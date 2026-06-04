@@ -58,7 +58,9 @@ def specs_for_team(team: str) -> list[RoleSpec]:
             RoleSpec("Developer", developer_count_for_building()),
             RoleSpec("Integrator", 1),
         ]
-    return TEAM_PRESETS.get(team, specs_for_team("building"))
+    if team in TEAM_PRESETS:
+        return TEAM_PRESETS[team]
+    return specs_for_team("building")
 
 ROLE_PROMPTS = {
     "Goal Planner": """
