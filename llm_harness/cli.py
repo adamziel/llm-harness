@@ -20,37 +20,37 @@ def main(argv: list[str] | None = None) -> int:
     """Dispatch harness subcommands while keeping the top-level script tiny."""
 
     parser = argparse.ArgumentParser(prog="harness", description="Deterministic Codex agent harness")
-    parser.add_argument("--root", default=os.getcwd(), help="Repository root (default: cwd)")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--root", default=os.getcwd(), help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="command", required=True, metavar="{run,status,poke}")
 
     run = sub.add_parser("run", help="Start or resume the scheduler")
     run.add_argument("--goal", help="Goal to record on first start")
-    run.add_argument("--team", default="auto", choices=sorted(["auto", "planning", "building", "minimal"]), help="Team preset")
-    run.add_argument("--once", action="store_true", help="Perform one scheduler tick for tests/services")
+    run.add_argument("--team", default="auto", choices=sorted(["auto", "planning", "building", "minimal"]), help=argparse.SUPPRESS)
+    run.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
 
     status = sub.add_parser("status", help="Show the Unicode/ANSI dashboard")
-    status.add_argument("--refresh", action="store_true", help="Refresh STATUS.md/STATUS.html before rendering")
+    status.add_argument("--refresh", action="store_true", help=argparse.SUPPRESS)
 
     poke = sub.add_parser("poke", help="Inject a prompt into running agents")
     poke.add_argument("message")
     poke.add_argument("--target", default="broadcast", help="Agent name, role, or broadcast")
 
-    sub.add_parser("update-status", help="Refresh STATUS.md and STATUS.html")
-    sub.add_parser("janitor", help="Run deterministic cleanup once")
+    _hidden_command(sub, "update-status")
+    _hidden_command(sub, "janitor")
 
-    test_loop = sub.add_parser("test-loop", help="Run the non-agentic full test loop")
-    test_loop.add_argument("--once", action="store_true", help="Run once and exit")
+    test_loop = _hidden_command(sub, "test-loop")
+    test_loop.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
 
-    sub.add_parser("mcp", help="Run the stdio MCP server")
-    sub.add_parser("index", help="Refresh the SQLite code index")
+    _hidden_command(sub, "mcp")
+    _hidden_command(sub, "index")
 
-    watchdog = sub.add_parser("watchdog", help="Run watchdog tick/loop")
+    watchdog = _hidden_command(sub, "watchdog")
     watchdog.add_argument("--once", action="store_true")
 
-    install = sub.add_parser("install-watchdog", help="Print watchdog service templates")
+    install = _hidden_command(sub, "install-watchdog")
     install.add_argument("--format", choices=["systemd", "nixos"], default="systemd")
 
-    sub.add_parser("mcp-config", help="Print a Codex MCP server config snippet")
+    _hidden_command(sub, "mcp-config")
 
     args = parser.parse_args(argv)
     root = Path(args.root).resolve()
@@ -110,6 +110,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     parser.error(f"Unhandled command {args.command}")
     return 2
+
+
+def _hidden_command(subparsers: argparse._SubParsersAction, name: str) -> argparse.ArgumentParser:
+    """Register an internal command without exposing it in public help output."""
+
+    parser = subparsers.add_parser(name, help=argparse.SUPPRESS)
+    subparsers._choices_actions = [action for action in subparsers._choices_actions if action.dest != name]
+    return parser
 
 
 def _mcp_config(root: Path) -> dict[str, object]:

@@ -117,6 +117,14 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("protocolVersion", output)
             self.assertIn("memory_query", output)
 
+    def test_public_help_only_lists_requested_commands(self):
+        root = Path(__file__).resolve().parents[1]
+        completed = subprocess.run([sys.executable, str(root / "harness"), "--help"], text=True, capture_output=True, check=True)
+        self.assertIn("{run,status,poke}", completed.stdout)
+        self.assertNotIn("test-loop", completed.stdout)
+        self.assertNotIn("update-status", completed.stdout)
+        self.assertNotIn("mcp-config", completed.stdout)
+
     def test_testing_loop_records_run_and_parses_failures(self):
         parsed = parse_test_output("tests/test_x.py::test_a PASSED\ntests/test_x.py::test_b FAILED\n")
         self.assertEqual(parsed[1]["status"], "failed")

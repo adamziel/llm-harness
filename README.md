@@ -18,16 +18,18 @@ running if GitHub auth is unavailable.
 
 ## Commands
 
+The user-facing CLI has only the three commands requested in `harness.md`:
+
 ```bash
-./harness run --goal "ship the project"   # start or resume scheduler
-./harness status                          # Unicode/ANSI dashboard
-./harness poke "message"                  # broadcast a prompt to agents
-./harness update-status                   # refresh STATUS.md and STATUS.html
-./harness test-loop --once                # record one full test run in SQLite
-./harness janitor                         # clean harness-owned temp files
-./harness mcp                             # stdio MCP server for agents
-./harness install-watchdog --format systemd
+./harness run --goal "ship the project"   # start or resume everything
+./harness status                          # show the Unicode/ANSI dashboard
+./harness poke "message"                  # inject a message into the running system
 ```
+
+`run` starts the internal updater, test loop, janitor, MCP, watchdog/service
+helpers, status page generation, and tmux windows as needed. Those internal
+entrypoints are intentionally hidden from help because users should not run them
+directly.
 
 On first run, the harness records the goal in `.harness/harness.sqlite3`, creates
 `PLAN.md` if needed, starts a tmux session (or uses the current one), opens
