@@ -4,6 +4,12 @@
 uses Python, tmux, git worktrees, SQLite, and small MCP tools to keep agentic work
 inspectable and restartable instead of trusting a single long-running chat.
 
+## Run it
+
+```bash
+./harness run --goal "Describe what you want the harness to build"
+```
+
 ## Commands
 
 ```bash
