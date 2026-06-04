@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from llm_harness import db
-from llm_harness.codex import CODEX_MODEL, build_codex_command
+from llm_harness.codex import CODEX_MODEL, CODEX_REASONING_EFFORT, build_codex_command
 from llm_harness.mcp_server import HarnessMCP, serve
 from llm_harness.roles import developer_count_for_building, specs_for_team
 from llm_harness.scheduler import HarnessScheduler
@@ -71,6 +71,7 @@ class HarnessTests(unittest.TestCase):
             command = build_codex_command(prompt, tmp)
             self.assertIn("codex --yolo", command)
             self.assertIn(f"--model {CODEX_MODEL}", command)
+            self.assertIn(f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"', command)
             self.assertIn(str(prompt), command)
 
     def test_status_reports_and_dashboard_render_from_sqlite(self):
@@ -183,7 +184,7 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("status", window_names)
             codex_commands = [command for _, window, command in fake.commands if window not in {"manhole", "status", "updater", "tests"} and not window.startswith("switch:")]
             self.assertTrue(codex_commands)
-            self.assertTrue(all("--yolo" in command and f"--model {CODEX_MODEL}" in command for command in codex_commands))
+            self.assertTrue(all("--yolo" in command and f"--model {CODEX_MODEL}" in command and f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"' in command for command in codex_commands))
             with db.connect(root / ".harness" / "harness.sqlite3") as conn:
                 agents = db.list_agents(conn)
                 self.assertGreaterEqual(len(agents), 3)

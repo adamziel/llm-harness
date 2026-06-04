@@ -143,7 +143,7 @@ def prompt_for_role(
         Harness database: {db_path}
 
         Non-negotiable operating constraints:
-        - You are being launched by the harness with Codex --yolo and model gpt-5.5-xhigh-fast. Never downgrade or ask to downgrade.
+        - You are being launched by the harness with Codex --yolo and model gpt-5.5 xhigh fast. Never downgrade or ask to downgrade.
         - Do not avoid work by sleeping, waiting indefinitely, or declaring vague blockers. If blocked, investigate, measure, and propose the next deterministic action.
         - Prefer deterministic tools over agentic guesses whenever deterministic tools can complete the task.
         - Report meaningful state changes through the SQLite MCP tools so the scheduler can monitor progress.

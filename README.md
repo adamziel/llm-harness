@@ -36,7 +36,7 @@ On first run, the harness records the goal in `.harness/harness.sqlite3`, create
 `manhole`, `status`, `updater`, and `tests` windows, and then maintains the
 selected team preset. When building starts, the builder team is 1 Manager,
 `floor(cpu_cores * 0.75)` Developers (minimum 1), and 1 Integrator. All Codex
-worker commands are generated with `--yolo` and `--model gpt-5.5-xhigh-fast`.
+worker commands are generated with `--yolo` and `--model gpt-5.5 -c model_reasoning_effort="xhigh"`.
 
 ## Persistent state
 

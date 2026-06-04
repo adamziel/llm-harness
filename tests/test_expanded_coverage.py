@@ -14,7 +14,7 @@ from unittest import mock
 
 from llm_harness import db
 from llm_harness import status as status_mod
-from llm_harness.codex import CODEX_MODEL, UnsafeCodexCommand, assert_codex_command_safe, build_codex_command
+from llm_harness.codex import CODEX_MODEL, CODEX_REASONING_EFFORT, UnsafeCodexCommand, assert_codex_command_safe, build_codex_command
 from llm_harness.indexer import code_search, refresh_index
 from llm_harness.mcp_server import HarnessMCP
 from llm_harness.roles import ROLE_ORDER, developer_count_for_building, prompt_for_role, slug_role, specs_for_team
@@ -85,7 +85,7 @@ def _role_prompt_case(self: unittest.TestCase, role: str) -> None:
     self.assertIn("/tmp/harness.sqlite3", prompt)
     self.assertIn("/repo", prompt)
     self.assertIn("--yolo", prompt)
-    self.assertIn("gpt-5.5-xhigh-fast", prompt)
+    self.assertIn("gpt-5.5 xhigh fast", prompt)
     self.assertIn("SQLite MCP", prompt)
 
 
@@ -129,6 +129,7 @@ def _codex_command_case(self: unittest.TestCase, dirname: str) -> None:
         command = build_codex_command(prompt, root)
         self.assertIn("codex --yolo", command)
         self.assertIn(f"--model {CODEX_MODEL}", command)
+        self.assertIn(f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"', command)
         self.assertIn("prompt file.md", command)
         assert_codex_command_safe(command)
 
@@ -148,14 +149,14 @@ add_cases(
     CodexCommandTests,
     "unsafe",
     [
-        "codex --model gpt-5.5-xhigh-fast",
+        "codex --model gpt-5.5",
         "codex --yolo",
         "codex --model other --yolo",
-        "codex --dangerously-auto-approve --model gpt-5.5-xhigh-fast",
+        "codex --dangerously-auto-approve --model gpt-5.5 -c model_reasoning_effort=\"xhigh\"",
         "codex --yolo --model gpt-4",
-        "python -m codex --model gpt-5.5-xhigh-fast",
+        "python -m codex --model gpt-5.5 -c model_reasoning_effort=\"xhigh\"",
         "codex --yolo --model",
-        "codex --model gpt-5.5-xhigh-fast --safe",
+        "codex --model gpt-5.5 -c model_reasoning_effort=\"xhigh\" --safe",
         "",
         "codex run",
     ],
