@@ -1,0 +1,45 @@
+# LLM Harness
+
+`llm-harness` is a deterministic scheduler around Codex CLI worker agents. It
+uses Python, tmux, git worktrees, SQLite, and small MCP tools to keep agentic work
+inspectable and restartable instead of trusting a single long-running chat.
+
+## Commands
+
+```bash
+./harness run --goal "ship the project"   # start or resume scheduler
+./harness status                          # Unicode/ANSI dashboard
+./harness poke "message"                  # broadcast a prompt to agents
+./harness update-status                   # refresh STATUS.md and STATUS.html
+./harness test-loop --once                # record one full test run in SQLite
+./harness janitor                         # clean harness-owned temp files
+./harness mcp                             # stdio MCP server for agents
+./harness install-watchdog --format systemd
+```
+
+On first run, the harness records the goal in `.harness/harness.sqlite3`, creates
+`PLAN.md` if needed, starts a tmux session (or uses the current one), opens
+`manhole`, `status`, `updater`, and `tests` windows, and then maintains the
+selected team preset. All Codex worker commands are generated with `--yolo` and
+`--model gpt-5.5-xhigh-fast`.
+
+## Persistent state
+
+SQLite is the source of truth. It stores goals, events, agents, tmux panes,
+worktrees, work lanes, resource samples, test runs, parsed test results, bug
+reports, metric samples, code index rows, prompt messages, and scheduler-routed
+spawn requests.
+
+The MCP server exposes that state through deterministic tools documented in
+`llm_harness/skills/sqlite_mcp/SKILL.md`.
+
+## Status reports
+
+`./harness status` prints a compact TUI dashboard with Unicode borders and ANSI
+colors. The updater writes `STATUS.md` and `STATUS.html` from templates created
+on first run at `.harness/STATUS_TEMPLATE.md` and `.harness/STATUS_TEMPLATE.html`.
+
+## Watchdog
+
+`./harness watchdog` performs repeated scheduler ticks and is intended to be run
+by a service manager. Use `install-watchdog` to print systemd or NixOS snippets.

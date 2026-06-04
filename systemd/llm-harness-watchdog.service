@@ -1,0 +1,13 @@
+[Unit]
+Description=LLM Harness watchdog
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/repo
+ExecStart=/path/to/repo/harness watchdog
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "llm-harness": {
+      "command": "./harness",
+      "args": ["mcp"],
+      "env": {
+        "HARNESS_ROOT": ".",
+        "HARNESS_DB": ".harness/harness.sqlite3"
+      }
+    }
+  }
+}

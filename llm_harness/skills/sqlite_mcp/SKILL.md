@@ -1,0 +1,27 @@
+# Harness SQLite MCP
+
+Use this skill in every Codex agent launched by the harness.
+
+The harness exposes a local MCP server backed by `.harness/harness.sqlite3`.
+Use it as the shared memory and coordination surface instead of relying on chat
+history alone.
+
+Tools:
+
+- `memory_record_event(type, message, agent_name?, payload?)` — record decisions,
+  crashes, prompts sent, completed work, and anything the scheduler or Status
+  reporter should know.
+- `memory_query(sql, params?)` — read harness tables with `SELECT`, `WITH`, or
+  `PRAGMA`. Useful tables include `goals`, `agents`, `work_lanes`, `test_runs`,
+  `test_results`, `bug_reports`, `events`, `resource_samples`, and
+  `metric_samples`.
+- `memory_update_agent(name, status, notes?, ended?)` — update your own status
+  frequently enough for the watchdog to tell progress from idleness.
+- `spawn_agent(role, title, prompt, requester?, notes?)` — request another agent.
+  This deliberately routes through the central scheduler so the harness knows the
+  whole process tree. Do not start Codex directly.
+- `code_search(query, worktree?, limit?, refresh?)` — search code with ripgrep or
+  the SQLite fallback index before doing broad manual greps.
+
+Keep writes concise and structured. Prefer several small events over one giant
+note that will waste future context.
