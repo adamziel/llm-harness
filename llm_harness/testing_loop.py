@@ -23,6 +23,8 @@ def discover_test_command(root: str | Path) -> list[str]:
     wants_pytest = (root_path / "pytest.ini").exists() or (root_path / "pyproject.toml").exists() or (root_path / "tests").exists()
     if wants_pytest and importlib.util.find_spec("pytest") is not None:
         return ["python", "-m", "pytest", "-q"]
+    if (root_path / "tests").exists():
+        return ["python", "-m", "unittest", "discover", "-s", "tests"]
     return ["python", "-m", "unittest", "discover"]
 
 
