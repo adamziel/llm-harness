@@ -120,6 +120,8 @@ class HarnessTests(unittest.TestCase):
     def test_testing_loop_records_run_and_parses_failures(self):
         parsed = parse_test_output("tests/test_x.py::test_a PASSED\ntests/test_x.py::test_b FAILED\n")
         self.assertEqual(parsed[1]["status"], "failed")
+        unittest_rows = parse_test_output("test_a (tests.test_x.Case.test_a) ... ok\n")
+        self.assertEqual(unittest_rows[0]["status"], "passed")
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
             subprocess.run(["git", "init"], cwd=tmp, check=True, capture_output=True)

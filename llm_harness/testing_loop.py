@@ -14,7 +14,8 @@ from typing import Any
 
 from . import db
 
-TEST_RESULT_RE = re.compile(r"^(?P<node>\S+?)\s+(?P<status>PASSED|FAILED|SKIPPED|ERROR)\b")
+PYTEST_RESULT_RE = re.compile(r"^(?P<node>\S+?)\s+(?P<status>PASSED|FAILED|SKIPPED|ERROR)\b")
+UNITTEST_RESULT_RE = re.compile(r"^(?P<test>\S+)\s+\((?P<case>[^)]+)\)\s+\.\.\.\s+(?P<status>ok|FAIL|ERROR|skipped\b.*)$")
 
 
 def discover_test_command(root: str | Path) -> list[str]:
@@ -23,9 +24,9 @@ def discover_test_command(root: str | Path) -> list[str]:
     root_path = Path(root)
     wants_pytest = (root_path / "pytest.ini").exists() or (root_path / "pyproject.toml").exists() or (root_path / "tests").exists()
     if wants_pytest and importlib.util.find_spec("pytest") is not None:
-        return ["python", "-m", "pytest", "-q"]
+        return ["python", "-m", "pytest", "-vv"]
     if (root_path / "tests").exists():
-        return ["python", "-m", "unittest", "discover", "-s", "tests"]
+        return ["python", "-m", "unittest", "discover", "-s", "tests", "-v"]
     return ["python", "-m", "unittest", "discover"]
 
 
@@ -70,13 +71,32 @@ def parse_test_output(output: str) -> list[dict[str, Any]]:
 
     results = []
     for line in output.splitlines():
-        match = TEST_RESULT_RE.match(line.strip())
-        if not match:
+        stripped = line.strip()
+        pytest_match = PYTEST_RESULT_RE.match(stripped)
+        if pytest_match:
+            node = pytest_match.group("node")
+            status = pytest_match.group("status").lower()
+            results.append({"nodeid": node, "file": node.split("::", 1)[0], "status": "failed" if status == "failed" else status})
             continue
-        node = match.group("node")
-        status = match.group("status").lower()
-        results.append({"nodeid": node, "file": node.split("::", 1)[0], "status": "failed" if status == "failed" else status})
+        unittest_match = UNITTEST_RESULT_RE.match(stripped)
+        if unittest_match:
+            status = _normalize_unittest_status(unittest_match.group("status"))
+            case = unittest_match.group("case")
+            node = case
+            results.append({"nodeid": node, "file": case.rsplit(".", 1)[0].replace(".", "/") + ".py", "status": status})
     return results
+
+
+def _normalize_unittest_status(status: str) -> str:
+    """Map unittest verbose words to the status vocabulary stored in SQLite."""
+
+    if status == "ok":
+        return "passed"
+    if status.startswith("skipped"):
+        return "skipped"
+    if status == "ERROR":
+        return "error"
+    return "failed"
 
 
 def summarize_results(results: list[dict[str, Any]], returncode: int) -> dict[str, int]:
