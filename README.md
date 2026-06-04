@@ -4,11 +4,17 @@
 uses Python, tmux, git worktrees, SQLite, and small MCP tools to keep agentic work
 inspectable and restartable instead of trusting a single long-running chat.
 
-## Run it
+## Run it without cloning
+
+Download the latest single-file release and start the harness:
 
 ```bash
-./harness run --goal "Describe what you want the harness to build"
+curl -fsSL https://github.com/adamziel/llm-harness/releases/latest/download/harness -o harness && chmod +x harness && ./harness run --goal "Describe what you want the harness to build"
 ```
+
+Requires `python3`, `git`, `tmux`, `codex`, and `gh` for GitHub publishing. The
+`gh` command is optional at startup; the harness prints a red warning and keeps
+running if GitHub auth is unavailable.
 
 ## Commands
 
