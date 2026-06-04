@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from textwrap import dedent
 
@@ -32,14 +33,6 @@ TEAM_PRESETS: dict[str, list[RoleSpec]] = {
         RoleSpec("Goal Planner", 1),
         RoleSpec("Auditor", 1),
     ],
-    "building": [
-        RoleSpec("Manager", 1),
-        RoleSpec("Developer", 2),
-        RoleSpec("Auditor", 1),
-        RoleSpec("Integrator", 1),
-        RoleSpec("Status reporter", 1),
-        RoleSpec("Janitor", 1),
-    ],
     "minimal": [
         RoleSpec("Manager", 1),
         RoleSpec("Developer", 1),
@@ -47,6 +40,25 @@ TEAM_PRESETS: dict[str, list[RoleSpec]] = {
         RoleSpec("Integrator", 1),
     ],
 }
+
+
+def developer_count_for_building(cpu_count: int | None = None) -> int:
+    """Reserve CPU for the harness by spawning developers for 75% of cores."""
+
+    cores = max(1, int(cpu_count or os.cpu_count() or 1))
+    return max(1, int(cores * 0.75))
+
+
+def specs_for_team(team: str) -> list[RoleSpec]:
+    """Resolve team presets, including the CPU-sized building team."""
+
+    if team == "building":
+        return [
+            RoleSpec("Manager", 1),
+            RoleSpec("Developer", developer_count_for_building()),
+            RoleSpec("Integrator", 1),
+        ]
+    return TEAM_PRESETS.get(team, specs_for_team("building"))
 
 ROLE_PROMPTS = {
     "Goal Planner": """

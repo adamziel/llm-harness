@@ -11,6 +11,7 @@ from pathlib import Path
 from llm_harness import db
 from llm_harness.codex import CODEX_MODEL, build_codex_command
 from llm_harness.mcp_server import HarnessMCP, serve
+from llm_harness.roles import developer_count_for_building, specs_for_team
 from llm_harness.scheduler import HarnessScheduler
 from llm_harness.status import dashboard, refresh_reports
 from llm_harness.testing_loop import parse_test_output, run_tests_once
@@ -124,6 +125,15 @@ class HarnessTests(unittest.TestCase):
         self.assertNotIn("test-loop", completed.stdout)
         self.assertNotIn("update-status", completed.stdout)
         self.assertNotIn("mcp-config", completed.stdout)
+
+    def test_building_team_uses_seventy_five_percent_of_cpu_cores_for_developers(self):
+        self.assertEqual(developer_count_for_building(8), 6)
+        self.assertEqual(developer_count_for_building(6), 4)
+        self.assertEqual(developer_count_for_building(1), 1)
+        specs = {spec.name: spec.min_count for spec in specs_for_team("building")}
+        self.assertEqual(specs["Manager"], 1)
+        self.assertEqual(specs["Integrator"], 1)
+        self.assertEqual(set(specs), {"Manager", "Developer", "Integrator"})
 
     def test_testing_loop_records_run_and_parses_failures(self):
         parsed = parse_test_output("tests/test_x.py::test_a PASSED\ntests/test_x.py::test_b FAILED\n")

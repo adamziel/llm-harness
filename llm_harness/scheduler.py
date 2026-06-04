@@ -16,7 +16,7 @@ from . import db
 from .codex import build_codex_command
 from .janitor import run_janitor
 from .resources import sample_resources
-from .roles import TEAM_PRESETS, prompt_for_role, slug_role
+from .roles import prompt_for_role, slug_role, specs_for_team
 from .status import refresh_reports
 from .tmux import Tmux, TmuxUnavailable, shell_command
 
@@ -181,7 +181,7 @@ class HarnessScheduler:
     def ensure_team(self, conn: sqlite3.Connection, team: str) -> None:
         """Keep at least the preset minimum number of live agents per role."""
 
-        specs = TEAM_PRESETS.get(team, TEAM_PRESETS["building"])
+        specs = specs_for_team(team)
         for spec in specs:
             running = conn.execute(
                 "SELECT COUNT(*) AS count FROM agents WHERE role = ? AND current_status = 'running'",

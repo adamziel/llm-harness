@@ -34,8 +34,9 @@ directly.
 On first run, the harness records the goal in `.harness/harness.sqlite3`, creates
 `PLAN.md` if needed, starts a tmux session (or uses the current one), opens
 `manhole`, `status`, `updater`, and `tests` windows, and then maintains the
-selected team preset. All Codex worker commands are generated with `--yolo` and
-`--model gpt-5.5-xhigh-fast`.
+selected team preset. When building starts, the builder team is 1 Manager,
+`floor(cpu_cores * 0.75)` Developers (minimum 1), and 1 Integrator. All Codex
+worker commands are generated with `--yolo` and `--model gpt-5.5-xhigh-fast`.
 
 ## Persistent state
 
