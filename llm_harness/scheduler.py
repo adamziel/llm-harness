@@ -34,7 +34,7 @@ class HarnessScheduler:
         self.paths = db.bootstrap(self.root)
         self.tmux = tmux or Tmux()
 
-    def run(self, goal: str | None = None, team: str = "building", once: bool = False) -> int:
+    def run(self, goal: str | None = None, team: str = "auto", once: bool = False) -> int:
         """Start or resume the harness, then keep monitoring worker state."""
 
         with db.connect(self.paths.db) as conn:
