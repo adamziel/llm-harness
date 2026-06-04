@@ -25,7 +25,7 @@ def main(argv: list[str] | None = None) -> int:
 
     run = sub.add_parser("run", help="Start or resume the scheduler")
     run.add_argument("--goal", help="Goal to record on first start")
-    run.add_argument("--team", default="building", choices=sorted(["planning", "building", "minimal"]), help="Team preset")
+    run.add_argument("--team", default="auto", choices=sorted(["auto", "planning", "building", "minimal"]), help="Team preset")
     run.add_argument("--once", action="store_true", help="Perform one scheduler tick for tests/services")
 
     status = sub.add_parser("status", help="Show the Unicode/ANSI dashboard")

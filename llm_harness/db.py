@@ -612,10 +612,34 @@ def note_failing_tests(conn: sqlite3.Connection, run_id: int, commit_sha: str) -
 def purge_old_test_logs(conn: sqlite3.Connection) -> None:
     """Keep recent full logs and compact older test runs without dropping metadata."""
 
-    keep_full = {
-        row["id"]
-        for row in conn.execute("SELECT id FROM test_runs ORDER BY id DESC LIMIT 5").fetchall()
-    }
+    rows = conn.execute("SELECT id, started_at FROM test_runs ORDER BY id DESC").fetchall()
+    keep_full = {row["id"] for row in rows[:5]}
+    now = datetime.now(timezone.utc)
+    hourly: set[str] = set()
+    daily: set[str] = set()
+    weekly: set[str] = set()
+    for row in rows[5:]:
+        try:
+            started = datetime.fromisoformat(row["started_at"])
+        except (TypeError, ValueError):
+            continue
+        age = now - started
+        if age.days == 0:
+            bucket = started.strftime("%Y-%m-%d-%H")
+            if bucket not in hourly:
+                hourly.add(bucket)
+                keep_full.add(row["id"])
+        elif age.days <= 7:
+            bucket = started.strftime("%Y-%m-%d")
+            if bucket not in daily:
+                daily.add(bucket)
+                keep_full.add(row["id"])
+        else:
+            year, week, _ = started.isocalendar()
+            bucket = f"{year}-W{week}"
+            if bucket not in weekly:
+                weekly.add(bucket)
+                keep_full.add(row["id"])
     if keep_full:
         placeholders = ",".join("?" for _ in keep_full)
         conn.execute(

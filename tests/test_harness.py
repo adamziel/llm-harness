@@ -84,6 +84,8 @@ class HarnessTests(unittest.TestCase):
                 md, html = refresh_reports(conn, tmp)
                 self.assertTrue(md.exists())
                 self.assertTrue(html.exists())
+                self.assertTrue((Path(tmp) / "progress.md").exists())
+                self.assertTrue((Path(tmp) / "progress.html").exists())
                 text = dashboard(conn)
                 self.assertIn("Last generated", text)
                 self.assertIn("Progress", text)
@@ -126,6 +128,27 @@ class HarnessTests(unittest.TestCase):
                 run_id = run_tests_once(conn, tmp, command=[sys.executable, "-c", "print('ok')"])
                 row = conn.execute("SELECT * FROM test_runs WHERE id = ?", (run_id,)).fetchone()
                 self.assertEqual(row["status"], "passed")
+
+    def test_testing_loop_queues_failure_lane_and_resolves_bug(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                fail_id = db.record_test_run(
+                    conn,
+                    command="manual",
+                    status="failed",
+                    full_log="tests/test_x.py::test_a FAILED",
+                    results=[{"nodeid": "tests/test_x.py::test_a", "status": "failed"}],
+                )
+                db.note_failing_tests(conn, fail_id, "bad")
+                from llm_harness.testing_loop import queue_test_fix_lane, resolve_fixed_tests
+
+                queue_test_fix_lane(conn, fail_id, [{"nodeid": "tests/test_x.py::test_a", "status": "failed"}], "bad")
+                self.assertEqual(conn.execute("SELECT COUNT(*) AS count FROM work_lanes").fetchone()["count"], 1)
+                resolve_fixed_tests(conn, [{"nodeid": "tests/test_x.py::test_a", "status": "passed"}], "good")
+                bug = conn.execute("SELECT * FROM bug_reports WHERE test_nodeid = 'tests/test_x.py::test_a'").fetchone()
+                self.assertEqual(bug["status"], "fixed")
 
     def test_scheduler_once_starts_support_windows_and_minimal_team(self):
         with tempfile.TemporaryDirectory() as tmp:

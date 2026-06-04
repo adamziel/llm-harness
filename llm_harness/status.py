@@ -71,7 +71,7 @@ pre { white-space: pre-wrap; }
 <p><strong>Last generated:</strong> {{generated_at}}</p>
 <div class=\"card\"><h2>Goal</h2><p>{{goal_html}}</p></div>
 <div class=\"grid\">
-  <div class=\"card\"><h2>Metric</h2><div class=\"bar\"><div class=\"fill\"></div></div><p>{{metric_html}}</p></div>
+  <div class=\"card\"><h2>Metric</h2><div class=\"bar\"><div class=\"fill\"></div></div><p>{{metric_html}}</p>{{metric_chart_html}}</div>
   <div class=\"card\"><h2>Resources</h2>{{resources_html}}</div>
   <div class=\"card\"><h2>Tests</h2>{{tests_html}}</div>
 </div>
@@ -113,6 +113,8 @@ def refresh_reports(conn: sqlite3.Connection, root: str | Path) -> tuple[Path, P
     status_html = root_path / "STATUS.html"
     status_md.write_text(md)
     status_html.write_text(html_text)
+    (root_path / "progress.md").write_text(md)
+    (root_path / "progress.html").write_text(html_text)
     return status_md, status_html
 
 
@@ -125,10 +127,12 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
     test_run = conn.execute("SELECT * FROM test_runs ORDER BY id DESC LIMIT 1").fetchone()
     resources = conn.execute("SELECT * FROM resource_samples ORDER BY id DESC LIMIT 24").fetchall()
     metric = latest_metric(conn)
+    metric_history = conn.execute("SELECT * FROM metric_samples ORDER BY id DESC LIMIT 24").fetchall()
     events = recent_events(conn, 12)
     queued_integration = conn.execute(
         "SELECT COUNT(*) AS count, COALESCE(SUM(expected_metric_delta), 0) AS delta FROM work_lanes WHERE status = 'awaiting_integration'"
     ).fetchone()
+    metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM metadata").fetchall()}
     return {
         "goal": dict(goal) if goal else None,
         "agents": [dict(row) for row in agents],
@@ -136,8 +140,10 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         "test_run": dict(test_run) if test_run else None,
         "resources": [dict(row) for row in resources],
         "metric": dict(metric) if metric else None,
+        "metric_history": [dict(row) for row in metric_history],
         "events": [dict(row) for row in events],
         "queued_integration": dict(queued_integration) if queued_integration else {"count": 0, "delta": 0},
+        "metadata": metadata,
     }
 
 
@@ -152,6 +158,10 @@ def dashboard(conn: sqlite3.Connection) -> str:
     metric = data["metric"] or {}
     goal_text = goal.get("text", "No goal recorded yet") if isinstance(goal, dict) else "No goal recorded yet"
     percent = float(metric.get("percent_ready", 0) if isinstance(metric, dict) else 0)
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    red_banner = metadata.get("red_banner", "")
+    if red_banner:
+        lines.append(_box_line(width, red_banner, ANSI["red"]))
     lines.append(_box_line(width, f"Goal: {shorten(str(goal_text), width=width-10, placeholder='…')}"))
     lines.append(_box_line(width, f"Progress: {_bar(percent, 24)} {percent:5.1f}%"))
 
@@ -215,6 +225,7 @@ def _html_context(data: dict[str, object]) -> dict[str, str]:
         "metric_percent": f"{percent:.1f}",
         "goal_html": html.escape(str(goal.get("text", "No goal recorded yet") if isinstance(goal, dict) else "No goal recorded yet")),
         "metric_html": html.escape(_metric_text(metric)),
+        "metric_chart_html": _sparkline(data.get("metric_history", []), "percent_ready"),
         "resources_html": _html_resource(data.get("resources", [])),
         "tests_html": html.escape(_test_text(data.get("test_run"))).replace("\n", "<br>"),
         "agents_html": _html_table(data.get("agents", []), ["name", "role", "current_status", "tmux_window", "worktree"]),
@@ -269,6 +280,31 @@ def _html_resource(resources: object) -> str:
         )
     rows.append("</table>")
     return "".join(rows)
+
+
+def _sparkline(rows: object, value_key: str) -> str:
+    """Render a tiny inline SVG trend without pulling in a charting library."""
+
+    if not isinstance(rows, list) or len(rows) < 2:
+        return "<p>No metric history chart yet.</p>"
+    ordered = list(reversed(rows))
+    values = [float(row.get(value_key, 0) or 0) for row in ordered]
+    high = max(values) or 1.0
+    low = min(values)
+    span = high - low or 1.0
+    points = []
+    width = 240
+    height = 64
+    for index, value in enumerate(values):
+        x = 0 if len(values) == 1 else (index / (len(values) - 1)) * width
+        y = height - ((value - low) / span) * height
+        points.append(f"{x:.1f},{y:.1f}")
+    return (
+        "<svg role=\"img\" aria-label=\"Progress trend\" viewBox=\"0 0 240 64\" width=\"100%\" height=\"64\">"
+        "<polyline fill=\"none\" stroke=\"#2563eb\" stroke-width=\"3\" points=\""
+        + " ".join(points)
+        + "\"/></svg>"
+    )
 
 
 def _markdown_table(rows: object, columns: list[str]) -> str:

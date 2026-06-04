@@ -44,12 +44,13 @@ class HarnessScheduler:
             self.ensure_goal(conn, goal)
             self.start_support_windows(conn)
             refresh_reports(conn, self.root)
-            db.log_event(conn, "scheduler", f"Harness run started with team preset {team}")
+            effective_team = self.effective_team(conn, team)
+            db.log_event(conn, "scheduler", f"Harness run started with team preset {effective_team}")
 
         if once:
             with db.connect(self.paths.db) as conn:
                 db.init_db(conn)
-                self.tick_once(conn, team)
+                self.tick_once(conn, self.effective_team(conn, team))
                 refresh_reports(conn, self.root)
             return 0
 
@@ -58,7 +59,7 @@ class HarnessScheduler:
             while True:
                 with db.connect(self.paths.db) as conn:
                     db.init_db(conn)
-                    self.tick_once(conn, team)
+                    self.tick_once(conn, self.effective_team(conn, team))
                     refresh_reports(conn, self.root)
                 time.sleep(5)
         except KeyboardInterrupt:
@@ -76,7 +77,18 @@ class HarnessScheduler:
         self.handle_spawn_requests(conn)
         self.ensure_team(conn, team)
         self.check_agent_liveness(conn)
+        self.check_progress_stall(conn)
         self.maybe_run_janitor(conn)
+
+    def effective_team(self, conn: sqlite3.Connection, requested: str) -> str:
+        """Keep first runs in planning until the goal has a real metric and plan."""
+
+        if requested != "auto":
+            return requested
+        goal = db.get_goal(conn)
+        if goal is None or goal["status"] == "planning":
+            return "planning"
+        return "building"
 
     def ensure_git_repo(self, conn: sqlite3.Connection) -> None:
         """Initialize git when needed because work lanes rely on branches/worktrees."""
@@ -140,7 +152,22 @@ class HarnessScheduler:
         db.set_meta(conn, "tmux_attach", attach)
         print(f"tmux session: {session} ({attach})", flush=True)
 
-        manhole_command = "printf 'Manhole ready. Use ./harness poke to route durable messages.\\n'; exec bash"
+        manhole_prompt = self.paths.prompts / "manhole.md"
+        manhole_prompt.write_text(
+            prompt_for_role(
+                "Manager",
+                "manhole",
+                (db.get_goal(conn) or {"text": ""})["text"],
+                str(self.paths.db),
+                str(self.root),
+                extra=(
+                    "You are the user's manhole session. You may inspect tmux panes, "
+                    "route corrections through ./harness poke, request agents through MCP, "
+                    "and help the user course-correct any part of the harness."
+                ),
+            )
+        )
+        manhole_command = build_codex_command(manhole_prompt, self.root)
         self.tmux.ensure_window(session, "manhole", manhole_command)
         status_command = "watch -n 5 ./harness status"
         self.tmux.ensure_window(session, "status", status_command)
@@ -258,6 +285,32 @@ class HarnessScheduler:
             last_seen = _parse_epoch(agent["last_seen_at"])
             if last_seen and now - last_seen > IDLE_SECONDS:
                 self.prompt_auditor(conn, f"{agent['name']} appears idle for more than 5 minutes. Diagnose and force progress toward the metric.")
+
+    def check_progress_stall(self, conn: sqlite3.Connection) -> None:
+        """Raise a visible alert if the progress metric has not increased in 30 minutes."""
+
+        metric = db.latest_metric(conn)
+        if metric is None:
+            return
+        percent = float(metric["percent_ready"])
+        best = float(db.get_meta(conn, "best_progress_percent", "0") or 0)
+        now = time.time()
+        if percent > best:
+            db.set_meta(conn, "best_progress_percent", str(percent))
+            db.set_meta(conn, "last_progress_increase_epoch", str(now))
+            db.set_meta(conn, "red_banner", "")
+            return
+        last_increase = float(db.get_meta(conn, "last_progress_increase_epoch", "0") or 0)
+        if last_increase == 0:
+            db.set_meta(conn, "last_progress_increase_epoch", str(now))
+            return
+        last_alert = float(db.get_meta(conn, "last_progress_stall_alert", "0") or 0)
+        if now - last_increase >= 30 * 60 and now - last_alert >= 30 * 60:
+            banner = "PROGRESS STALLED: metric has not increased for 30 minutes."
+            db.set_meta(conn, "red_banner", banner)
+            db.set_meta(conn, "last_progress_stall_alert", str(now))
+            db.log_event(conn, "progress_stalled", banner, payload={"percent_ready": percent})
+            self.prompt_manager(conn, banner + " Reorganize work so progress resumes.")
 
     def prompt_auditor(self, conn: sqlite3.Connection, message: str) -> None:
         """Ask an existing auditor to intervene, or start one if none is running."""

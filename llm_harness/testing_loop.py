@@ -8,6 +8,7 @@ import re
 import shlex
 import sqlite3
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -54,8 +55,11 @@ def run_tests_once(conn: sqlite3.Connection, root: str | Path, command: list[str
     )
     db.note_failing_tests(conn, run_id, commit)
     if status == "failed":
+        queue_test_fix_lane(conn, run_id, parsed, commit)
+        maybe_invoke_architect(conn)
         db.log_event(conn, "tests_failed", "Full test suite failed; Manager should prioritize fixes", payload={"run_id": run_id})
     else:
+        resolve_fixed_tests(conn, parsed, commit)
         db.log_event(conn, "tests_passed", "Full test suite passed", payload={"run_id": run_id})
     db.purge_old_test_logs(conn)
     return run_id
@@ -85,6 +89,71 @@ def summarize_results(results: list[dict[str, Any]], returncode: int) -> dict[st
     if not results and returncode != 0:
         summary["failed"] = 1
     return summary
+
+
+def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dict[str, Any]], commit: str) -> None:
+    """Put main-branch test failures at the top of the durable work queue."""
+
+    failures = [result["nodeid"] for result in results if result.get("status") in {"failed", "error"}]
+    title = f"Fix failing tests from run {run_id}"
+    notes = "Failed tests: " + (", ".join(failures) if failures else "see full test log") + f"\nFirst failing commit: {commit}"
+    conn.execute(
+        """
+        INSERT INTO work_lanes(ts, title, role, status, notes)
+        VALUES (?, ?, 'Developer', 'queued', ?)
+        """,
+        (db.utc_now(), title, notes),
+    )
+    conn.commit()
+
+
+def resolve_fixed_tests(conn: sqlite3.Connection, results: list[dict[str, Any]], commit: str) -> None:
+    """Close bug reports when a later passing run proves the test is fixed."""
+
+    passed = {result["nodeid"] for result in results if result.get("status") == "passed"}
+    if passed:
+        rows = conn.execute(
+            "SELECT * FROM bug_reports WHERE status = 'open'"
+        ).fetchall()
+        fixed_ids = [row["id"] for row in rows if row["test_nodeid"] in passed]
+    else:
+        # Some runners only print a command-level success. A green full-suite run
+        # still proves previously open test failures are no longer present.
+        fixed_ids = [row["id"] for row in conn.execute("SELECT id FROM bug_reports WHERE status = 'open'").fetchall()]
+    for bug_id in fixed_ids:
+        conn.execute(
+            """
+            UPDATE bug_reports
+            SET status = 'fixed', fixed_commit = ?, resolution = 'Fixed before or during this passing test run.', updated_at = ?
+            WHERE id = ?
+            """,
+            (commit, db.utc_now(), bug_id),
+        )
+    conn.commit()
+
+
+def maybe_invoke_architect(conn: sqlite3.Connection) -> None:
+    """Escalate tests that have failed repeatedly in the last 24 hours."""
+
+    since = (datetime.fromisoformat(db.utc_now()) - timedelta(hours=24)).isoformat(timespec="seconds")
+    repeated = conn.execute(
+        """
+        SELECT test_nodeid, occurrences FROM bug_reports
+        WHERE status = 'open' AND updated_at >= ? AND occurrences > 3
+        """,
+        (since,),
+    ).fetchall()
+    for row in repeated:
+        db.queue_spawn_request(
+            conn,
+            role="Architect",
+            title=f"Find systemic cause for repeated failure: {row['test_nodeid']}",
+            prompt=(
+                f"Test {row['test_nodeid']} has failed more than three times in 24 hours. "
+                "Investigate the structural root cause and plan a reliability refactor."
+            ),
+            requester="test-loop",
+        )
 
 
 def _git_commit(root: Path) -> str:
