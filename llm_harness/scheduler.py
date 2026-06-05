@@ -771,6 +771,7 @@ class HarnessScheduler:
                 if self.tmux.target_exists(target):
                     active += 1
                 else:
+                    self.requeue_agent_cards(conn, agent, "tmux pane no longer exists")
                     db.update_agent_status(conn, agent["name"], "crash", "tmux pane no longer exists", ended=True)
                     db.log_event(conn, "agent_missing", f"{agent['name']} tmux pane no longer exists", agent_name=agent["name"])
                 continue
@@ -805,6 +806,7 @@ class HarnessScheduler:
                         self.card_prompt(conn, card_id, request["title"], request["prompt"]),
                     )
                 except Exception:
+                    self.requeue_agent_cards(conn, existing, "tmux prompt failed")
                     db.update_agent_status(conn, existing["name"], "crash", "tmux prompt failed", ended=True)
                     db.log_event(conn, "agent_missing", f"{existing['name']} tmux prompt failed", agent_name=existing["name"])
                     db.mark_spawn_request(conn, request["id"], "failed", existing["name"])
@@ -828,6 +830,7 @@ class HarnessScheduler:
             if not target:
                 continue
             if hasattr(self.tmux, "target_exists") and not self.tmux.target_exists(target):
+                self.requeue_agent_cards(conn, agent, "tmux pane no longer exists")
                 db.update_agent_status(conn, agent["name"], "crash", "tmux pane no longer exists", ended=True)
                 db.log_event(conn, "agent_missing", f"{agent['name']} tmux pane no longer exists", agent_name=agent["name"])
                 continue
@@ -851,6 +854,27 @@ class HarnessScheduler:
                 (agent["id"], agent["branch"], agent["branch"], agent["worktree"], agent["worktree"]),
             ).fetchone()["count"]
         )
+
+    def requeue_agent_cards(self, conn: sqlite3.Connection, agent: sqlite3.Row, reason: str) -> int:
+        """Return cards owned by a dead worker to planned so Python can reassign them."""
+
+        rows = conn.execute(
+            """
+            SELECT id FROM worklanes
+            WHERE stage = 'development'
+              AND (
+                owner_agent_id = ?
+                OR (? != '' AND branch_name = ?)
+                OR (? != '' AND worktree_path = ?)
+              )
+            """,
+            (agent["id"], agent["branch"], agent["branch"], agent["worktree"], agent["worktree"]),
+        ).fetchall()
+        for row in rows:
+            db.requeue_card(conn, int(row["id"]), f"Requeued after {agent['name']} ended without an accepted report: {reason}")
+        if rows:
+            db.log_event(conn, "card_requeued", f"Requeued {len(rows)} cards from {agent['name']}", agent_name=agent["name"], payload={"reason": reason})
+        return len(rows)
 
     def card_prompt(self, conn: sqlite3.Connection, card_id: int, title: str, prompt: str) -> str:
         """Build the bounded prompt for a concrete card-backed assignment."""
@@ -887,6 +911,7 @@ class HarnessScheduler:
                 self.tmux.send_prompt(target, message)
                 return str(agent["name"])
             except Exception:
+                self.requeue_agent_cards(conn, agent, "tmux prompt failed")
                 db.update_agent_status(conn, agent["name"], "crash", "tmux prompt failed", ended=True)
                 db.log_event(conn, "agent_missing", f"{agent['name']} tmux prompt failed", agent_name=agent["name"])
         return ""
@@ -1011,6 +1036,7 @@ class HarnessScheduler:
         for agent in agents:
             target = _tmux_target(agent)
             if target and hasattr(self.tmux, "target_exists") and not self.tmux.target_exists(target):
+                self.requeue_agent_cards(conn, agent, "tmux pane no longer exists")
                 db.update_agent_status(conn, agent["name"], "crash", "tmux pane no longer exists", ended=True)
                 db.log_event(conn, "agent_missing", f"{agent['name']} tmux pane no longer exists", agent_name=agent["name"])
                 continue
@@ -1082,6 +1108,7 @@ class HarnessScheduler:
             if not target:
                 continue
             if hasattr(self.tmux, "target_exists") and not self.tmux.target_exists(target):
+                self.requeue_agent_cards(conn, auditor, "tmux pane no longer exists")
                 db.update_agent_status(conn, auditor["name"], "crash", "tmux pane no longer exists", ended=True)
                 db.log_event(conn, "agent_missing", f"{auditor['name']} tmux pane no longer exists", agent_name=auditor["name"])
                 continue
@@ -1094,6 +1121,7 @@ class HarnessScheduler:
                 db.log_event(conn, "auditor_prompt", message, agent_name=auditor["name"], payload={"card_id": card_id})
                 return
             except Exception:
+                self.requeue_agent_cards(conn, auditor, "tmux prompt failed")
                 db.update_agent_status(conn, auditor["name"], "crash", "tmux prompt failed", ended=True)
                 db.log_event(conn, "agent_missing", f"{auditor['name']} tmux prompt failed", agent_name=auditor["name"])
         last_spawn = float(db.get_meta(conn, "last_auditor_spawn_epoch", "0") or 0)
@@ -1170,7 +1198,9 @@ class HarnessScheduler:
                 db.log_event(conn, "coordinator_prompt", message, agent_name=coordinator["name"], payload={"card_id": card_id})
                 return
             except Exception:
-                pass
+                self.requeue_agent_cards(conn, coordinator, "tmux prompt failed")
+                db.update_agent_status(conn, coordinator["name"], "crash", "tmux prompt failed", ended=True)
+                db.log_event(conn, "agent_missing", f"{coordinator['name']} tmux prompt failed", agent_name=coordinator["name"])
         self.spawn_agent(conn, "Coordinator", "Respond to scheduler alert", extra=message, card_id=card_id)
 
     def prompt_manager(self, conn: sqlite3.Connection, message: str) -> None:

@@ -1035,10 +1035,15 @@ class HarnessTests(unittest.TestCase):
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
                 db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%missing", cwd=tmp)
+                lane_id = db.queue_worklane(conn, "Unreported work")
+                db.assign_card(conn, lane_id, "developer-1")
                 scheduler.check_agent_liveness(conn)
                 agent = db.list_agents(conn)[0]
+                lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
                 self.assertEqual(agent["current_status"], "crash")
                 self.assertIn("tmux pane no longer exists", agent["notes"])
+                self.assertEqual((lane["stage"], lane["status"]), ("planned", "queued"))
+                self.assertIn("ended without an accepted report", lane["notes"])
 
     def test_idle_liveness_prompts_are_throttled(self):
         old = (datetime.now(timezone.utc) - timedelta(seconds=max(IDLE_SECONDS, IDLE_PROMPT_SECONDS) + 1)).isoformat(timespec="seconds")
