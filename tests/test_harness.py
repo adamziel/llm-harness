@@ -24,6 +24,8 @@ class FakeTmux:
     def __init__(self):
         self.commands = []
         self.sent = []
+        self.killed_windows = []
+        self.killed_sessions = []
 
     def current_or_create_session(self, root):
         return "fake-session"
@@ -43,6 +45,14 @@ class FakeTmux:
 
     def send_prompt(self, target, message):
         self.sent.append((target, message))
+
+    def kill_window(self, session, window):
+        self.killed_windows.append((session, window))
+        return True
+
+    def kill_session(self, session):
+        self.killed_sessions.append(session)
+        return True
 
 
 class HarnessTests(unittest.TestCase):
@@ -128,7 +138,7 @@ class HarnessTests(unittest.TestCase):
     def test_public_help_only_lists_requested_commands(self):
         root = Path(__file__).resolve().parents[1]
         completed = subprocess.run([sys.executable, str(root / "harness"), "--help"], text=True, capture_output=True, check=True)
-        self.assertIn("{run,status,poke}", completed.stdout)
+        self.assertIn("{run,status,stop,poke}", completed.stdout)
         self.assertNotIn("test-loop", completed.stdout)
         self.assertNotIn("update-status", completed.stdout)
         self.assertNotIn("mcp-config", completed.stdout)
@@ -205,6 +215,45 @@ class HarnessTests(unittest.TestCase):
             with db.connect(root / ".harness" / "harness.sqlite3") as conn:
                 agents = db.list_agents(conn)
                 self.assertGreaterEqual(len(agents), 3)
+
+    def test_stop_cleans_harness_runtime_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = db.bootstrap(root)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(root, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "tmux_session", "session")
+                conn.commit()
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_session="session", tmux_window="developer-1", tmux_pane="%1", cwd=tmp)
+                db.queue_spawn_request(conn, role="Developer", title="later", prompt="do it")
+                db.queue_message(conn, "hello")
+            result = scheduler.stop()
+            with db.connect(paths.db) as conn:
+                agent = conn.execute("SELECT * FROM agents WHERE name = 'developer-1'").fetchone()
+                request = conn.execute("SELECT * FROM spawn_requests").fetchone()
+                message = conn.execute("SELECT * FROM messages").fetchone()
+                banner = db.get_meta(conn, "red_banner")
+            self.assertEqual(agent["current_status"], "stopped")
+            self.assertEqual(request["status"], "cancelled")
+            self.assertEqual(message["status"], "cancelled")
+            self.assertEqual(banner, "Harness stopped.")
+            self.assertIn(("session", "developer-1"), fake.killed_windows)
+            self.assertIn(("session", "manhole"), fake.killed_windows)
+            self.assertEqual(result["agents"], 1)
+
+    def test_stop_kills_harness_created_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "tmux_session", "llm-harness-repo")
+                conn.commit()
+            scheduler.stop()
+            self.assertEqual(fake.killed_sessions, ["llm-harness-repo"])
 
     def test_liveness_marks_missing_tmux_panes_crashed(self):
         class MissingTmux(FakeTmux):

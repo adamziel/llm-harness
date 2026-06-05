@@ -42,6 +42,7 @@ class HarnessScheduler:
 
         with db.connect(self.paths.db) as conn:
             db.init_db(conn)
+            db.set_meta(conn, "scheduler_pid", str(os.getpid()))
             self.ensure_git_repo(conn)
             self.check_gh(conn)
             self.ensure_goal(conn, goal)
@@ -55,6 +56,7 @@ class HarnessScheduler:
                 db.init_db(conn)
                 self.tick_once(conn, self.effective_team(conn, team))
                 refresh_reports(conn, self.root)
+                db.set_meta(conn, "scheduler_pid", "")
             return 0
 
         print("Harness scheduler running. Press Ctrl-C to stop; workers remain inspectable in tmux.", flush=True)
@@ -69,7 +71,109 @@ class HarnessScheduler:
             print("Harness scheduler stopped by user; agent tmux windows remain available.", flush=True)
             with db.connect(self.paths.db) as conn:
                 db.log_event(conn, "scheduler", "Harness scheduler stopped by user")
+                db.set_meta(conn, "scheduler_pid", "")
             return 130
+
+    def stop(self) -> dict[str, int]:
+        """Stop harness-owned runtime processes and mark durable state inactive."""
+
+        with db.connect(self.paths.db) as conn:
+            db.init_db(conn)
+            session = db.get_meta(conn, "tmux_session", "")
+            windows = self.harness_windows(conn)
+            killed_windows = 0
+            if session:
+                for window in sorted(windows):
+                    try:
+                        if self.tmux.kill_window(session, window):
+                            killed_windows += 1
+                    except Exception:
+                        continue
+                if session.startswith("llm-harness-"):
+                    try:
+                        self.tmux.kill_session(session)
+                    except Exception:
+                        pass
+            stopped_agents = conn.execute("SELECT COUNT(*) AS count FROM agents WHERE current_status = 'running'").fetchone()["count"]
+            conn.execute(
+                """
+                UPDATE agents
+                SET current_status = 'stopped', ended_at = ?, last_seen_at = ?, notes = 'Stopped by harness stop'
+                WHERE current_status = 'running'
+                """,
+                (db.utc_now(), db.utc_now()),
+            )
+            cancelled_spawns = conn.execute("UPDATE spawn_requests SET status = 'cancelled' WHERE status = 'queued'").rowcount
+            cancelled_messages = conn.execute("UPDATE messages SET status = 'cancelled' WHERE status = 'queued'").rowcount
+            pids = self.scheduler_pids(conn)
+            signaled = self.signal_processes(pids)
+            db.set_meta(conn, "scheduler_pid", "")
+            db.set_meta(conn, "tmux_session", "")
+            db.set_meta(conn, "tmux_attach", "")
+            db.set_meta(conn, "red_banner", "Harness stopped.")
+            janitor_result = run_janitor(conn, self.root, max_prompt_age_hours=0)
+            db.log_event(
+                conn,
+                "stop",
+                "Stopped harness runtime",
+                payload={
+                    "tmux_windows": killed_windows,
+                    "agents": int(stopped_agents),
+                    "spawn_requests": int(cancelled_spawns),
+                    "messages": int(cancelled_messages),
+                    "scheduler_processes": signaled,
+                    **janitor_result,
+                },
+            )
+            refresh_reports(conn, self.root)
+        return {
+            "tmux_windows": killed_windows,
+            "agents": int(stopped_agents),
+            "spawn_requests": int(cancelled_spawns),
+            "messages": int(cancelled_messages),
+            "scheduler_processes": signaled,
+            **janitor_result,
+        }
+
+    def harness_windows(self, conn: sqlite3.Connection) -> set[str]:
+        """Return tmux windows owned by this harness run."""
+
+        windows = {"manhole", "status", "updater", "tests"}
+        for row in conn.execute("SELECT tmux_window FROM agents WHERE tmux_window != ''"):
+            windows.add(str(row["tmux_window"]))
+        return windows
+
+    def scheduler_pids(self, conn: sqlite3.Connection) -> list[int]:
+        """Find running harness scheduler/watchdog processes for this repository."""
+
+        pids: set[int] = set()
+        current = os.getpid()
+        recorded = int(db.get_meta(conn, "scheduler_pid", "0") or 0)
+        if recorded > 0 and recorded != current:
+            pids.add(recorded)
+        for pid, command in _process_rows():
+            if pid == current:
+                continue
+            command_lower = command.lower()
+            if "harness" not in command_lower:
+                continue
+            if " run" not in command_lower and " watchdog" not in command_lower:
+                continue
+            if _process_cwd(pid) == self.root:
+                pids.add(pid)
+        return sorted(pids)
+
+    def signal_processes(self, pids: list[int]) -> int:
+        """Terminate scheduler processes without failing stop cleanup."""
+
+        signaled = 0
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                signaled += 1
+            except OSError:
+                continue
+        return signaled
 
     def tick_once(self, conn: sqlite3.Connection, team: str = "building") -> None:
         """Perform one scheduler pass: resources, requested spawns, liveness, janitor."""
@@ -507,6 +611,34 @@ def _tmux_target(agent: sqlite3.Row) -> str:
     if agent["tmux_session"] and agent["tmux_window"]:
         return f"{agent['tmux_session']}:{agent['tmux_window']}"
     return ""
+
+
+def _process_rows() -> list[tuple[int, str]]:
+    """Read process ids and commands for conservative stop-process matching."""
+
+    try:
+        result = subprocess.run(["ps", "-eo", "pid=,command="], text=True, capture_output=True, check=False)
+    except OSError:
+        return []
+    rows: list[tuple[int, str]] = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(maxsplit=1)
+        if not parts:
+            continue
+        try:
+            rows.append((int(parts[0]), parts[1] if len(parts) > 1 else ""))
+        except ValueError:
+            continue
+    return rows
+
+
+def _process_cwd(pid: int) -> Path | None:
+    """Resolve a process cwd on Linux; return None when unavailable."""
+
+    try:
+        return Path(f"/proc/{pid}/cwd").resolve()
+    except OSError:
+        return None
 
 
 def watchdog_loop(root: str | Path, once: bool = False) -> int:

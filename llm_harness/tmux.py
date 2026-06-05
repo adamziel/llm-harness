@@ -79,6 +79,16 @@ class Tmux:
 
         return self.run(["display-message", "-p", "-t", target, "#{pane_id}"], check=False).returncode == 0
 
+    def kill_window(self, session: str, window: str) -> bool:
+        """Kill one tmux window if it still exists."""
+
+        return self.run(["kill-window", "-t", f"{session}:{window}"], check=False).returncode == 0
+
+    def kill_session(self, session: str) -> bool:
+        """Kill a harness-created tmux session."""
+
+        return self.run(["kill-session", "-t", session], check=False).returncode == 0
+
     def switch_to(self, session: str, window: str) -> None:
         """Show the status window when the user is already inside tmux."""
 
