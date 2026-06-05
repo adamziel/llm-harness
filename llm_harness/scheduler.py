@@ -111,7 +111,6 @@ class HarnessScheduler:
             db.set_meta(conn, "tmux_session", "")
             db.set_meta(conn, "tmux_attach", "")
             db.set_meta(conn, "red_banner", "Harness stopped.")
-            janitor_result = run_janitor(conn, self.root, max_prompt_age_hours=0)
             db.log_event(
                 conn,
                 "stop",
@@ -122,7 +121,6 @@ class HarnessScheduler:
                     "spawn_requests": int(cancelled_spawns),
                     "messages": int(cancelled_messages),
                     "scheduler_processes": signaled,
-                    **janitor_result,
                 },
             )
             refresh_reports(conn, self.root)
@@ -132,7 +130,6 @@ class HarnessScheduler:
             "spawn_requests": int(cancelled_spawns),
             "messages": int(cancelled_messages),
             "scheduler_processes": signaled,
-            **janitor_result,
         }
 
     def harness_windows(self, conn: sqlite3.Connection) -> set[str]:

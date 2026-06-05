@@ -229,6 +229,8 @@ class HarnessTests(unittest.TestCase):
                 db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_session="session", tmux_window="developer-1", tmux_pane="%1", cwd=tmp)
                 db.queue_spawn_request(conn, role="Developer", title="later", prompt="do it")
                 db.queue_message(conn, "hello")
+            (paths.tmp / "keep.tmp").write_text("next janitor owns this")
+            (paths.prompts / "keep.md").write_text("next janitor owns this")
             result = scheduler.stop()
             with db.connect(paths.db) as conn:
                 agent = conn.execute("SELECT * FROM agents WHERE name = 'developer-1'").fetchone()
@@ -242,6 +244,10 @@ class HarnessTests(unittest.TestCase):
             self.assertIn(("session", "developer-1"), fake.killed_windows)
             self.assertIn(("session", "manhole"), fake.killed_windows)
             self.assertEqual(result["agents"], 1)
+            self.assertNotIn("tmp_entries", result)
+            self.assertNotIn("prompt_files", result)
+            self.assertTrue((paths.tmp / "keep.tmp").exists())
+            self.assertTrue((paths.prompts / "keep.md").exists())
 
     def test_stop_kills_harness_created_session(self):
         with tempfile.TemporaryDirectory() as tmp:

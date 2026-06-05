@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     status = sub.add_parser("status", help="Show the Unicode/ANSI dashboard")
     status.add_argument("--refresh", action="store_true", help=argparse.SUPPRESS)
 
-    sub.add_parser("stop", help="Stop harness agents and cleanup runtime windows")
+    sub.add_parser("stop", help="Stop harness agents and runtime windows")
 
     poke = sub.add_parser("poke", help="Inject a prompt into running agents")
     poke.add_argument("message")
