@@ -224,6 +224,9 @@ class HarnessTests(unittest.TestCase):
                     "UPDATE worklanes SET owner_agent_id = ?, branch_name = ?, worktree_path = ? WHERE id = ?",
                     (agent["id"], "work/developer-1", worktree, lane_id),
                 )
+                queued_lane_id = db.queue_worklane(conn, "Review queued runtime lane", status="queued")
+                ready_lane_id = db.queue_worklane(conn, "Merge finished runtime lane", status="ready_for_integration")
+                conn.execute("UPDATE worklanes SET branch_name = ? WHERE id = ?", ("work/developer-99", ready_lane_id))
                 conn.commit()
                 db.log_event(conn, "note", "status is alive")
                 md, html = refresh_reports(conn, tmp)
@@ -238,6 +241,9 @@ class HarnessTests(unittest.TestCase):
                 self.assertIn("Active work (agents ↔ lanes)", text)
                 self.assertIn("developer-1 [Developer/working] → lane#", text)
                 self.assertIn("Fix parser lowering", text)
+                self.assertIn("Unassigned lanes", text)
+                self.assertIn(f"lane#{queued_lane_id} queued/Developer: Review queued runtime lane", text)
+                self.assertIn(f"lane#{ready_lane_id} ready_for_integration/Developer: Merge finished runtime lane (work/developer-99)", text)
                 self.assertIn("status is alive", text)
 
     def test_status_update_commits_and_pushes_status_artifacts(self):

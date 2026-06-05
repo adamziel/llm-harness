@@ -248,6 +248,40 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         LIMIT 12
         """
     ).fetchall()
+    pending_lanes = conn.execute(
+        """
+        SELECT
+            w.id,
+            w.title,
+            w.status,
+            w.role_type,
+            w.branch_name,
+            w.expected_metric_impact
+        FROM worklanes w
+        WHERE w.status IN ('queued', 'assigned', 'needs_verification', 'ready_for_integration', 'integration_failed')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM agents a
+              WHERE a.current_status NOT IN ('crash', 'success', 'stopped')
+                AND (
+                    w.owner_agent_id = a.id
+                    OR (a.branch != '' AND w.branch_name = a.branch)
+                    OR (a.worktree != '' AND w.worktree_path = a.worktree)
+                )
+          )
+        ORDER BY
+            CASE w.status
+                WHEN 'integration_failed' THEN 0
+                WHEN 'ready_for_integration' THEN 1
+                WHEN 'needs_verification' THEN 2
+                WHEN 'assigned' THEN 3
+                ELSE 4
+            END,
+            w.priority ASC,
+            w.id ASC
+        LIMIT 8
+        """
+    ).fetchall()
     queued_integration = conn.execute(
         "SELECT COUNT(*) AS count, COALESCE(SUM(expected_metric_impact), 0) AS delta FROM worklanes WHERE status IN ('needs_verification', 'ready_for_integration')"
     ).fetchone()
@@ -265,6 +299,7 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         "metric_history": [dict(row) for row in metric_history],
         "events": [dict(row) for row in events],
         "active_work": [dict(row) for row in active_work],
+        "pending_lanes": [dict(row) for row in pending_lanes],
         "queued_integration": dict(queued_integration) if queued_integration else {"count": 0, "delta": 0},
         "failed_integration": dict(failed_integration) if failed_integration else {"count": 0},
         "metadata": metadata,
@@ -323,6 +358,11 @@ def dashboard(conn: sqlite3.Connection) -> str:
     extra = max(0, len(work_lines) - 8)
     if extra:
         lines.append(_box_line(width, f"… {extra} more active work rows"))
+    lane_lines = _pending_lane_lines(data.get("pending_lanes", []))
+    if lane_lines:
+        lines.append(_box_line(width, "Unassigned lanes", ANSI["bold"]))
+        for line in lane_lines:
+            lines.append(_box_line(width, line))
 
     lines.append(_box_sep(width))
     lines.append(_box_line(width, "Recent events", ANSI["bold"]))
@@ -354,6 +394,23 @@ def _active_work_lines(rows: object) -> list[str]:
         if branch:
             lane = f"{lane} ({branch})"
         lines.append(f"{agent} [{role}/{status}] → {lane}")
+    return lines
+
+
+def _pending_lane_lines(rows: object) -> list[str]:
+    """Render queued or integration-ready lanes that have no active agent."""
+
+    if not isinstance(rows, list) or not rows:
+        return []
+    lines: list[str] = []
+    for row in rows:
+        lane_id = row.get("id")
+        status = str(row.get("status") or "unknown")
+        role = str(row.get("role_type") or "Developer")
+        title = str(row.get("title") or "untitled")
+        branch = str(row.get("branch_name") or "")
+        branch_text = f" ({branch})" if branch else ""
+        lines.append(f"lane#{lane_id} {status}/{role}: {title}{branch_text}")
     return lines
 
 
