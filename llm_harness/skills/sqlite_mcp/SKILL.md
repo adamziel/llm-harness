@@ -12,11 +12,14 @@ Tools:
   crashes, prompts sent, completed work, and anything the scheduler or Status
   reporter should know.
 - `memory_query(sql, params?)` — read harness tables with `SELECT`, `WITH`, or
-  `PRAGMA`. Useful tables include `goals`, `agents`, `work_lanes`, `test_runs`,
-  `test_results`, `bug_reports`, `events`, `resource_samples`, and
-  `metric_samples`.
+  `PRAGMA`. Useful tables include `goals`, `agents`, `worklanes`,
+  `integration_attempts`, `agent_reports`, `test_runs`, `test_results`,
+  `issues`, `events`, `resource_samples`, and `metric_samples`. Use
+  `PRAGMA table_xinfo(table)` before assuming column names.
 - `memory_update_agent(name, status, notes?, ended?)` — update your own status
   frequently enough for the watchdog to tell progress from idleness.
+- `agent_report(...)` — submit structured Developer or Integrator reports.
+  Structured reports are authoritative for worklane status.
 - `spawn_agent(role, title, prompt, requester?, notes?)` — request another agent.
   This deliberately routes through the central scheduler so the harness knows the
   whole process tree. Do not start Codex directly.

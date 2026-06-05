@@ -58,7 +58,7 @@ def run_tests_once(conn: sqlite3.Connection, root: str | Path, command: list[str
     if status == "failed":
         queue_test_fix_lane(conn, run_id, parsed, commit)
         maybe_invoke_architect(conn)
-        db.log_event(conn, "tests_failed", "Full test suite failed; Manager should prioritize fixes", payload={"run_id": run_id})
+        db.log_event(conn, "tests_failed", "Full test suite failed; Coordinator should prioritize stabilization lanes", payload={"run_id": run_id})
     else:
         resolve_fixed_tests(conn, parsed, commit)
         db.log_event(conn, "tests_passed", "Full test suite passed", payload={"run_id": run_id})
@@ -117,14 +117,16 @@ def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dic
     failures = [result["nodeid"] for result in results if result.get("status") in {"failed", "error"}]
     title = f"Fix failing tests from run {run_id}"
     notes = "Failed tests: " + (", ".join(failures) if failures else "see full test log") + f"\nFirst failing commit: {commit}"
-    conn.execute(
-        """
-        INSERT INTO work_lanes(ts, title, role, status, notes)
-        VALUES (?, ?, 'Developer', 'queued', ?)
-        """,
-        (db.utc_now(), title, notes),
+    db.queue_worklane(
+        conn,
+        title,
+        role_type="Developer",
+        status="queued",
+        notes=notes,
+        priority=0,
+        goal="Restore the main-branch full test suite.",
+        acceptance_criteria="The failing tests pass in the deterministic test loop.",
     )
-    conn.commit()
 
 
 def resolve_fixed_tests(conn: sqlite3.Connection, results: list[dict[str, Any]], commit: str) -> None:
@@ -141,6 +143,7 @@ def resolve_fixed_tests(conn: sqlite3.Connection, results: list[dict[str, Any]],
         # still proves previously open test failures are no longer present.
         fixed_ids = [row["id"] for row in conn.execute("SELECT id FROM bug_reports WHERE status = 'open'").fetchall()]
     for bug_id in fixed_ids:
+        bug = conn.execute("SELECT test_nodeid FROM bug_reports WHERE id = ?", (bug_id,)).fetchone()
         conn.execute(
             """
             UPDATE bug_reports
@@ -149,6 +152,15 @@ def resolve_fixed_tests(conn: sqlite3.Connection, results: list[dict[str, Any]],
             """,
             (commit, db.utc_now(), bug_id),
         )
+        if bug:
+            conn.execute(
+                """
+                UPDATE issues
+                SET status = 'fixed', fixed_commit = ?, resolution = 'Fixed before or during this passing test run.', updated_at = ?
+                WHERE issue_key = ?
+                """,
+                (commit, db.utc_now(), f"test:{bug['test_nodeid']}"),
+            )
     conn.commit()
 
 

@@ -52,6 +52,27 @@ TOOLS = [
         },
     },
     {
+        "name": "agent_report",
+        "description": "Store a structured Developer or Integrator report and update its worklane status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string"},
+                "integrator_id": {"type": "string"},
+                "worklane_id": {"type": "string"},
+                "status": {"type": "string"},
+                "summary": {"type": "string"},
+                "files_changed": {"type": "array"},
+                "commits": {"type": "array"},
+                "tests_run": {"type": "array"},
+                "test_result": {"type": "string"},
+                "blockers": {"type": "array"},
+                "next_action": {"type": "string"},
+            },
+            "required": ["status", "summary"],
+        },
+    },
+    {
         "name": "spawn_agent",
         "description": "Request a new Codex agent through the central harness scheduler.",
         "inputSchema": {
@@ -135,6 +156,9 @@ class HarnessMCP:
                     notes = f"{requested_status}: {notes}" if notes else requested_status
                 db.update_agent_status(conn, str(args["name"]), status, notes, bool(args.get("ended", False)))
                 return _text({"ok": True})
+            if name == "agent_report":
+                report_id = db.record_agent_report(conn, args)
+                return _text({"report_id": report_id, "ok": True})
             if name == "spawn_agent":
                 request_id = db.queue_spawn_request(
                     conn,

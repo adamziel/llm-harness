@@ -188,6 +188,89 @@ class HarnessTests(unittest.TestCase):
                 text = result["content"][0]["text"]
                 self.assertIn("created_at", text)
 
+    def test_init_repairs_setup_without_starting_resident_team(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with (
+                mock.patch.object(scheduler, "check_gh"),
+                mock.patch.object(scheduler, "check_local_tools"),
+                mock.patch.object(scheduler, "check_harness_mcp", return_value=True),
+                mock.patch.object(scheduler, "initialize_index"),
+            ):
+                self.assertEqual(scheduler.init_project(goal="Ship refined harness"), 0)
+            self.assertTrue((root / ".git").exists())
+            self.assertTrue((root / "DEVELOPMENT.md").exists())
+            self.assertTrue((root / "PLAN.md").exists())
+            self.assertTrue((root / ".harness" / "STATUS_TEMPLATE.md").exists())
+            self.assertTrue((root / ".harness" / "prompts" / "roles" / "coordinator.md").exists())
+            self.assertEqual(scheduler.tmux.commands, [])
+            with db.connect(root / ".harness" / "harness.sqlite3") as conn:
+                self.assertTrue(db.get_meta(conn, "initialized_at"))
+
+    def test_run_requires_init_before_resident_team_starts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            self.assertEqual(scheduler.run(goal="later", once=True), 1)
+            self.assertEqual(fake.commands, [])
+
+    def test_refined_schema_has_required_control_plane_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                names = {
+                    row["name"]
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
+                }
+            for name in {
+                "runs",
+                "agents",
+                "events",
+                "worklanes",
+                "agent_messages",
+                "agent_reports",
+                "worktrees",
+                "commits",
+                "integration_attempts",
+                "test_runs",
+                "test_results",
+                "issues",
+                "resource_samples",
+                "status_snapshots",
+                "settings",
+            }:
+                self.assertIn(name, names)
+
+    def test_agent_report_updates_worklane_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                lane_id = db.queue_worklane(conn, "Implement focused fix", acceptance_criteria="Focused test passes")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", cwd=tmp)
+            server = HarnessMCP(tmp, paths.db)
+            result = server.call_tool(
+                "agent_report",
+                {
+                    "agent_id": "developer-1",
+                    "worklane_id": str(lane_id),
+                    "status": "ready_for_integration",
+                    "summary": "Implemented and tested",
+                    "files_changed": ["x.py"],
+                    "commits": ["abc"],
+                    "tests_run": ["python -m unittest"],
+                    "test_result": "pass",
+                    "blockers": [],
+                    "next_action": "integrate",
+                },
+            )
+            self.assertIn('"ok": true', result["content"][0]["text"])
+            with db.connect(paths.db) as conn:
+                lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+                self.assertEqual(lane["status"], "ready_for_integration")
+                self.assertEqual(conn.execute("SELECT COUNT(*) AS count FROM agent_reports").fetchone()["count"], 1)
+
     def test_mcp_activity_status_keeps_agent_lifecycle_running(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
@@ -216,7 +299,7 @@ class HarnessTests(unittest.TestCase):
     def test_public_help_only_lists_requested_commands(self):
         root = Path(__file__).resolve().parents[1]
         completed = subprocess.run([sys.executable, str(root / "harness"), "--help"], text=True, capture_output=True, check=True)
-        self.assertIn("{run,status,stop,poke}", completed.stdout)
+        self.assertIn("{init,run,status,stop,poke,doctor,logs,lanes,agents}", completed.stdout)
         self.assertNotIn("test-loop", completed.stdout)
         self.assertNotIn("update-status", completed.stdout)
         self.assertNotIn("mcp-config", completed.stdout)
@@ -232,14 +315,15 @@ class HarnessTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(__version__, match.group(1))
 
-    def test_building_team_uses_seventy_five_percent_of_cpu_cores_for_developers(self):
-        self.assertEqual(developer_count_for_building(8), 6)
+    def test_building_team_uses_conservative_medium_developer_cap(self):
+        self.assertEqual(developer_count_for_building(8), 4)
         self.assertEqual(developer_count_for_building(6), 4)
         self.assertEqual(developer_count_for_building(1), 1)
         specs = {spec.name: spec.min_count for spec in specs_for_team("building")}
-        self.assertEqual(specs["Manager"], 1)
+        self.assertEqual(specs["Coordinator"], 1)
+        self.assertEqual(specs["Developer"], 4)
         self.assertEqual(specs["Integrator"], 1)
-        self.assertEqual(set(specs), {"Manager", "Developer", "Integrator"})
+        self.assertEqual(set(specs), {"Coordinator", "Developer", "Integrator"})
 
     def test_missing_development_md_is_created_before_agents_start(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -323,6 +407,8 @@ class HarnessTests(unittest.TestCase):
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
                 db.set_meta(conn, "red_banner", "Harness stopped.")
+                db.set_meta(conn, "initialized_at", db.utc_now())
+                conn.commit()
             fake = FakeTmux()
             scheduler = HarnessScheduler(root, tmux=fake)
             code = scheduler.run(goal="Build something", team="minimal", once=True)
@@ -347,7 +433,7 @@ class HarnessTests(unittest.TestCase):
             scheduler = HarnessScheduler(tmp, tmux=fake)
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
-                db.upsert_agent(conn, name="manager-1", role="Manager", current_status="working", tmux_pane="%manager", cwd=tmp)
+                db.upsert_agent(conn, name="coordinator-1", role="Coordinator", current_status="working", tmux_pane="%coordinator", cwd=tmp)
                 for index, status in enumerate(["working", "idle", "waiting", "running"], start=1):
                     db.upsert_agent(conn, name=f"developer-{index}", role="Developer", current_status=status, tmux_pane=f"%developer-{index}", cwd=tmp)
                 db.upsert_agent(conn, name="integrator-1", role="Integrator", current_status="merging", tmux_pane="%integrator", cwd=tmp)
@@ -367,7 +453,7 @@ class HarnessTests(unittest.TestCase):
             scheduler = HarnessScheduler(tmp, tmux=fake)
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
-                db.upsert_agent(conn, name="manager-1", role="Manager", current_status="running", tmux_pane="%manager", cwd=tmp)
+                db.upsert_agent(conn, name="coordinator-1", role="Coordinator", current_status="running", tmux_pane="%coordinator", cwd=tmp)
                 db.upsert_agent(conn, name="integrator-1", role="Integrator", current_status="running", tmux_pane="%integrator", cwd=tmp)
                 db.upsert_agent(conn, name="developer-1", role="Developer", current_status="working", tmux_pane="%live", cwd=tmp)
                 db.upsert_agent(conn, name="developer-2", role="Developer", current_status="success", tmux_pane="%done", cwd=tmp)
@@ -376,8 +462,27 @@ class HarnessTests(unittest.TestCase):
                     scheduler.ensure_team(conn, "building")
                 missing = conn.execute("SELECT current_status FROM agents WHERE name = 'developer-3'").fetchone()["current_status"]
             spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
-            self.assertEqual(spawned_developers, ["developer-4", "developer-5"])
+            self.assertEqual(spawned_developers, ["developer-4", "developer-5", "developer-6"])
             self.assertEqual(missing, "crash")
+
+    def test_integration_backpressure_prevents_developer_scaleup(self):
+        old = str(__import__("time").time() - 21 * 60)
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="coordinator-1", role="Coordinator", current_status="running", tmux_pane="%coordinator", cwd=tmp)
+                db.upsert_agent(conn, name="integrator-1", role="Integrator", current_status="running", tmux_pane="%integrator", cwd=tmp)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer", cwd=tmp)
+                for index in range(3):
+                    db.queue_worklane(conn, f"Ready lane {index}", status="ready_for_integration")
+                db.set_meta(conn, "integration_backlog_since", old)
+                scheduler.ensure_team(conn, "building")
+                self.assertEqual(db.get_meta(conn, "integration_backpressure_active"), "1")
+            spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
+            self.assertEqual(spawned_developers, [])
 
     def test_stop_cleans_harness_runtime_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -530,18 +635,18 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(stale["current_status"], "crash")
             self.assertEqual(fake.sent, [("%live", "check this")])
 
-    def test_prompt_manager_reuses_active_manager(self):
+    def test_prompt_coordinator_reuses_active_coordinator(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
             fake = FakeTmux()
             scheduler = HarnessScheduler(tmp, tmux=fake)
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
-                db.upsert_agent(conn, name="manager-1", role="Manager", current_status="working", tmux_pane="%manager", cwd=tmp)
-                scheduler.prompt_manager(conn, "reorganize")
-            manager_windows = [window for _, window, _ in fake.commands if window.startswith("manager-")]
-            self.assertEqual(manager_windows, [])
-            self.assertEqual(fake.sent, [("%manager", "reorganize")])
+                db.upsert_agent(conn, name="coordinator-1", role="Coordinator", current_status="working", tmux_pane="%coordinator", cwd=tmp)
+                scheduler.prompt_coordinator(conn, "reorganize")
+            coordinator_windows = [window for _, window, _ in fake.commands if window.startswith("coordinator-")]
+            self.assertEqual(coordinator_windows, [])
+            self.assertEqual(fake.sent, [("%coordinator", "reorganize")])
 
     def test_architect_spawn_requests_reuse_one_active_architect(self):
         with tempfile.TemporaryDirectory() as tmp:

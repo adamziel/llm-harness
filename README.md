@@ -6,10 +6,14 @@ inspectable and restartable instead of trusting a single long-running chat.
 
 ## Run it without cloning
 
-Download the latest single-file release and start the harness:
+Download the latest single-file release, initialize the project, then start the
+resident team:
 
 ```bash
-curl -fsSL https://github.com/adamziel/llm-harness/releases/latest/download/harness -o harness && chmod +x harness && ./harness run --goal "Describe what you want the harness to build"
+curl -fsSL https://github.com/adamziel/llm-harness/releases/latest/download/harness -o harness
+chmod +x harness
+./harness init --goal "Describe what you want the harness to build"
+./harness run
 ```
 
 Requires `python3`, `git`, `tmux`, `codex`, and `gh` for GitHub publishing. The
@@ -18,12 +22,18 @@ running if GitHub auth is unavailable.
 
 ## Commands
 
-The user-facing CLI has only the three commands requested in `harness.md`:
+The main user-facing CLI is:
 
 ```bash
-./harness run --goal "ship the project"   # start or resume everything
+./harness init --goal "ship the project"  # initialize or repair setup
+./harness run                             # start or resume resident sessions
 ./harness status                          # show the Unicode/ANSI dashboard
 ./harness poke "message"                  # inject a message into the running system
+./harness stop                            # stop harness-owned runtime windows
+./harness doctor                          # print setup diagnostics
+./harness lanes                           # inspect worklanes
+./harness agents                          # inspect agents
+./harness logs                            # inspect recent events
 ```
 
 `run` starts the internal updater, test loop, janitor, MCP, watchdog/service
@@ -31,19 +41,20 @@ helpers, status page generation, and tmux windows as needed. Those internal
 entrypoints are intentionally hidden from help because users should not run them
 directly.
 
-On first run, the harness records the goal in `.harness/harness.sqlite3`, creates
-`PLAN.md` if needed, starts a tmux session (or uses the current one), opens
-`manhole`, `status`, `updater`, and `tests` windows, and then maintains the
-selected team preset. When building starts, the builder team is 1 Manager,
-`floor(cpu_cores * 0.75)` Developers (minimum 1), and 1 Integrator. All Codex
-worker commands are generated with `--yolo` and `--model gpt-5.5 -c model_reasoning_effort="xhigh"`.
+`init` records the goal in `.harness/harness.sqlite3`, initializes Git if needed,
+creates `DEVELOPMENT.md`, `PLAN.md`, status templates, role prompt files, and
+validates the harness MCP. `run` then starts a small resident control plane:
+Coordinator, Developer pool, Integrator, and Manhole/support windows. Conceptual
+roles such as Architect, Conflict Resolver, Lane Scout, and Goal Planner are
+capabilities invoked as short-lived jobs rather than standing sessions. All
+Codex worker commands are generated with `--yolo` and `--model gpt-5.5 -c model_reasoning_effort="xhigh"`.
 
 ## Persistent state
 
-SQLite is the source of truth. It stores goals, events, agents, tmux panes,
-worktrees, work lanes, resource samples, test runs, parsed test results, bug
-reports, metric samples, code index rows, prompt messages, and scheduler-routed
-spawn requests.
+SQLite is the source of truth. It stores runs, goals, events, agents, tmux panes,
+worktrees, worklanes, agent messages, structured agent reports, integration
+attempts, issues, resource samples, test runs, parsed test results, bug history,
+metric samples, code index rows, settings, and scheduler-routed spawn requests.
 
 The MCP server exposes that state through deterministic tools documented in
 `llm_harness/skills/sqlite_mcp/SKILL.md`.

@@ -23,11 +23,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="harness", description="Deterministic Codex agent harness")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--root", default=os.getcwd(), help=argparse.SUPPRESS)
-    sub = parser.add_subparsers(dest="command", required=True, metavar="{run,status,stop,poke}")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="{init,run,status,stop,poke,doctor,logs,lanes,agents}")
+
+    init = sub.add_parser("init", help="Initialize or repair harness state")
+    init.add_argument("--goal", help="Goal to record during initialization")
 
     run = sub.add_parser("run", help="Start or resume the scheduler")
     run.add_argument("--goal", help="Goal to record on first start")
-    run.add_argument("--team", default="auto", choices=sorted(["auto", "planning", "building", "minimal"]), help=argparse.SUPPRESS)
+    run.add_argument("--team", default="auto", choices=sorted(["auto", "small", "medium", "large", "building", "minimal"]), help=argparse.SUPPRESS)
     run.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
 
     status = sub.add_parser("status", help="Show the Unicode/ANSI dashboard")
@@ -38,6 +41,11 @@ def main(argv: list[str] | None = None) -> int:
     poke = sub.add_parser("poke", help="Inject a prompt into running agents")
     poke.add_argument("message")
     poke.add_argument("--target", default="broadcast", help="Agent name, role, or broadcast")
+
+    sub.add_parser("doctor", help="Show harness setup diagnostics")
+    sub.add_parser("logs", help="Show recent harness events")
+    sub.add_parser("lanes", help="Show worklanes")
+    sub.add_parser("agents", help="Show agents")
 
     _hidden_command(sub, "update-status")
     _hidden_command(sub, "janitor")
@@ -60,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root).resolve()
     paths = db.bootstrap(root)
 
+    if args.command == "init":
+        return HarnessScheduler(root).init_project(goal=args.goal)
     if args.command == "run":
         return HarnessScheduler(root).run(goal=args.goal, team=args.team, once=args.once)
     if args.command == "status":
@@ -79,6 +89,30 @@ def main(argv: list[str] | None = None) -> int:
             db.init_db(conn)
             refresh_reports(conn, root)
             print(dashboard(conn))
+        return 0
+    if args.command == "doctor":
+        with db.connect(paths.db) as conn:
+            db.init_db(conn)
+            metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM metadata ORDER BY key")}
+            print(json.dumps(metadata, indent=2, sort_keys=True))
+        return 0
+    if args.command == "logs":
+        with db.connect(paths.db) as conn:
+            db.init_db(conn)
+            rows = [dict(row) for row in conn.execute("SELECT id, ts, type, agent_name, message FROM events ORDER BY id DESC LIMIT 50")]
+            print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    if args.command == "lanes":
+        with db.connect(paths.db) as conn:
+            db.init_db(conn)
+            rows = [dict(row) for row in conn.execute("SELECT * FROM worklanes ORDER BY priority, id LIMIT 100")]
+            print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    if args.command == "agents":
+        with db.connect(paths.db) as conn:
+            db.init_db(conn)
+            rows = [dict(row) for row in db.list_agents(conn)]
+            print(json.dumps(rows, indent=2, sort_keys=True))
         return 0
     if args.command == "update-status":
         with db.connect(paths.db) as conn:

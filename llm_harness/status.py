@@ -115,6 +115,8 @@ def refresh_reports(conn: sqlite3.Connection, root: str | Path) -> tuple[Path, P
     status_html.write_text(html_text)
     (root_path / "progress.md").write_text(md)
     (root_path / "progress.html").write_text(html_text)
+    conn.execute("INSERT INTO status_snapshots(created_at, summary_json) VALUES (?, ?)", (generated, json.dumps(data, sort_keys=True)))
+    conn.commit()
     return status_md, status_html
 
 
@@ -123,14 +125,17 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
 
     goal = conn.execute("SELECT * FROM goals WHERE id = 1").fetchone()
     agents = conn.execute("SELECT * FROM agents ORDER BY role, name").fetchall()
-    work_lanes = conn.execute("SELECT * FROM work_lanes ORDER BY id DESC LIMIT 10").fetchall()
+    work_lanes = conn.execute("SELECT * FROM worklanes ORDER BY id DESC LIMIT 10").fetchall()
     test_run = conn.execute("SELECT * FROM test_runs ORDER BY id DESC LIMIT 1").fetchone()
     resources = conn.execute("SELECT * FROM resource_samples ORDER BY id DESC LIMIT 24").fetchall()
     metric = latest_metric(conn)
     metric_history = conn.execute("SELECT * FROM metric_samples ORDER BY id DESC LIMIT 24").fetchall()
     events = recent_events(conn, 12)
     queued_integration = conn.execute(
-        "SELECT COUNT(*) AS count, COALESCE(SUM(expected_metric_delta), 0) AS delta FROM work_lanes WHERE status = 'awaiting_integration'"
+        "SELECT COUNT(*) AS count, COALESCE(SUM(expected_metric_impact), 0) AS delta FROM worklanes WHERE status IN ('needs_verification', 'ready_for_integration')"
+    ).fetchone()
+    failed_integration = conn.execute(
+        "SELECT COUNT(*) AS count FROM worklanes WHERE status = 'integration_failed'"
     ).fetchone()
     metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM metadata").fetchall()}
     return {
@@ -143,6 +148,7 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         "metric_history": [dict(row) for row in metric_history],
         "events": [dict(row) for row in events],
         "queued_integration": dict(queued_integration) if queued_integration else {"count": 0, "delta": 0},
+        "failed_integration": dict(failed_integration) if failed_integration else {"count": 0},
         "metadata": metadata,
     }
 
@@ -187,6 +193,9 @@ def dashboard(conn: sqlite3.Connection) -> str:
     queued = data["queued_integration"]
     if isinstance(queued, dict):
         lines.append(_box_line(width, f"Awaiting integration: {queued.get('count', 0)} lanes, expected metric delta {queued.get('delta', 0)}"))
+    failed = data.get("failed_integration")
+    if isinstance(failed, dict) and failed.get("count", 0):
+        lines.append(_box_line(width, f"Integration failed queue: {failed.get('count', 0)} lanes", ANSI["red"]))
 
     lines.append(_box_sep(width))
     lines.append(_box_line(width, "Recent events", ANSI["bold"]))
@@ -206,7 +215,7 @@ def _markdown_context(data: dict[str, object]) -> dict[str, str]:
         "goal": str(goal.get("text", "No goal recorded yet") if isinstance(goal, dict) else "No goal recorded yet"),
         "metric": _metric_text(metric),
         "agents": _markdown_table(data.get("agents", []), ["name", "role", "current_status", "tmux_window", "worktree"]),
-        "work_lanes": _markdown_table(data.get("work_lanes", []), ["id", "title", "role", "status", "expected_metric_delta"]),
+        "work_lanes": _markdown_table(data.get("work_lanes", []), ["id", "title", "role_type", "status", "integration_queue", "expected_metric_impact"]),
         "tests": _test_text(data.get("test_run")),
         "resources": _resource_text(data.get("resources", [])),
         "events": "\n".join(f"- {e['ts']} **{e['type']}**: {e['message']}" for e in data.get("events", [])) or "No events yet.",
@@ -229,7 +238,7 @@ def _html_context(data: dict[str, object]) -> dict[str, str]:
         "resources_html": _html_resource(data.get("resources", [])),
         "tests_html": html.escape(_test_text(data.get("test_run"))).replace("\n", "<br>"),
         "agents_html": _html_table(data.get("agents", []), ["name", "role", "current_status", "tmux_window", "worktree"]),
-        "work_lanes_html": _html_table(data.get("work_lanes", []), ["id", "title", "role", "status", "expected_metric_delta"]),
+        "work_lanes_html": _html_table(data.get("work_lanes", []), ["id", "title", "role_type", "status", "integration_queue", "expected_metric_impact"]),
         "events_html": "<ul>" + "".join(f"<li>{html.escape(e['ts'])} <strong>{html.escape(e['type'])}</strong>: {html.escape(e['message'])}</li>" for e in data.get("events", [])) + "</ul>",
         "next_steps_html": html.escape(_next_steps(data)),
     }
@@ -329,9 +338,9 @@ def _html_table(rows: object, columns: list[str]) -> str:
 def _next_steps(data: dict[str, object]) -> str:
     lanes = data.get("work_lanes", [])
     if isinstance(lanes, list) and lanes:
-        queued = [lane for lane in lanes if lane.get("status") in {"queued", "ready"}]
+        queued = [lane for lane in lanes if lane.get("status") in {"queued", "assigned", "needs_verification", "ready_for_integration"}]
         if queued:
-            return "Start or finish queued lane: " + str(queued[0].get("title"))
+            return "Move next worklane forward: " + str(queued[0].get("title"))
     if not data.get("goal"):
         return "Capture the user goal and deterministic success metric."
     return "Keep scheduler loops running, refresh status, and audit measurable progress."

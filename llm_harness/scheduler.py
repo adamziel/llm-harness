@@ -14,22 +14,36 @@ from typing import Any
 
 from . import db
 from .codex import MCP_SERVER_NAME, build_codex_command, codex_mcp_config_args
+from .indexer import refresh_index
 from .janitor import run_janitor
 from .resources import sample_resources
 from .roles import prompt_for_role, slug_role, specs_for_team
-from .status import refresh_reports
+from .status import ensure_templates, refresh_reports
 from .tmux import Tmux, TmuxUnavailable, _session_name, shell_command
 
 IDLE_SECONDS = 30 * 60
 IDLE_PROMPT_SECONDS = 30 * 60
 AUDITOR_SPAWN_SECONDS = 60
-SINGLETON_SPAWN_ROLES = {"Architect"}
+SINGLETON_SPAWN_ROLES = {
+    "Architect",
+    "Auditor",
+    "Verifier",
+    "Goal Planner",
+    "Lane Scout",
+    "Dependency Mapper",
+    "Conflict Resolver",
+    "Reproducer",
+    "Prompt/Protocol Maintainer",
+    "Narrative Summarizer",
+}
 JANITOR_SECONDS = 60 * 60
 LOW_RESOURCE_SECONDS = 60
 HIGH_RESOURCE_SECONDS = 30
+INTEGRATION_BACKPRESSURE_SECONDS = 20 * 60
+INTEGRATION_READY_STATUSES = ("needs_verification", "ready_for_integration")
 DEFAULT_DEVELOPMENT_MD = """# Development Guide
 
-This starter file was created by `./harness run` because DEVELOPMENT.md was missing.
+This starter file was created by the harness because DEVELOPMENT.md was missing.
 Edit it with project-specific commands and conventions for future agents.
 
 ## Build
@@ -44,8 +58,16 @@ Edit it with project-specific commands and conventions for future agents.
 
 ## Agent workflow
 
+- Work on one assigned worklane at a time.
 - Keep edits narrow and preserve existing style.
+- Avoid creating a single huge file with the entire project.
+- Avoid fragmenting every tiny thing into its own file or function.
+- Write intention-led docblocks for most functions and types you create; explain why they exist.
+- Document what/how only when it is not obvious from the code.
+- Commit reasonably often to preserve progress.
+- Report structured status through the harness MCP `agent_report` tool.
 - Record meaningful status through the harness MCP tools.
+- Avoid unsupported claims of completion; cite tests, files, commits, or other evidence.
 - Leave unrelated files untouched.
 """
 
@@ -58,15 +80,41 @@ class HarnessScheduler:
         self.paths = db.bootstrap(self.root)
         self.tmux = tmux or Tmux()
 
+    def init_project(self, goal: str | None = None) -> int:
+        """Initialize or repair harness state without starting the resident team."""
+
+        def initialize(conn: sqlite3.Connection) -> int:
+            self.ensure_git_repo(conn)
+            self.check_gh(conn)
+            self.check_project_context(conn)
+            ensure_templates(self.root)
+            self.write_role_prompt_files(conn)
+            self.ensure_goal(conn, goal)
+            self.check_local_tools(conn)
+            conn.commit()
+            if not self.check_harness_mcp(conn):
+                return 1
+            self.initialize_index(conn)
+            refresh_reports(conn, self.root)
+            db.set_meta(conn, "initialized_at", db.utc_now())
+            db.set_meta(conn, "initialized_version", "refined")
+            db.set_meta(conn, "resident_team_default", "small")
+            db.log_event(conn, "init", "Harness initialized or repaired")
+            return 0
+
+        return self.with_retrying_db("init", initialize)
+
     def run(self, goal: str | None = None, team: str = "auto", once: bool = False) -> int:
         """Start or resume the harness, then keep monitoring worker state."""
 
         def start(conn: sqlite3.Connection) -> int:
+            if not self.validate_initialized(conn):
+                return 1
             db.set_meta(conn, "scheduler_pid", str(os.getpid()))
             self.ensure_git_repo(conn)
             self.check_gh(conn)
             self.check_project_context(conn)
-            self.ensure_goal(conn, goal)
+            conn.commit()
             if not self.check_codex_mcp(conn):
                 db.set_meta(conn, "scheduler_pid", "")
                 return 1
@@ -123,6 +171,88 @@ class HarnessScheduler:
                     raise
                 print(f"\033[33mSQLite database is locked during {label}; waiting and retrying.\033[0m", file=sys.stderr)
                 time.sleep(2)
+
+    def validate_initialized(self, conn: sqlite3.Connection) -> bool:
+        """Require explicit initialization before resident sessions are started."""
+
+        if db.get_meta(conn, "initialized_at"):
+            return True
+        message = "Harness is not initialized. Run ./harness init first."
+        db.set_meta(conn, "red_banner", message)
+        db.log_event(conn, "init_required", message)
+        print(f"\033[31m{message}\033[0m", file=sys.stderr)
+        return False
+
+    def write_role_prompt_files(self, conn: sqlite3.Connection) -> None:
+        """Materialize reusable role prompts for inspection and repair."""
+
+        roles_dir = self.paths.prompts / "roles"
+        roles_dir.mkdir(parents=True, exist_ok=True)
+        goal = db.get_goal(conn)
+        goal_text = goal["text"] if goal else ""
+        for role in ("Coordinator", "Developer", "Integrator", "Auditor", "Goal Planner", "Architect"):
+            prompt = prompt_for_role(role, slug_role(role), goal_text, str(self.paths.db), str(self.root))
+            path = roles_dir / f"{slug_role(role)}.md"
+            if not path.exists():
+                path.write_text(prompt)
+
+    def check_local_tools(self, conn: sqlite3.Connection) -> None:
+        """Record availability of local tools init depends on without starting agents."""
+
+        tmux_available = self.tmux.available() if hasattr(self.tmux, "available") else True
+        if tmux_available:
+            db.set_meta(conn, "tmux_status", "available")
+        else:
+            db.set_meta(conn, "tmux_status", "missing")
+            db.log_event(conn, "warning", "tmux is missing; run can still track state but cannot start inspectable windows")
+            print("\033[31mtmux is not installed or not on PATH.\033[0m", file=sys.stderr)
+        try:
+            codex = subprocess.run(["codex", "--version"], cwd=self.root, text=True, capture_output=True, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            db.set_meta(conn, "codex_status", "missing")
+            db.log_event(conn, "warning", f"Codex CLI unavailable: {exc}")
+            print(f"\033[31mCodex CLI unavailable: {exc}\033[0m", file=sys.stderr)
+            return
+        db.set_meta(conn, "codex_status", "available" if codex.returncode == 0 else "unknown")
+
+    def check_harness_mcp(self, conn: sqlite3.Connection) -> bool:
+        """Verify the harness stdio MCP itself before Codex receives it."""
+
+        harness = self.harness_executable()
+        if not harness.exists():
+            db.log_event(conn, "mcp_failed", f"Harness executable not found for MCP: {harness}")
+            return False
+        try:
+            server = subprocess.run(
+                [str(harness), "--root", str(self.root), "mcp"],
+                input='{"jsonrpc":"2.0","id":1,"method":"initialize"}\n{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n',
+                cwd=self.root,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            db.log_event(conn, "mcp_failed", f"Harness MCP server did not start: {exc}")
+            return False
+        ok = server.returncode == 0 and "memory_query" in server.stdout and "agent_report" in server.stdout
+        db.set_meta(conn, "harness_mcp_status", "available" if ok else "failed")
+        if ok:
+            db.log_event(conn, "mcp", "Harness MCP server passed init preflight")
+        else:
+            detail = (server.stderr or server.stdout or "no MCP output").strip()
+            db.log_event(conn, "mcp_failed", f"Harness MCP server did not expose required tools: {detail}")
+        return ok
+
+    def initialize_index(self, conn: sqlite3.Connection) -> None:
+        """Prime the code index when possible without blocking future worktrees."""
+
+        try:
+            count = refresh_index(conn, self.root)
+        except Exception as exc:
+            db.log_event(conn, "index_failed", f"Initial code index unavailable; agents can fall back to search: {exc}")
+            return
+        db.log_event(conn, "index", f"Indexed {count} files during init")
 
     def stop(self) -> dict[str, int]:
         """Stop harness-owned runtime processes and mark durable state inactive."""
@@ -272,14 +402,13 @@ class HarnessScheduler:
         self.maybe_run_janitor(conn)
 
     def effective_team(self, conn: sqlite3.Connection, requested: str) -> str:
-        """Keep first runs in planning until the goal has a real metric and plan."""
+        """Choose a resident team without blocking on a global planning phase."""
 
         if requested != "auto":
             return requested
-        goal = db.get_goal(conn)
-        if goal is None or goal["status"] == "planning":
-            return "planning"
-        return "building"
+        if db.get_meta(conn, "integration_backpressure_active") == "1":
+            return "small"
+        return db.get_meta(conn, "resident_team_default", "small") or "small"
 
     def ensure_git_repo(self, conn: sqlite3.Connection) -> None:
         """Initialize git when needed because work lanes rely on branches/worktrees."""
@@ -373,7 +502,7 @@ class HarnessScheduler:
         return self.root / "harness"
 
     def ensure_goal(self, conn: sqlite3.Connection, provided: str | None) -> None:
-        """Capture the goal once and leave refinement to the Goal Planner agent."""
+        """Capture the initial goal seed during init, then let Coordinator refine lanes."""
 
         if db.get_goal(conn) is not None:
             return
@@ -381,9 +510,9 @@ class HarnessScheduler:
         if not goal and sys.stdin.isatty():
             goal = input("Describe the goal for this harness run: ").strip()
         if not goal:
-            goal = "Goal not captured yet; Goal Planner must ask the user for the real goal."
-        measure = "Goal Planner must define a deterministic success metric before building."
-        db.set_goal(conn, goal, measure=measure, status="planning", auditor_summary="Auditor must verify metric quality before build work is accepted.")
+            goal = "Goal not captured yet; Coordinator or Goal Planner must ask the user for the real goal."
+        measure = "Coordinator must maintain a deterministic success metric and acceptance criteria."
+        db.set_goal(conn, goal, measure=measure, status="active", auditor_summary="Auditor/Verifier must prefer deterministic metric evidence over freeform claims.")
         self.write_initial_plan_stub(goal)
 
     def write_initial_plan_stub(self, goal: str) -> None:
@@ -395,7 +524,7 @@ class HarnessScheduler:
         plan.write_text(
             "# Plan\n\n"
             f"Goal: {goal}\n\n"
-            "The Goal Planner must refine this into milestones, a deterministic success metric, and work lanes.\n"
+            "Initial backlog seed: Coordinator or Goal Planner must refine this into measurable worklanes without blocking useful development.\n"
         )
 
     def start_support_windows(self, conn: sqlite3.Connection) -> None:
@@ -415,7 +544,7 @@ class HarnessScheduler:
         manhole_prompt = self.paths.prompts / "manhole.md"
         manhole_prompt.write_text(
             prompt_for_role(
-                "Manager",
+                "Coordinator",
                 "manhole",
                 (db.get_goal(conn) or {"text": ""})["text"],
                 str(self.paths.db),
@@ -438,14 +567,41 @@ class HarnessScheduler:
         db.log_event(conn, "tmux", "Support windows ready", payload={"session": session, "attach": attach})
 
     def ensure_team(self, conn: sqlite3.Connection, team: str) -> None:
-        """Keep at least the preset minimum number of live agents per role."""
+        """Keep the small resident team alive while respecting integration backpressure."""
 
         specs = specs_for_team(team)
         for spec in specs:
             active = self.active_agent_count(conn, spec.name)
-            missing = max(0, spec.min_count - active)
+            target = spec.min_count
+            if spec.name == "Developer" and self.integration_backpressure(conn):
+                target = min(target, max(1, active))
+            missing = max(0, target - active)
             for _ in range(missing):
                 self.spawn_agent(conn, spec.name, title=f"Maintain {spec.name} capacity")
+
+    def integration_backpressure(self, conn: sqlite3.Connection) -> bool:
+        """Detect when integration queues are too full to justify more feature work."""
+
+        placeholders = ",".join("?" for _ in INTEGRATION_READY_STATUSES)
+        ready = conn.execute(
+            f"SELECT COUNT(*) AS count FROM worklanes WHERE status IN ({placeholders})",
+            INTEGRATION_READY_STATUSES,
+        ).fetchone()["count"]
+        failed = conn.execute("SELECT COUNT(*) AS count FROM worklanes WHERE status = 'integration_failed'").fetchone()["count"]
+        developers = max(1, self.active_agent_count(conn, "Developer"))
+        now = time.time()
+        if ready > developers or failed > 0:
+            since = float(db.get_meta(conn, "integration_backlog_since", "0") or 0)
+            if since == 0:
+                db.set_meta(conn, "integration_backlog_since", str(now))
+                db.set_meta(conn, "integration_backpressure_active", "0")
+                return False
+            active = failed > 0 or now - since >= INTEGRATION_BACKPRESSURE_SECONDS
+            db.set_meta(conn, "integration_backpressure_active", "1" if active else "0")
+            return active
+        db.set_meta(conn, "integration_backlog_since", "0")
+        db.set_meta(conn, "integration_backpressure_active", "0")
+        return False
 
     def active_agent_count(self, conn: sqlite3.Connection, role: str) -> int:
         """Count live agents for capacity, including non-terminal self-reported statuses."""
@@ -469,18 +625,19 @@ class HarnessScheduler:
         """Accept MCP spawn requests by starting agents through scheduler-owned code."""
 
         for request in db.next_spawn_requests(conn):
+            role = "Coordinator" if request["role"] == "Manager" else request["role"]
             existing = ""
-            if request["role"] in SINGLETON_SPAWN_ROLES:
+            if role in SINGLETON_SPAWN_ROLES or role == "Coordinator":
                 existing = self.prompt_running_role(
                     conn,
-                    request["role"],
+                    role,
                     f"Additional assigned work: {request['title']}\n\n{request['prompt']}",
                 )
             if existing:
                 db.mark_spawn_request(conn, request["id"], "started", existing)
-                db.log_event(conn, "spawn_coalesced", f"Reused {existing} for {request['role']}: {request['title']}", agent_name=existing)
+                db.log_event(conn, "spawn_coalesced", f"Reused {existing} for {role}: {request['title']}", agent_name=existing)
                 continue
-            name = self.spawn_agent(conn, request["role"], request["title"], extra=request["prompt"])
+            name = self.spawn_agent(conn, role, request["title"], extra=request["prompt"])
             db.mark_spawn_request(conn, request["id"], "started" if name else "failed", name or "")
 
     def prompt_running_role(self, conn: sqlite3.Connection, role: str, message: str) -> str:
@@ -547,6 +704,22 @@ class HarnessScheduler:
             branch=branch,
             notes=title,
         )
+        if role == "Developer":
+            lane = db.claim_next_worklane(conn, name, str(cwd), branch)
+            db.record_worktree(conn, str(cwd), branch=branch, owner_agent=name, worklane_id=lane["id"] if lane else None, base_commit=self.current_head())
+            if lane:
+                try:
+                    self.tmux.send_prompt(
+                        pane.pane,
+                        (
+                            f"Assigned worklane #{lane['id']}: {lane['title']}\n"
+                            f"Goal: {lane['goal'] or lane['description'] or lane['notes']}\n"
+                            f"Acceptance criteria: {lane['acceptance_criteria'] or 'Use lane-specific tests and deterministic evidence.'}\n"
+                            "Report with the agent_report MCP tool when this lane changes status."
+                        ),
+                    )
+                except Exception:
+                    pass
         db.log_event(conn, "agent_started", f"Started {name} for {title}", agent_name=name, payload={"role": role, "window": window})
         return name
 
@@ -575,6 +748,12 @@ class HarnessScheduler:
 
         result = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=self.root, text=True, capture_output=True, check=False)
         return result.returncode == 0
+
+    def current_head(self) -> str:
+        """Return the current base commit for worktree bookkeeping."""
+
+        result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.root, text=True, capture_output=True, check=False)
+        return result.stdout.strip() if result.returncode == 0 else ""
 
     def check_agent_liveness(self, conn: sqlite3.Connection) -> None:
         """Detect crashed, idle, or suspicious agents and route correction prompts."""
@@ -637,7 +816,7 @@ class HarnessScheduler:
             db.set_meta(conn, "red_banner", banner)
             db.set_meta(conn, "last_progress_stall_alert", str(now))
             db.log_event(conn, "progress_stalled", banner, payload={"percent_ready": percent})
-            self.prompt_manager(conn, banner + " Reorganize work so progress resumes.")
+            self.prompt_coordinator(conn, banner + " Reorganize work so progress resumes.")
 
     def prompt_auditor(self, conn: sqlite3.Connection, message: str) -> None:
         """Ask a reachable auditor to intervene, or start one alert auditor."""
@@ -682,7 +861,10 @@ class HarnessScheduler:
             if since == 0:
                 db.set_meta(conn, "low_resource_since", str(now))
             elif now - since >= LOW_RESOURCE_SECONDS and now - last_prompt >= 5 * 60:
-                self.prompt_manager(conn, "CPU and RAM have stayed below 60%; consider more work-intense Codex sessions or more lanes.")
+                if self.integration_backpressure(conn):
+                    self.prompt_coordinator(conn, "CPU and RAM are underused, but integration is backed up. Add integration or conflict-resolution support instead of more feature Developers.")
+                else:
+                    self.prompt_coordinator(conn, "CPU and RAM have stayed below 60% and integration is healthy; consider increasing useful concurrency.")
                 db.set_meta(conn, "last_low_resource_prompt", str(now))
         else:
             db.set_meta(conn, "low_resource_since", "0")
@@ -703,25 +885,30 @@ class HarnessScheduler:
         else:
             db.set_meta(conn, "high_resource_since", "0")
 
-    def prompt_manager(self, conn: sqlite3.Connection, message: str) -> None:
-        """Ask the Manager to reorganize work when deterministic monitors fire."""
+    def prompt_coordinator(self, conn: sqlite3.Connection, message: str) -> None:
+        """Ask the Coordinator to reorganize work when deterministic monitors fire."""
 
-        manager = next(
+        coordinator = next(
             (
                 agent
-                for agent in conn.execute("SELECT * FROM agents WHERE role = 'Manager' ORDER BY id")
+                for agent in conn.execute("SELECT * FROM agents WHERE role IN ('Coordinator', 'Manager') ORDER BY CASE role WHEN 'Coordinator' THEN 0 ELSE 1 END, id")
                 if db.is_active_agent_status(agent["current_status"])
             ),
             None,
         )
-        if manager and manager["tmux_pane"]:
+        if coordinator and coordinator["tmux_pane"]:
             try:
-                self.tmux.send_prompt(manager["tmux_pane"], message)
-                db.log_event(conn, "manager_prompt", message, agent_name=manager["name"])
+                self.tmux.send_prompt(coordinator["tmux_pane"], message)
+                db.log_event(conn, "coordinator_prompt", message, agent_name=coordinator["name"])
                 return
             except Exception:
                 pass
-        self.spawn_agent(conn, "Manager", "Respond to scheduler resource alert", extra=message)
+        self.spawn_agent(conn, "Coordinator", "Respond to scheduler alert", extra=message)
+
+    def prompt_manager(self, conn: sqlite3.Connection, message: str) -> None:
+        """Compatibility wrapper for older tests and queued Manager requests."""
+
+        self.prompt_coordinator(conn, message)
 
     def kill_problematic_codex(self, sample: dict[str, Any]) -> int:
         """Terminate the hottest Codex process when sustained resource pressure is unsafe."""

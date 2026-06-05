@@ -1,88 +1,961 @@
-# LLM Harness System — Spec
+# LLM Harness System — Revised Spec
 
-Implement a python script that implements an LLM agent harness. Anytime a task can be completed by either deterministic
-tools (function calls, shell calls, requests, etc.) or non-deterministic agentic tools, prefer deterministic tools. If
-a task can only be completed by prompting an agent, then implement it that way, but make sure we're aware of that agent's
-refusal, failure, avoidance (e.g. sleep 3600) and we have a feedback loop in place to force it to complete the task in
-a timely manner.
+Implement a Python script that implements an LLM agent harness for driving concurrent software development with Codex CLI sessions.
 
-- The architecture is this:
-    - The top level harness scheduler is an event-driven loop that creates, manages, monitors, kills codex CLI processes.
-	- We don't trust the codex sessions to do what we've asked them to. We treat them as lazy, drifting, forgetful, and assume they
-	  will look for easier solutions than what we've asked for, they'll forget, they'll tend to avoid measuring progress, they'll
-	  look for reasons to `sleep`, not to work, wait for something, assume we're blocked, and other reasons not to work. This harness
-	  script uses deterministic code structures such as loops, watchdogs, status monitoring, process spawning and killing etc. to
-	  fight against agentic unreliability. We course-correct
-	- The codex processes are isolated enough such that a codex process crashing does not crash the entire harness scheduler.
-	- Offer commands:
-		- `./harness run`
-			– On the first start, it runs the **Goal Planner** to capture the user's goal. We get the user to state the goal and refine it with Goal Planner agent. We plan and collect the information from the user. Planning might require a small team of researchers itself. The planner should generate a bunch of ideas, hypotheses, and questions, and that team of researchers should go and find answers, verify, and bring in more ideas from what's out there in the world. Based on that, the planner might decide to do another round. We do up to 3 rounds and we display the progress the entire time. We collect insights in a separate sqlite table to avoid a huge markdown file that hogs the context. Then we summarize it in chunks, and then we do a summary of summaries — a recursive process to feed the model a manageable amount of information.
-			— Once we have a goal, we clean up what we don't need anymore with Janitor, store a sumamry for the Auditor to know what to put special emphasis on, and proceed to the building stage.
-			– When we start building, we measure the available system CPU, RAM, disk space for other parts of the system to use, and then we spawn the builder team consisting of: 1 Manager, (nb_cpu_cores*0.75) developers, 1 integrator
-			– On subsequent runs, it understands and recovers the progress we've made so far. It could resume the initial research if
-			that crashed, or it could resume the building phase. In either  case, it re-establishes the team of agents to continue pursuing it where we stopped.
-			There may be half-finished worktrees. We must have enough bookkeeping to know where have we stopped, what was the likely source of the last crash, if any, and re-establish the team of agents exactly as it was before. If we are restarting because of an earlier crash of this entire harness, start with analyzing what happened via codex, adjusting the work plan, possibly involving an architect, and only then restarting the team. Tell the Manager what happened.
-			— It also spawns a `manhole` tmux window with a codex session that has access to all the other agents and can be used by the user to course-correct any part of the system, e.g. the goal, number of sessions, how we achieve or report progress, and anything else. It can manage codex sessions, poke them, start new ones for its benefit, and whatever else it needs.
-			– It also spawns a `status` tmux window that runs the `watch` command refreshing every 5 seconds with the latest `./harness status` and switches to it.
-			– The stdout of harness run is a high-level log of what is happening. High-level enough to only get a handful of events every minute. Many hundreds of lines per minute are not acceptable.
-		- `./harness status` — shows a TUI dashboard with a summary of progress, current agents, test runs, and % of metric ready. Uses Unicode borders, rectangles, and ANSI color codes to provide useful visual information. Totally fine to use a library for this. It's a reflection of the last STATUS.md. The first information we see is the date and time when it was last generated.
-		- `./harness poke "message"` — injects a message/prompt into the running system (e.g. to a specific agent or broadcast) and then shows the same TUI dashboard. Uses Unicode borders, rectangles, and ANSI color codes to provide useful visual information. Totally fine to use a library for this.
-	- It doesn't have to be rebuilt to change how it works, so bash or python or something like that.
-	- Has a few team presets with a minimal number of agents doing a specific task — i.e. it just knows the roles and how many agents per role we're spinning. We use different teams for different stages.
-	— All codex sessions must run in --yolo mode with gpt 5.5 xhigh fast and never downgrade.
-	- Runs a deterministic loop to monitor the running worker agents. If we have less than the minimum amount, it starts more. If we have idle ones, it starts/prompts an existing auditor and tells it to understand why the agent is idle and get it to work. It is okay for an agent to wait a minute or two for another agent if they collaborate, but it's not okay to wait for 5 minutes, 10 minutes, 30 minutes, especially multiple times in a row. Anytime any agent runs a `sleep` command, that's suspicious and must be investigated. If the rate of progress is not increasing every 30 minutes, it tells `harness run` so it can display a big red banner to the user, that should also be highlighted in the progress report, and then it sends a prompt to the manager to re-organize work such that it starts making progress again. We also monitor the lifetime of each agent.
-	- We work with git. If harness is ran in a non-git repository, it initializes one. If we don't have access to `gh` command or it's unauthorized with github, we say that in red letters but we still start. If gh is available and authorized, we push our progress to remote branches and set things up to publish STATUS.html as a github page.
-	- Every 60 minutes (and on system start), we run a Janitor to clean up.
-	- Runs a deterministic loop to probe the system resource usage. If CPU and RAM usage stays below 60%, send a prompt to the manager to indicate we might be using more resources through more work-intense codex sessions, or a higher number of codex sessions. If CPU or RAM usage stays around 95%+ across all cores and we're slowing down the entire machine for more than 30 seconds, then kill the problematic process and let it
-	- Set up a watchdog that restarts the system if it dies. Also monitors any crashed agent processes managed by us. Restart them where they left off, and append to the initial prompt for that agent a summary of the crash details with information where to find more details if needed, and ask it to adjust what it's doing to avoid another crash. Also monitors resource usage: if we're slowing down the entire machine because we're using more than 100% RAM or CPU, then it kills it if that goes on for more than 30 seconds continuously. If the lifetime of recent agents drops to a few seconds without producing successful results, we assume it's a resource exhaustion problem and we run Janitor. If that doesn't help, we poke the Manager with what we found and tell him to reorganize the system such that agents can complete their work. The watchdog must stay alive at all cost. We use the most reliable mechanism of keeping that watchdog alive. We must support fedora and nix-os, so probaby systemd and whatever nixos uses.
-	- Uses a sqlite database as memory. Only write to md files when the instructions explicitly request that.
-	- Writes events into that memory, e.g. starting a codex session, stopping a codex session, sending it a prompt.
-	- Uses tmux for running the team so that it's inspectable by the user. Every codex session is in its own tmux window. It uses the current tmux session if we're in one, and only starts a new tmux session if we're not in a tmux session right now. It prints the session and the command to attach to it. It also stores it in sqlite and makes it easy to retrieve later.
-	- We store in sqlite the details of each agentic run: start time, end time, current_status (e.g. running, crash, success), tmux pane, worktree/cwd, notes. We can store more information, but not less.
-- It understands the following roles:
-  - **Goal Planner:** asks for the goal, finds a deterministic way to measure success, e.g. % of unit tests passed from a pre-existing suite. Doesn't move on until we have that. Once it understands what we want to achieve and how, it plans out all the tasks. At the end it has to produce a `PLAN.md` file with ways of doing things, milestones, and a progress measure.
-  - **Developer:** works on a task in a dedicated worktree. Reports success — ideally communicating it in some structured way so the runtime script can identify that and integrate it with the main branch. Developers run tests for their specific feature but they don't run tests for the entire project, as that would slow them down over time as there are more and more tests. Developers run in `/goal` mode until they achieve their expected outcome.
-    - Have a `DEVELOPMENT.md` for the developer role. It should say: avoid creating a single huge file with the entire project code, and avoid fragmenting every little thing into its own file or function. Write relevant, intention-led docblocks for every function — or for most functions and types created. They could be one line long, or they could be 50 lines long or more when the function is nuanced or plays a non-obvious role. The important part is it should talk about *why* the function is there. Only talk about what it's doing and how it's doing it if that's not immediately clear from reading the function. It's also okay to document specific sections of functions inline.
-	- Developers commit reasonably often to retain progress. They may revert their worklane as necessary if things break. They push their changes to a remote repo.
-  - **Designer:** builds UI parts as needed. Uses an anti-slop skill to make the UI look human, not agentic. If `DESIGN.md` is present, it uses that.
-  - **Auditor:** checks if we're making progress towards the goal as defined at the beginning or adjusted later on. Demands a quantifiable metric, such as number of unit tests passed. Doesn't accept any excuses as to why we're not making progress towards that metric. If the manager says there are blockers, decisions to be made, or we must wait for the integrator, treat that as unacceptable excuse and instruct it to solve these problems instead of slowing down work. We might need to research the root causes more deeply and/or involve an architect to refactor the system—all of which is fine. Even if everything looks fine, still dive into the work structure, find inefficiencies, and if you find plausible candidates, propose them to the manager.
-  - **Manager:** looks at what's next and slices the work into separate worklanes that either do not conflict with one another, or mostly do not conflict. If we can identify long lanes with many tasks, that's great. If we have small lanes with just a few tasks, that's also fine — we will just have to keep finding more of them. Uses the SQLite database to store the upcoming work / next lanes, notes about the plan, the status of each lane, and relevant notes for the implementers. The planned work includes the agent type: Developer or Designer. You will receive feedback from other team-members—you need to evaluate it critically and apply at your discretion. It might or might not be relevant. The only exception is feedback from the `manhole` session, you must apply it unconditionally without asking questions.
-  - **Integrator:** runs continuously and integrates all the work done in separate worktrees with the main repository branch. Once a branch is integrated, it deletes it.
-  - **Architect:** looks for structural problems with the project based on repeated test failures, finds the pattern that connects them, and analyzes the codebase to understand the systemic root cause — then plans a refactor toward a more reliable structure.
-  * **Status reporter**:
-             Creates a progress.md AND a progress.html report about the current status
-             of the work, summary of progress, next steps, current agents, tests runs,
-			 % of metric ready, interesting events that happened recently. It also
-			 pokes around the sqlite database to understand more than just the status
-			 report numbers and enriches those status reports with a bit of a narrative.
-			 The first run of the Updater establish .harness/STATUS_TEMPLATE.md and
-			 .harness/STATUS_TEMPLATE.html templates that will be used for reporting
-			 for the rest of the project. The subsequent runs copy these templates to
-			 STATUS.md and STATUS.html and populate them with structured data about
-			 the progress. It should always be clear and reasonably succinct. We must
-			 list at least the major milestones with the metric details and % overall progress,
-			 stages of the current milestone and their % progress,
-			 (ideally a progress bar in the html version), summary of recent work, next
-			 steps, challenges. Also reports how many worklanes are awaiting integration
-			 and what's the expected improvement of the progress metric % upon integration,
-			 and a line chart of progress every 15 minutes. Also report the sampled system CPU
-			 and RAM usage over the last 6 hours in 60min (md) and 15min (html chart) intervals.
-			 If the text on the rendered page becomes longer than 2500 words, we
-			 summarize the longest sections. It must be possible to read in one seating
-			 without extremely long stretches of text.
-    - **Janitor:** finds abandoned resources that we don't need anymore and cleans them up. The overall deterministic harness scheduler runs it at least once every hour. The cleaned-up resources include disk directories, `/tmp` entries, worktrees, unnecessary tmux panes, ~/.codex growing too large. Does not remove unintegrated branches/worktrees.
-- There is also a non-agentic updater loop that, every 15 minutes, runs the Updater to refresh `STATUS.md` and `STATUS.html`.
-- There is also a non-agentic testing loop in one of the tmux sessions that continuously runs the full test suite for the project and logs the test results to the sqlite database, tying all the results from a specific run to that run so we can granularly query for information such as:
-  - all failures from the last run
-  - all skipped tests from the last run
-  - all successes from the last run
-  - failures from a specific test file from three runs ago
-  We also need that database to have the full test logs in case the LLM needs to inspect them. We always keep the last 5 full test runs. The older ones we purge in such a way that we keep one report an hour from today, one report a day from the week before that, and one report per week from every month before that.
-  - Any time a test in that non-agentic testing loop fails, we ask the Manager agent to add fixing these tests to the top of the work queue. In this way, the developers will continue with their current tasks until they're finished, and then will start fixing the main-branch problems afterwards.
-  - Whenever a test fails and we fix it, we must store that as a bug report in the sqlite database. So a failing test would be a new issue, the root-cause investigation would be a description of that issue, the fix summary would be in a resolution column, and we would also log the first commit where it failed and the commit where it was fixed.
-  - Before we fix a failing test, we do a lookup in the table to see if it failed in the past and what the causes were then. That becomes part of the context, as we may be continuously running into similar issues.
-  - If we fix any test more than 3 times a day — i.e. it switches from passing to failing to passing to failing to passing to failing within the same 24 hours — we invoke an Architect to find the systemic failure that keeps causing problems and plan refactoring the system into a more reliable form. That refactor would ideally keep between *one* and *all* development agents busy and not block other concurrent work.
-- Runs developers in separate git worktrees so they don't collide with each other.
-- SQLite interactions are done through an MCP tool. Every agent has access to it and is also instructed how to use it in a very brief skill. You must build that MCP and skill and run tests to confirm they work.
-– Spawning sub agents is done through an MCP tool that route the request back to the central harness scheduler such that we know the entire tree at any given time. All communication happens through other tools of this MCP.
-- Brings over an open-source codebase indexer and provides codex with an MCP so that we don't have to grep things all the time. It should run independently of all the worklanes, not block starting a new worktree, and distinguish different worktrees so that each can benefit from it. If we can't run it in a specific worktree yet, just fall back to regular grepping etc. but keep checking for its readiness.
+The purpose of the harness is to compensate for agentic unreliability using deterministic supervision. Anytime a task can be completed by deterministic tools — function calls, shell calls, requests, SQLite queries, Git commands, process checks, test runners, etc. — prefer deterministic tools. If a task can only be completed by prompting an agent, implement it that way, but ensure the harness detects refusal, failure, avoidance, idle drift, repeated waiting, excessive sleeping, and lack of measurable progress. The harness must have feedback loops that keep work moving in a timely manner.
+
+This system must **not** be designed as a single global state machine where the whole harness moves through blocking phases. The harness should instead be a **concurrent control plane**: independent deterministic loops and a small number of resident Codex sessions coordinate through SQLite, Git worktrees, tmux, structured reports, and measurable progress signals.
+
+The core principle is:
+
+> Roles are capabilities, not necessarily always-running Codex sessions.
+
+Most roles should be deterministic loops, short-lived agent jobs, or temporary modes of an existing resident session. We should not need 15 standing agents just to keep the system afloat.
+
+## High-level architecture
+
+The top-level harness scheduler is an event-driven concurrent supervisor that creates, manages, monitors, prompts, kills, and restarts Codex CLI processes.
+
+We do not trust Codex sessions to reliably do what we asked. We treat them as lazy, drifting, forgetful, and likely to look for easier solutions than requested. They may forget the goal, avoid measuring progress, claim blockers too early, wait unnecessarily, run `sleep`, or assume the system is blocked. The harness fights this with deterministic structures:
+
+* watchdog loops,
+* process supervision,
+* SQLite-backed durable state,
+* structured agent reports,
+* test loops,
+* worklane queues,
+* integration queues,
+* resource monitors,
+* idle detection,
+* crash recovery,
+* bounded integration attempts,
+* status rendering,
+* cleanup routines.
+
+Codex processes are isolated enough that one crashing session does not crash the entire harness scheduler.
+
+The system is organized around **worklanes**, not global phases.
+
+A worklane is an independently schedulable unit of work with:
+
+* a goal,
+* an owner,
+* a worktree,
+* a base branch,
+* acceptance criteria,
+* current status,
+* recent activity,
+* expected metric impact,
+* conflict risk,
+* integration status,
+* test evidence.
+
+Development, verification, testing, integration, auditing, reporting, cleanup, and planning should happen concurrently whenever possible. No subsystem should wait for another subsystem except where a specific worklane declares an explicit dependency.
+
+## Resident Codex sessions
+
+The default resident team should be small.
+
+Recommended default:
+
+* **Coordinator**: 1 session.
+* **Developers**: scalable pool, initially capped conservatively.
+* **Integrator**: 1 session.
+* **Manhole**: 1 session for user intervention.
+* **Optional Auditor/Verifier**: 0 or 1 session, enabled when quality or progress confidence is low.
+
+For example:
+
+* Small mode: 1 Coordinator, 2 Developers, 1 Integrator, 1 Manhole.
+* Medium mode: 1 Coordinator, 4 Developers, 1 Integrator, 1 Manhole, optional shared Auditor/Verifier.
+* Large mode: 1 Coordinator, 6–8 Developers, 1–2 Integrators, 1 Manhole, optional shared Auditor/Verifier.
+
+The system must not spawn one standing Codex session for every conceptual role. Roles such as Architect, Reproducer, Conflict Resolver, Dependency Mapper, Lane Scout, Narrative Summarizer, Prompt Maintainer, and Flow Auditor should normally be short-lived jobs or temporary assignments to an existing idle worker.
+
+The main thing that scales horizontally is the Developer pool. Developer scaling must be capped by integration health, not just CPU/RAM availability.
+
+## Deterministic loops
+
+These should normally be non-agentic deterministic loops, not Codex sessions:
+
+* Watchdog.
+* Resource monitor.
+* Test loop.
+* Status renderer.
+* SQLite event logger.
+* Queue monitor.
+* Basic staleness detector.
+* Basic integration triage.
+* Safe Janitor cleanup.
+* Metric monitor.
+
+An LLM may be invoked to interpret anomalies, summarize long event streams, or propose reorganization, but the primary monitoring and bookkeeping must be deterministic.
+
+## Commands
+
+./harness init
+
+Initializes a new harness project. This command is required before ./harness run.
+
+Responsibilities:
+
+Creates the .harness/ directory.
+Creates the SQLite database and schema.
+Initializes Git if running in a non-Git repository.
+Checks whether gh is available and authorized.
+Checks whether tmux is available.
+Checks whether Codex CLI is available.
+Checks whether the requested Codex model/profile is available.
+Creates initial config files.
+Creates role prompt files.
+Creates DEVELOPMENT.md.
+Creates .harness/STATUS_TEMPLATE.md.
+Creates .harness/STATUS_TEMPLATE.html.
+Creates or validates MCP configuration.
+Builds and tests the SQLite MCP.
+Builds and tests the scheduler/subagent MCP.
+Initializes the codebase indexer if available.
+Runs the Goal Planner to capture:
+goal,
+constraints,
+success metric,
+acceptance criteria,
+initial backlog seed.
+Writes PLAN.md.
+Records the initialized run/project state in SQLite.
+
+./harness init should be safe to rerun. If initialization has already happened, it should validate and repair missing setup where possible rather than duplicating state.
+
+It should not start the resident agent team except for short-lived setup/planning agents needed during initialization.
+
+./harness run
+
+Starts or resumes the harness after ./harness init has completed.
+
+Responsibilities:
+
+Loads existing SQLite state.
+Validates that initialization has completed.
+Discovers existing tmux sessions and panes.
+Discovers existing worktrees.
+Determines which agents are alive, dead, idle, crashed, or stale.
+Starts or resumes the resident sessions:
+Coordinator,
+Developer pool,
+Integrator,
+Manhole,
+optional Auditor/Verifier.
+Starts deterministic loops:
+watchdog,
+resource monitor,
+test loop,
+status renderer,
+queue monitor,
+metric monitor,
+safe Janitor loop.
+Opens the status tmux window.
+Continues useful work from the current SQLite/worktree state.
+
+If the harness itself previously crashed, ./harness run records that event, summarizes likely causes, informs the Coordinator, and resumes conservatively.
+
+./harness run must not redo initialization or goal planning unless required setup is missing or the user explicitly requests reinitialization.
+
+It must not require a global “restart phase” that blocks all other work.
+
+### `./harness status`
+
+Shows a TUI dashboard with:
+
+* current date/time,
+* last status generation time,
+* overall progress metric,
+* worklane queues,
+* active agents,
+* idle/stale/crashed agents,
+* ready-for-integration queue,
+* integration-failed queue,
+* current test results,
+* recent test trend,
+* system CPU/RAM/disk usage,
+* recent meaningful events,
+* warnings and backpressure state.
+
+The TUI should use Unicode borders, rectangles, and ANSI colors.
+
+It is a reflection of the latest SQLite state and `STATUS.md`, not a freeform agent claim.
+
+### `./harness poke "message"`
+
+Injects a message into the running system and then displays the status dashboard.
+
+The message may be routed to:
+
+* Coordinator,
+* specific agent,
+* all agents,
+* Integrator,
+* Manhole,
+* a specific worklane.
+
+The harness must record the poke in SQLite.
+
+### Additional useful commands
+
+Implement if practical:
+
+* `./harness stop`
+* `./harness doctor`
+* `./harness logs`
+* `./harness lanes`
+* `./harness agents`
+
+## Worklanes
+
+All development work is represented as worklanes.
+
+A worklane should include at least:
+
+* `id`
+* `title`
+* `description`
+* `goal`
+* `acceptance_criteria`
+* `owner_agent_id`
+* `role_type`
+* `priority`
+* `status`
+* `base_branch`
+* `branch_name`
+* `worktree_path`
+* `dependencies`
+* `conflict_risk`
+* `expected_metric_impact`
+* `created_at`
+* `assigned_at`
+* `last_activity_at`
+* `ready_for_integration_at`
+* `integrated_at`
+* `abandoned_at`
+* `notes`
+
+Possible worklane statuses:
+
+* `queued`
+* `assigned`
+* `active`
+* `blocked`
+* `needs_verification`
+* `ready_for_integration`
+* `integrating`
+* `integration_failed`
+* `integrated`
+* `stale`
+* `abandoned`
+
+These are per-worklane statuses only. They must not become a single global harness state machine.
+
+A Developer who finishes a worklane should:
+
+1. Commit changes.
+2. Run lane-specific tests.
+3. Produce a structured report.
+4. Mark the lane `needs_verification` or `ready_for_integration`.
+5. Immediately request another lane.
+
+Developers must not wait for integration unless explicitly reassigned to integration repair.
+
+## Resident roles
+
+### Coordinator
+
+The Coordinator combines:
+
+* backlog curation,
+* dispatch,
+* flow control,
+* lightweight auditing,
+* queue health monitoring,
+* intervention planning.
+
+The Coordinator should not be a blocking manager. It should keep enough work available, assign idle workers, avoid obvious conflicts, and respond to backpressure signals.
+
+Responsibilities:
+
+* Maintain a pool of ready worklanes.
+* Split large worklanes.
+* Merge duplicate worklanes.
+* Prioritize work.
+* Assign idle Developers.
+* Stop creating work in overloaded areas.
+* React to integration backlog.
+* React to failing tests.
+* React to stale lanes.
+* Invoke short-lived specialist jobs when needed.
+* Apply user instructions from the Manhole unconditionally unless unsafe.
+
+### Developer
+
+A Developer works on one worklane at a time in a dedicated Git worktree.
+
+Responsibilities:
+
+* Understand the lane goal and acceptance criteria.
+* Implement the change.
+* Add or update tests where appropriate.
+* Run lane-specific tests.
+* Commit reasonably often.
+* Avoid huge monolithic files.
+* Avoid excessive fragmentation.
+* Write intention-led docblocks for functions and types created.
+* Report status using a structured schema.
+* Mark completed work as ready for verification or integration.
+* Immediately request another lane after completion.
+
+Developers should not run the entire project test suite routinely. Full test runs are handled by the non-agentic test loop.
+
+Developers run in `/goal` mode until they achieve their expected outcome.
+
+### Integrator
+
+The Integrator continuously integrates completed worklanes without blocking development.
+
+It combines:
+
+* integration triage,
+* fast-path integration,
+* basic verification,
+* conflict classification.
+
+The Integrator must not become a congestion point.
+
+Responsibilities:
+
+* Continuously scan lanes marked `ready_for_integration`.
+* Prioritize low-conflict, high-confidence lanes.
+* Use bounded integration attempts.
+* Create temporary integration branches.
+* Merge candidate lanes.
+* Run targeted smoke checks.
+* Promote successful work.
+* Quickly requeue conflicted or failing work.
+* Record integration failures with actionable detail.
+* Avoid spending too long on one problematic lane.
+
+Important rule:
+
+> If a lane cannot be integrated within a bounded time or bounded number of attempts, stop trying, record the reason, create or update a conflict-resolution worklane, and move on.
+
+The Integrator should not block Developers from continuing work.
+
+### Manhole
+
+The Manhole is a tmux window with a Codex session that has access to the state of the harness and can be used by the user to course-correct any part of the system.
+
+It can:
+
+* inspect agents,
+* inspect worklanes,
+* poke agents,
+* adjust priorities,
+* change the goal,
+* change reporting behavior,
+* request more or fewer sessions,
+* invoke specialist roles,
+* instruct the Coordinator.
+
+Instructions from Manhole to Coordinator must be applied unconditionally unless unsafe or impossible.
+
+### Optional Auditor/Verifier
+
+This may be a resident session or a short-lived job.
+
+Responsibilities:
+
+* Check whether completed lanes actually satisfy their acceptance criteria.
+* Challenge unsupported claims of progress.
+* Look for stale or fake progress.
+* Inspect whether the metric is improving.
+* Suggest reorganization when progress stalls.
+* Escalate repeated integration failures or repeated test failures.
+
+The Auditor should rely first on deterministic evidence:
+
+* commits,
+* tests,
+* DB records,
+* changed files,
+* structured reports,
+* integration results,
+* metric trends.
+
+Freeform agent claims are secondary.
+
+## Non-resident specialist roles
+
+These roles are normally invoked on demand.
+
+### Goal Planner
+
+Captures:
+
+* goal,
+* constraints,
+* success metric,
+* acceptance criteria,
+* initial backlog seed.
+
+It produces `PLAN.md`.
+
+It should avoid delaying development unnecessarily. Once the initial metric and backlog seed exist, more planning can continue as ordinary research or planning worklanes.
+
+### Lane Scout
+
+Finds independently executable work:
+
+* isolated modules,
+* failing tests with clear scope,
+* TODOs,
+* type errors,
+* documentation gaps,
+* small refactors,
+* test gaps,
+* low-conflict improvements.
+
+Feeds candidates to the Coordinator.
+
+### Dependency Mapper
+
+Analyzes likely conflict and dependency structure:
+
+* file ownership,
+* import graph,
+* test ownership,
+* hot files,
+* overlapping worklanes,
+* branch divergence.
+
+Helps the Coordinator avoid assigning conflicting lanes.
+
+### Conflict Resolver
+
+Handles failed integrations.
+
+A failed integration should become ordinary work, not a system-wide blocker.
+
+Responsibilities:
+
+* inspect integration failure,
+* rebase or adapt the branch,
+* resolve conflicts,
+* update tests,
+* return the lane to `ready_for_integration`.
+
+### Reproducer
+
+When tests fail, creates or identifies a minimal reproduction and stores it in SQLite.
+
+### Architect
+
+Invoked by triggers, not standing by default.
+
+Triggers include:
+
+* same test fails repeatedly,
+* a test flips passing/failing more than 3 times in 24 hours,
+* integration failures cluster around a subsystem,
+* many lanes conflict on the same files,
+* progress stalls despite high activity.
+
+Architect produces refactor worklanes. It must not block unrelated work.
+
+### Prompt/Protocol Maintainer
+
+Invoked when agents repeatedly fail to follow role instructions, output schemas, or MCP usage rules.
+
+Updates:
+
+* role prompts,
+* `DEVELOPMENT.md`,
+* MCP instructions,
+* structured report schemas,
+* failure-specific reminders.
+
+### Narrative Summarizer
+
+Optional LLM role used by the deterministic Status Renderer when long event streams need concise human-readable explanation.
+
+### Janitor
+
+Mostly deterministic.
+
+Cleans safe abandoned resources:
+
+* temporary directories,
+* obsolete logs,
+* unnecessary tmux panes,
+* old safe worktrees,
+* excessive cache growth,
+* old test logs according to retention policy.
+
+Must not delete:
+
+* unintegrated branches,
+* unintegrated worktrees,
+* recent useful logs,
+* evidence needed for crash/debug recovery,
+* anything not proven safe by SQLite records.
+
+## Integration model
+
+The integration system should use asynchronous queues:
+
+* `ready_fast_path`
+* `ready_needs_review`
+* `ready_high_conflict`
+* `ready_metric_sensitive`
+* `integration_failed`
+
+The Integrator should favor fast-path work to keep throughput high.
+
+Suggested branch model:
+
+* `main`
+* `harness/integration`
+* `worklane/<id>-<slug>`
+* `integration-attempt/<timestamp>-<lane>`
+
+Basic flow:
+
+1. Developer completes worklane.
+2. Developer commits.
+3. Developer reports structured completion.
+4. Verifier or Integrator checks local acceptance evidence.
+5. Lane enters an integration queue.
+6. Integrator attempts merge into a temporary integration branch.
+7. Targeted smoke tests run.
+8. Successful lane is promoted.
+9. Failed lane is requeued or converted into conflict-resolution work.
+10. Developer pool continues working throughout.
+
+The Integrator must never allow one bad branch to stall the whole system.
+
+## Backpressure without global blocking
+
+The system should use backpressure, not global waiting.
+
+Examples:
+
+* If `ready_for_integration` queue grows beyond Developer count for more than 20 minutes, stop spawning feature work and assign idle workers to verification or conflict resolution.
+* If `integration_failed` grows, spawn or reassign one Conflict Resolver.
+* If too many lanes touch the same subsystem, stop creating new lanes in that subsystem.
+* If a worklane is too far behind `main`, create a refresh/rebase task.
+* If full-test failures grow, prioritize stabilization lanes.
+* If the integration queue is near zero and tests are healthy, add Developer sessions if resources allow.
+* If CPU/RAM is underused but integration is backed up, do not add feature Developers.
+* If CPU/RAM is underused and integration is healthy, consider adding Developers.
+* If CPU/RAM is overused for more than 30 seconds, identify and kill or pause problematic harness-owned processes.
+
+The core scaling question is:
+
+> Can the system integrate completed work as fast as Developers produce it?
+
+If not, add integration support, not more feature Developers.
+
+## SQLite memory
+
+SQLite is the source of truth.
+
+Use SQLite for:
+
+* runs,
+* agents,
+* events,
+* prompts,
+* worklanes,
+* worktrees,
+* branches,
+* commits,
+* agent reports,
+* test runs,
+* test results,
+* issues,
+* bug history,
+* integration attempts,
+* resource samples,
+* status snapshots,
+* settings.
+
+Only write markdown files when explicitly required.
+
+Minimum tables should include:
+
+* `runs`
+* `agents`
+* `events`
+* `worklanes`
+* `agent_messages`
+* `agent_reports`
+* `worktrees`
+* `commits`
+* `integration_attempts`
+* `test_runs`
+* `test_results`
+* `issues`
+* `resource_samples`
+* `status_snapshots`
+* `settings`
+
+Every significant action should be recorded as an event:
+
+* starting a session,
+* stopping a session,
+* sending a prompt,
+* receiving a report,
+* assigning a worklane,
+* changing worklane status,
+* creating a worktree,
+* committing,
+* attempting integration,
+* failing integration,
+* passing or failing tests,
+* killing a process,
+* cleaning resources.
+
+## Structured agent reports
+
+Agents must produce structured reports so the harness can parse them.
+
+A Developer report should include:
+
+```json
+{
+  "agent_id": "...",
+  "worklane_id": "...",
+  "status": "in_progress | blocked | needs_verification | ready_for_integration | failed",
+  "summary": "...",
+  "files_changed": [],
+  "commits": [],
+  "tests_run": [],
+  "test_result": "pass | fail | not_run",
+  "blockers": [],
+  "next_action": "..."
+}
+```
+
+An Integrator report should include:
+
+```json
+{
+  "integrator_id": "...",
+  "worklane_id": "...",
+  "attempt_branch": "...",
+  "status": "integrated | integration_failed | requeued | needs_conflict_resolution",
+  "summary": "...",
+  "merge_result": "...",
+  "tests_run": [],
+  "test_result": "pass | fail | not_run",
+  "failure_reason": null,
+  "next_action": "..."
+}
+```
+
+Freeform logs are allowed, but structured reports are authoritative.
+
+## Git and worktrees
+
+The harness works with Git.
+
+If run in a non-Git repository, initialize one.
+
+If `gh` is unavailable or unauthorized, print a red warning but continue.
+
+If `gh` is available and authorized:
+
+* push progress to remote branches,
+* optionally publish `STATUS.html` as a GitHub Page.
+
+Developers work in separate Git worktrees to avoid collisions.
+
+The harness stores worktree details in SQLite:
+
+* path,
+* branch,
+* owner agent,
+* worklane,
+* base commit,
+* status,
+* last activity.
+
+Unintegrated worktrees must not be deleted by Janitor.
+
+## Testing loop
+
+A non-agentic testing loop continuously runs the full test suite and logs results to SQLite.
+
+It records:
+
+* run id,
+* commit,
+* start time,
+* end time,
+* command,
+* status,
+* full logs,
+* individual test successes,
+* individual test failures,
+* skipped tests.
+
+The database must allow queries such as:
+
+* all failures from the last run,
+* all skipped tests from the last run,
+* all successes from the last run,
+* failures from a specific test file from three runs ago,
+* history of a specific failing test.
+
+Keep the last 5 full test logs.
+
+For older logs, retain:
+
+* one report per hour from today,
+* one report per day from the previous week,
+* one report per week from earlier months.
+
+Any time a test fails, the harness should create or update an issue record and notify the Coordinator. Developers should not necessarily drop current work immediately, but the Coordinator should prioritize stabilization lanes appropriately.
+
+When a test is fixed, store:
+
+* failing test,
+* suspected root cause,
+* fix summary,
+* first failing commit,
+* fixing commit,
+* related worklane.
+
+Before fixing a failing test, look up whether it failed in the past and include previous causes/resolutions in the context.
+
+If any test flips from passing to failing to passing repeatedly more than 3 times in 24 hours, invoke Architect to identify the systemic cause and create refactor worklanes.
+
+## Status reporting
+
+A deterministic Status Renderer updates `STATUS.md` and `STATUS.html` every 15 minutes and on startup.
+
+The first run creates:
+
+* `.harness/STATUS_TEMPLATE.md`
+* `.harness/STATUS_TEMPLATE.html`
+
+Subsequent runs populate those templates from SQLite.
+
+Status must include:
+
+* overall progress metric,
+* major milestones,
+* current milestone stages,
+* percentage progress,
+* progress bar in HTML,
+* current agents,
+* current worklanes,
+* integration queue size,
+* integration failed queue size,
+* expected metric improvement from pending integrations,
+* test results,
+* recent work,
+* next steps,
+* challenges,
+* recent interesting events,
+* CPU/RAM samples,
+* progress chart every 15 minutes,
+* resource chart every 15 minutes in HTML,
+* resource summary every 60 minutes in Markdown.
+
+If rendered text becomes longer than 2500 words, summarize the longest sections.
+
+The status page should be readable in one sitting.
+
+An optional Narrative Summarizer may enrich the report, but deterministic data is authoritative.
+
+## Resource monitoring
+
+A deterministic resource loop samples:
+
+* CPU,
+* RAM,
+* disk,
+* process tree usage,
+* harness-owned process usage.
+
+If CPU and RAM usage stay below 60% and integration/test health is good, the Coordinator may be prompted to consider increasing useful concurrency.
+
+If CPU or RAM usage stays around 95%+ and the machine is slowed for more than 30 seconds, identify the problematic harness-owned process and kill or pause it.
+
+If recent agents die after only a few seconds without producing useful results, assume possible resource exhaustion. Run Janitor. If that does not help, notify Coordinator and reduce concurrency.
+
+Do not scale Developer count based only on unused CPU/RAM. Integration health and test health are stronger signals.
+
+## Watchdog
+
+The watchdog must be deterministic and as reliable as possible.
+
+It monitors:
+
+* harness process,
+* Codex sessions,
+* tmux panes,
+* worktree health,
+* crashed agents,
+* repeated short-lived agents,
+* idle agents,
+* runaway resource usage.
+
+On crash:
+
+* record crash details,
+* restart where possible,
+* append crash context to the restarted agent’s prompt,
+* ask it to adjust behavior to avoid repeated crash,
+* notify Coordinator.
+
+The watchdog must support Fedora and NixOS as well as practical local fallbacks. Prefer systemd where available; support a NixOS-compatible mechanism where possible.
+
+The watchdog should not kill processes outside the harness process group.
+
+## Idle and avoidance detection
+
+The harness should monitor for:
+
+* no output,
+* no DB report,
+* no file changes,
+* no commits,
+* repeated claims of being blocked,
+* repeated waiting,
+* `sleep` commands,
+* long-running commands with no evidence of progress,
+* agents that avoid tests,
+* agents that claim success without evidence.
+
+It is acceptable for an agent to wait briefly for collaboration, but not repeatedly for 5, 10, or 30 minutes without progress.
+
+Any use of `sleep` is suspicious and should be investigated.
+
+If progress metric is not improving over a configurable window, the status dashboard should show a red warning and the Coordinator should reorganize work.
+
+## MCP tools
+
+SQLite interactions are done through an MCP tool.
+
+Every agent has access to the SQLite MCP and brief instructions for using it.
+
+Build and test this MCP.
+
+Spawning subagents must also go through an MCP tool routed back to the central harness scheduler. Agents must not spawn invisible unmanaged agent trees.
+
+All inter-agent communication should happen through the harness-visible tools, prompts, SQLite records, or controlled tmux/session mechanisms.
+
+The harness should know the entire agent tree at any given time.
+
+## Codebase indexer
+
+Bring over an open-source codebase indexer and expose it through an MCP so agents do not have to grep constantly.
+
+It should:
+
+* run independently of worklanes,
+* not block new worktrees,
+* distinguish different worktrees,
+* fall back to grep if indexing is unavailable,
+* keep checking for readiness.
+
+## Codex configuration
+
+All Codex sessions should default to:
+
+* `--yolo`
+* `gpt-5.5 xhigh fast`
+
+Do not silently downgrade.
+
+If the requested model is unavailable, fail clearly unless the user explicitly allows fallback.
+
+Permission/model behavior should be configurable, but the default must match the above.
+
+## Safety and cleanup boundaries
+
+Destructive operations need guardrails.
+
+Never delete:
+
+* unintegrated branches,
+* unintegrated worktrees,
+* current useful logs,
+* crash evidence,
+* data not proven safe by SQLite records.
+
+Never kill:
+
+* processes outside the harness process group,
+* user processes not created by the harness.
+
+Janitor should support dry-run mode.
+
+Cleanup decisions should be recorded in SQLite.
+
+## Development instructions
+
+Create `DEVELOPMENT.md` for Developer agents.
+
+It should instruct Developers to:
+
+* avoid creating a single huge file with the entire project,
+* avoid fragmenting every tiny thing into its own file/function,
+* write relevant intention-led docblocks for most functions/types created,
+* document why a function/type exists,
+* document what/how only when not obvious from code,
+* add inline comments for non-obvious sections,
+* commit reasonably often,
+* run relevant lane-specific tests,
+* report structured status,
+* avoid unsupported claims of completion.
+
+## Acceptance tests
+
+The harness should include tests for at least:
+
+* starting in a non-Git directory initializes Git,
+* first `./harness run` creates SQLite DB,
+* first `./harness run` creates/uses tmux session,
+* status command renders without agents,
+* crashed Developer is detected and restarted,
+* sleeping Developer is detected and escalated,
+* Developer worktree is created correctly,
+* Developer completion creates structured report,
+* ready worklane enters integration queue,
+* Integrator handles fast-path lane,
+* Integrator requeues conflicted lane without blocking others,
+* failed full test creates issue record,
+* fixed test updates issue record,
+* repeated failing test invokes Architect,
+* Janitor does not delete unintegrated worktree,
+* restart resumes known worklanes,
+* stale worklane is detected,
+* integration backlog triggers backpressure,
+* low CPU does not spawn more Developers when integration is backed up,
+* `./harness poke` records event and routes message.
+
+## Core objective
+
+The harness should feel less like a pipeline and more like a local operating system for coding agents.
+
+It should keep useful work flowing concurrently while deterministic loops continuously measure, supervise, integrate, test, clean, report, and recover.
+
+The system succeeds when:
+
+* Developers rarely wait,
+* Integrator does not become a bottleneck,
+* broken work is requeued quickly,
+* progress is measured objectively,
+* status is always inspectable,
+* crashes are recoverable,
+* integration debt is controlled,
+* and the user can intervene at any time through the Manhole.

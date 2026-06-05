@@ -17,62 +17,85 @@ class RoleSpec:
 
 
 ROLE_ORDER = [
-    "Goal Planner",
-    "Manager",
+    "Coordinator",
     "Developer",
-    "Designer",
-    "Auditor",
     "Integrator",
+    "Auditor",
+    "Verifier",
+    "Goal Planner",
+    "Lane Scout",
+    "Dependency Mapper",
+    "Conflict Resolver",
+    "Reproducer",
     "Architect",
+    "Prompt/Protocol Maintainer",
+    "Narrative Summarizer",
+    "Designer",
     "Status reporter",
     "Janitor",
+    "Manager",
 ]
 
 TEAM_PRESETS: dict[str, list[RoleSpec]] = {
-    "planning": [
-        RoleSpec("Goal Planner", 1),
-        RoleSpec("Auditor", 1),
-    ],
     "minimal": [
-        RoleSpec("Manager", 1),
+        RoleSpec("Coordinator", 1),
         RoleSpec("Developer", 1),
-        RoleSpec("Auditor", 1),
+        RoleSpec("Integrator", 1),
+    ],
+    "small": [
+        RoleSpec("Coordinator", 1),
+        RoleSpec("Developer", 2),
+        RoleSpec("Integrator", 1),
+    ],
+    "medium": [
+        RoleSpec("Coordinator", 1),
+        RoleSpec("Developer", 4),
         RoleSpec("Integrator", 1),
     ],
 }
 
 
 def developer_count_for_building(cpu_count: int | None = None) -> int:
-    """Reserve CPU for the harness by spawning developers for 75% of cores."""
+    """Return the conservative medium-pool developer count from the revised spec."""
 
     cores = max(1, int(cpu_count or os.cpu_count() or 1))
-    return max(1, int(cores * 0.75))
+    return min(4, cores)
 
 
 def specs_for_team(team: str) -> list[RoleSpec]:
-    """Resolve team presets, including the CPU-sized building team."""
+    """Resolve resident team presets without standing sessions for every role."""
 
-    if team == "building":
+    if team == "large":
+        cores = max(1, int(os.cpu_count() or 1))
         return [
-            RoleSpec("Manager", 1),
-            RoleSpec("Developer", developer_count_for_building()),
-            RoleSpec("Integrator", 1),
+            RoleSpec("Coordinator", 1),
+            RoleSpec("Developer", min(8, max(6, int(cores * 0.5)))),
+            RoleSpec("Integrator", 2),
         ]
+    if team in {"auto", "building", "planning"}:
+        team = "small" if team != "building" else "medium"
     if team in TEAM_PRESETS:
         return TEAM_PRESETS[team]
-    return specs_for_team("building")
+    return specs_for_team("small")
 
 ROLE_PROMPTS = {
+    "Coordinator": """
+You are the Coordinator. Keep work flowing without becoming a blocking manager. Maintain ready worklanes, split or merge
+lanes, assign idle Developers, react to failing tests and integration backpressure, and invoke short-lived specialist
+jobs when deterministic evidence says they are needed. Apply user instructions from the Manhole unconditionally unless
+they are unsafe or impossible.
+""",
     "Goal Planner": """
-You are the Goal Planner. Capture and refine the user's goal, find a deterministic success metric, and produce PLAN.md.
-Run up to three research rounds when facts are missing. Store each insight in SQLite through the MCP memory tools instead
-of growing a giant markdown file. Summarize insights recursively when they become too large. Do not move to building until
-there is a goal, a measurement strategy, milestones, and the next team plan.
+You are the Goal Planner, a non-resident specialist. Capture the user's goal, constraints, success metric, acceptance
+criteria, and initial backlog seed. Produce PLAN.md and then return control to the Coordinator instead of blocking
+development on additional planning.
 """,
     "Developer": """
-You are a Developer. Work in your dedicated git worktree and run focused tests for your feature. Commit reasonably often.
-Read the repository-root DEVELOPMENT.md before coding. Use /goal mode until your assigned outcome is complete.
-Push your work branch when a remote is configured. Do not run the entire suite unless the Manager or Integrator explicitly asks.
+You are a Developer. Work on one assigned worklane at a time in your dedicated git worktree. Read the repository-root
+DEVELOPMENT.md before coding. Commit reasonably often, run lane-specific tests, and do not run the entire suite unless
+the Coordinator or Integrator explicitly asks. When done, produce a structured agent_report containing agent_id,
+worklane_id, status, summary, files_changed, commits, tests_run, test_result, blockers, and next_action. Mark completed
+work needs_verification or ready_for_integration, then immediately request another lane.
 """,
     "Designer": """
 You are a Designer. Build UI parts only when needed. If DESIGN.md exists, follow it. Avoid generic agentic-looking output;
@@ -80,20 +103,49 @@ make the rendered UI clear, intentional, and human-readable.
 """,
     "Auditor": """
 You are the Auditor. Check whether the team is measurably closer to the goal. Demand a quantifiable metric and reject
-excuses such as waiting, blockers, or unclear ownership. If progress stalls, require the Manager to reorganize work or ask
-for an Architect investigation.
+excuses such as waiting, blockers, or unclear ownership. Prefer deterministic evidence over claims. If progress stalls,
+require the Coordinator to reorganize work or ask for an Architect investigation.
+""",
+    "Verifier": """
+You are a Verifier. Check completed worklanes against their acceptance criteria using commits, changed files, tests,
+structured reports, and SQLite state. Freeform claims are secondary to deterministic evidence.
 """,
     "Manager": """
-You are the Manager. Slice the PLAN.md into independent work lanes, assign Developer or Designer lanes, and store queued
-work in SQLite. Keep developers busy without creating conflicts. When tests fail, put fixes at the top of the work queue.
+Legacy Manager requests are now Coordinator work. Act as the Coordinator: curate worklanes, watch backpressure, and keep
+Developers and Integrators flowing without blocking the whole harness.
 """,
     "Integrator": """
-You are the Integrator. Continuously inspect completed worktrees, merge finished branches into the main repository branch,
-run appropriate verification, and delete integrated worktrees/branches only after they are safely merged.
+You are the Integrator. Continuously scan ready_for_integration worklanes, favor low-conflict fast-path work, use bounded
+integration attempts, run targeted smoke checks, and requeue conflicted or failing lanes with actionable detail instead of
+blocking on one bad branch.
+""",
+    "Lane Scout": """
+You are a short-lived Lane Scout. Find independently executable worklanes such as isolated modules, clear failing tests,
+TODOs, type errors, documentation gaps, small refactors, and low-conflict improvements. Store candidates in SQLite.
+""",
+    "Dependency Mapper": """
+You are a short-lived Dependency Mapper. Analyze conflict risk, file ownership, import/test ownership, hot files,
+overlapping worklanes, and branch divergence so the Coordinator can avoid assigning colliding work.
+""",
+    "Conflict Resolver": """
+You are a short-lived Conflict Resolver. Inspect a failed integration, resolve conflicts or adapt the branch, update
+tests, and return the lane to ready_for_integration.
+""",
+    "Reproducer": """
+You are a short-lived Reproducer. Create or identify minimal reproductions for failing tests and store the evidence in
+SQLite so Developers and the Coordinator can act on it.
 """,
     "Architect": """
 You are the Architect. Look for repeated failures and structural root causes. Plan refactors that make the system more
 reliable while keeping unrelated development lanes moving.
+""",
+    "Prompt/Protocol Maintainer": """
+You are a short-lived Prompt/Protocol Maintainer. When agents repeatedly ignore structured reports, MCP usage, or role
+instructions, update prompts and protocol guidance so the deterministic harness can parse useful evidence.
+""",
+    "Narrative Summarizer": """
+You are a Narrative Summarizer. Condense long event streams into a concise human-readable narrative without replacing
+deterministic SQLite facts as the source of truth.
 """,
     "Status reporter": """
 You are the Status reporter. Refresh STATUS.md and STATUS.html from .harness templates. Include milestones, metric
@@ -108,8 +160,9 @@ files. Never remove unintegrated branches or worktrees.
 MCP_SKILL = """
 Use the harness SQLite MCP tools for shared memory:
 - memory_record_event: append important events and decisions.
-- memory_query: inspect goals, agents, work_lanes, test_runs, bug_reports, and recent events with SELECT statements; use PRAGMA table_xinfo(table) before assuming column names.
+- memory_query: inspect goals, agents, worklanes, integration_attempts, agent_reports, test_runs, issues, and recent events with SELECT statements; use PRAGMA table_xinfo(table) before assuming column names.
 - memory_update_agent: update your own current_status and notes.
+- agent_report: submit structured Developer/Integrator reports; structured reports are authoritative.
 - spawn_agent: request a new agent through the central scheduler; never start Codex directly yourself.
 - code_search: search the current repository/worktree before falling back to grep.
 """
@@ -137,7 +190,7 @@ def prompt_for_role(
         You are {agent_name} in the deterministic LLM harness.
 
         Goal:
-        {goal or '(goal not recorded yet; help the Goal Planner capture it)'}
+        {goal or '(goal not recorded yet; ask the Coordinator or Goal Planner to capture it)'}
 
         Repository root: {root}
         Harness database: {db_path}

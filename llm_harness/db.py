@@ -170,15 +170,38 @@ def init_db(conn: sqlite3.Connection) -> None:
             crash_count INTEGER NOT NULL DEFAULT 0
         );
 
-        CREATE TABLE IF NOT EXISTS work_lanes (
+        CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            status TEXT NOT NULL DEFAULT 'running',
+            summary TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS worklanes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'Developer',
+            description TEXT NOT NULL DEFAULT '',
+            goal TEXT NOT NULL DEFAULT '',
+            acceptance_criteria TEXT NOT NULL DEFAULT '',
+            owner_agent_id INTEGER,
+            role_type TEXT NOT NULL DEFAULT 'Developer',
+            priority INTEGER NOT NULL DEFAULT 100,
             status TEXT NOT NULL DEFAULT 'queued',
-            branch TEXT NOT NULL DEFAULT '',
-            worktree TEXT NOT NULL DEFAULT '',
-            expected_metric_delta REAL NOT NULL DEFAULT 0,
+            base_branch TEXT NOT NULL DEFAULT '',
+            branch_name TEXT NOT NULL DEFAULT '',
+            worktree_path TEXT NOT NULL DEFAULT '',
+            dependencies TEXT NOT NULL DEFAULT '[]',
+            conflict_risk TEXT NOT NULL DEFAULT 'unknown',
+            expected_metric_impact REAL NOT NULL DEFAULT 0,
+            integration_queue TEXT NOT NULL DEFAULT '',
+            test_evidence TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            assigned_at TEXT,
+            last_activity_at TEXT,
+            ready_for_integration_at TEXT,
+            integrated_at TEXT,
+            abandoned_at TEXT,
             notes TEXT NOT NULL DEFAULT ''
         );
 
@@ -188,6 +211,58 @@ def init_db(conn: sqlite3.Connection) -> None:
             target TEXT NOT NULL DEFAULT 'broadcast',
             message TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'queued'
+        );
+
+        CREATE TABLE IF NOT EXISTS agent_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            target TEXT NOT NULL DEFAULT 'broadcast',
+            message TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            delivered_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS agent_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            agent_name TEXT NOT NULL DEFAULT '',
+            worklane_id INTEGER,
+            role TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            report_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS worktrees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            branch TEXT NOT NULL DEFAULT '',
+            owner_agent TEXT NOT NULL DEFAULT '',
+            worklane_id INTEGER,
+            base_commit TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            last_activity_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS commits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sha TEXT NOT NULL UNIQUE,
+            branch TEXT NOT NULL DEFAULT '',
+            worklane_id INTEGER,
+            agent_name TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS integration_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worklane_id INTEGER NOT NULL,
+            attempt_branch TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'integrating',
+            merge_result TEXT NOT NULL DEFAULT '',
+            tests_json TEXT NOT NULL DEFAULT '[]',
+            failure_reason TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS spawn_requests (
@@ -255,6 +330,34 @@ def init_db(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS issues (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_key TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            severity INTEGER NOT NULL DEFAULT 1,
+            source TEXT NOT NULL DEFAULT '',
+            first_seen_commit TEXT NOT NULL DEFAULT '',
+            fixed_commit TEXT NOT NULL DEFAULT '',
+            root_cause TEXT NOT NULL DEFAULT '',
+            resolution TEXT NOT NULL DEFAULT '',
+            worklane_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS status_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS code_index (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             worktree TEXT NOT NULL,
@@ -266,21 +369,126 @@ def init_db(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
         CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(current_status);
-        CREATE INDEX IF NOT EXISTS idx_work_lanes_status ON work_lanes(status);
+        CREATE INDEX IF NOT EXISTS idx_worklanes_status ON worklanes(status);
+        CREATE INDEX IF NOT EXISTS idx_worklanes_queue ON worklanes(integration_queue, status, priority);
         CREATE INDEX IF NOT EXISTS idx_messages_target_status ON messages(target, status);
+        CREATE INDEX IF NOT EXISTS idx_agent_messages_target_status ON agent_messages(target, status);
+        CREATE INDEX IF NOT EXISTS idx_agent_reports_worklane ON agent_reports(worklane_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_worktrees_owner ON worktrees(owner_agent, status);
+        CREATE INDEX IF NOT EXISTS idx_integration_attempts_lane ON integration_attempts(worklane_id, status);
         CREATE INDEX IF NOT EXISTS idx_spawn_requests_status ON spawn_requests(status);
         CREATE INDEX IF NOT EXISTS idx_resource_samples_ts ON resource_samples(ts DESC);
         CREATE INDEX IF NOT EXISTS idx_metric_samples_ts ON metric_samples(ts DESC);
         CREATE INDEX IF NOT EXISTS idx_test_runs_started ON test_runs(started_at DESC);
         CREATE INDEX IF NOT EXISTS idx_test_results_run ON test_results(run_id);
         CREATE INDEX IF NOT EXISTS idx_bugs_node_status ON bug_reports(test_nodeid, status);
+        CREATE INDEX IF NOT EXISTS idx_issues_key_status ON issues(issue_key, status);
         CREATE INDEX IF NOT EXISTS idx_code_index_worktree_path ON code_index(worktree, path);
         """
     )
+    ensure_worklane_compat(conn)
     ensure_mcp_compat_columns(conn)
     if get_meta(conn, "schema_version") != str(SCHEMA_VERSION):
         set_meta(conn, "schema_version", str(SCHEMA_VERSION))
     conn.commit()
+
+
+def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
+    """Expose the refined worklanes table through the legacy work_lanes name."""
+
+    object_type = _sqlite_object_type(conn, "work_lanes")
+    if object_type == "table":
+        for row in conn.execute("SELECT * FROM work_lanes").fetchall():
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO worklanes(
+                    id, title, role_type, status, branch_name, worktree_path,
+                    expected_metric_impact, created_at, last_activity_at, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["title"],
+                    row["role"],
+                    row["status"],
+                    row["branch"],
+                    row["worktree"],
+                    row["expected_metric_delta"],
+                    row["ts"],
+                    row["ts"],
+                    row["notes"],
+                ),
+            )
+        conn.execute("DROP TABLE work_lanes")
+    elif object_type == "view":
+        conn.execute("DROP VIEW work_lanes")
+    conn.executescript(
+        """
+        DROP TRIGGER IF EXISTS work_lanes_insert;
+        DROP TRIGGER IF EXISTS work_lanes_update;
+        DROP TRIGGER IF EXISTS work_lanes_delete;
+
+        CREATE VIEW work_lanes AS
+        SELECT
+            id,
+            created_at AS ts,
+            title,
+            role_type AS role,
+            status,
+            branch_name AS branch,
+            worktree_path AS worktree,
+            expected_metric_impact AS expected_metric_delta,
+            notes
+        FROM worklanes;
+
+        CREATE TRIGGER work_lanes_insert INSTEAD OF INSERT ON work_lanes
+        BEGIN
+            INSERT INTO worklanes(
+                id, title, role_type, status, branch_name, worktree_path,
+                expected_metric_impact, created_at, last_activity_at, notes
+            ) VALUES (
+                NEW.id,
+                COALESCE(NEW.title, ''),
+                COALESCE(NEW.role, 'Developer'),
+                COALESCE(NEW.status, 'queued'),
+                COALESCE(NEW.branch, ''),
+                COALESCE(NEW.worktree, ''),
+                COALESCE(NEW.expected_metric_delta, 0),
+                COALESCE(NEW.ts, datetime('now')),
+                COALESCE(NEW.ts, datetime('now')),
+                COALESCE(NEW.notes, '')
+            );
+        END;
+
+        CREATE TRIGGER work_lanes_update INSTEAD OF UPDATE ON work_lanes
+        BEGIN
+            UPDATE worklanes SET
+                title = COALESCE(NEW.title, title),
+                role_type = COALESCE(NEW.role, role_type),
+                status = COALESCE(NEW.status, status),
+                branch_name = COALESCE(NEW.branch, branch_name),
+                worktree_path = COALESCE(NEW.worktree, worktree_path),
+                expected_metric_impact = COALESCE(NEW.expected_metric_delta, expected_metric_impact),
+                notes = COALESCE(NEW.notes, notes),
+                last_activity_at = datetime('now')
+            WHERE id = OLD.id;
+        END;
+
+        CREATE TRIGGER work_lanes_delete INSTEAD OF DELETE ON work_lanes
+        BEGIN
+            DELETE FROM worklanes WHERE id = OLD.id;
+        END;
+        """
+    )
+
+
+def _sqlite_object_type(conn: sqlite3.Connection, name: str) -> str:
+    """Return the SQLite object type for migrations, or an empty string."""
+
+    row = conn.execute("SELECT type FROM sqlite_master WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        return ""
+    return str(row["type"] if isinstance(row, sqlite3.Row) else row[0])
 
 
 def ensure_mcp_compat_columns(conn: sqlite3.Connection) -> None:
@@ -320,6 +528,13 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.execute(
         """
         INSERT INTO metadata(key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, value, now),
+    )
+    conn.execute(
+        """
+        INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
         """,
         (key, value, now),
@@ -494,9 +709,14 @@ def recent_events(conn: sqlite3.Connection, limit: int = 12) -> list[sqlite3.Row
 def queue_message(conn: sqlite3.Connection, message: str, target: str = "broadcast") -> int:
     """Persist a prompt injection before tmux delivery is attempted."""
 
+    now = utc_now()
     cur = conn.execute(
         "INSERT INTO messages(ts, target, message, status) VALUES (?, ?, ?, 'queued')",
-        (utc_now(), target, message),
+        (now, target, message),
+    )
+    conn.execute(
+        "INSERT INTO agent_messages(id, created_at, target, message, status) VALUES (?, ?, ?, ?, 'queued')",
+        (int(cur.lastrowid), now, target, message),
     )
     log_event(conn, "poke", f"Queued message for {target}", payload={"message": message})
     return int(cur.lastrowid)
@@ -505,7 +725,140 @@ def queue_message(conn: sqlite3.Connection, message: str, target: str = "broadca
 def mark_message(conn: sqlite3.Connection, message_id: int, status: str) -> None:
     """Mark a user or scheduler prompt as delivered or failed."""
 
+    delivered_at = utc_now() if status == "delivered" else None
     conn.execute("UPDATE messages SET status = ? WHERE id = ?", (status, message_id))
+    conn.execute("UPDATE agent_messages SET status = ?, delivered_at = COALESCE(?, delivered_at) WHERE id = ?", (status, delivered_at, message_id))
+    conn.commit()
+
+
+def queue_worklane(
+    conn: sqlite3.Connection,
+    title: str,
+    role_type: str = "Developer",
+    status: str = "queued",
+    notes: str = "",
+    priority: int = 100,
+    description: str = "",
+    goal: str = "",
+    acceptance_criteria: str = "",
+    expected_metric_impact: float = 0,
+) -> int:
+    """Create a refined worklane row and return its durable id."""
+
+    now = utc_now()
+    cur = conn.execute(
+        """
+        INSERT INTO worklanes(
+            title, description, goal, acceptance_criteria, role_type, priority,
+            status, expected_metric_impact, created_at, last_activity_at, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (title, description, goal, acceptance_criteria, role_type, priority, status, expected_metric_impact, now, now, notes),
+    )
+    log_event(conn, "worklane_created", title, payload={"worklane_id": int(cur.lastrowid), "status": status})
+    return int(cur.lastrowid)
+
+
+def claim_next_worklane(conn: sqlite3.Connection, agent_name: str, worktree: str, branch: str) -> sqlite3.Row | None:
+    """Assign the highest-priority queued lane to a developer, if one exists."""
+
+    lane = conn.execute(
+        """
+        SELECT * FROM worklanes
+        WHERE status = 'queued' AND role_type IN ('Developer', 'Designer')
+        ORDER BY priority ASC, id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    if lane is None:
+        return None
+    now = utc_now()
+    agent = conn.execute("SELECT id FROM agents WHERE name = ?", (agent_name,)).fetchone()
+    conn.execute(
+        """
+        UPDATE worklanes
+        SET status = 'assigned', owner_agent_id = ?, branch_name = ?, worktree_path = ?,
+            assigned_at = ?, last_activity_at = ?
+        WHERE id = ?
+        """,
+        (agent["id"] if agent else None, branch, worktree, now, now, lane["id"]),
+    )
+    log_event(conn, "worklane_assigned", f"Assigned worklane#{lane['id']} to {agent_name}", agent_name=agent_name, payload={"worklane_id": lane["id"]})
+    return conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane["id"],)).fetchone()
+
+
+def update_worklane_status(conn: sqlite3.Connection, lane_id: int, status: str, notes: str | None = None) -> None:
+    """Move one worklane through its per-lane lifecycle."""
+
+    now = utc_now()
+    fields = ["status = ?", "last_activity_at = ?"]
+    params: list[Any] = [status, now]
+    if status == "ready_for_integration":
+        fields.extend(["ready_for_integration_at = ?", "integration_queue = ?"])
+        params.extend([now, "ready_fast_path"])
+    elif status == "integrated":
+        fields.append("integrated_at = ?")
+        params.append(now)
+    elif status == "abandoned":
+        fields.append("abandoned_at = ?")
+        params.append(now)
+    if notes is not None:
+        fields.append("notes = ?")
+        params.append(notes)
+    params.append(lane_id)
+    conn.execute(f"UPDATE worklanes SET {', '.join(fields)} WHERE id = ?", tuple(params))
+    log_event(conn, "worklane_status", f"worklane#{lane_id} -> {status}", payload={"worklane_id": lane_id, "status": status})
+
+
+def record_agent_report(conn: sqlite3.Connection, report: Mapping[str, Any]) -> int:
+    """Store a structured agent report and reflect authoritative lane status."""
+
+    now = utc_now()
+    agent_name = str(report.get("agent_id") or report.get("integrator_id") or report.get("agent_name") or "")
+    lane_value = report.get("worklane_id")
+    lane_id = int(lane_value) if str(lane_value or "").isdigit() else None
+    status = str(report.get("status") or "")
+    agent = conn.execute("SELECT role FROM agents WHERE name = ?", (agent_name,)).fetchone()
+    cur = conn.execute(
+        """
+        INSERT INTO agent_reports(created_at, agent_name, worklane_id, role, status, report_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (now, agent_name, lane_id, agent["role"] if agent else "", status, json.dumps(report, sort_keys=True)),
+    )
+    if lane_id and status:
+        update_worklane_status(conn, lane_id, status, str(report.get("summary") or ""))
+    log_event(conn, "agent_report", f"{agent_name or 'agent'} reported {status or 'status'}", agent_name=agent_name, payload={"report_id": int(cur.lastrowid), "worklane_id": lane_id})
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def record_worktree(
+    conn: sqlite3.Connection,
+    path: str,
+    branch: str = "",
+    owner_agent: str = "",
+    worklane_id: int | None = None,
+    base_commit: str = "",
+    status: str = "active",
+) -> None:
+    """Record a harness-owned worktree so Janitor can preserve unintegrated work."""
+
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO worktrees(path, branch, owner_agent, worklane_id, base_commit, status, last_activity_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            branch = excluded.branch,
+            owner_agent = excluded.owner_agent,
+            worklane_id = excluded.worklane_id,
+            base_commit = excluded.base_commit,
+            status = excluded.status,
+            last_activity_at = excluded.last_activity_at
+        """,
+        (path, branch, owner_agent, worklane_id, base_commit, status, now),
+    )
     conn.commit()
 
 
@@ -664,6 +1017,17 @@ def note_failing_tests(conn: sqlite3.Connection, run_id: int, commit_sha: str) -
                 """,
                 (row["nodeid"], commit_sha, now, now),
             )
+        conn.execute(
+            """
+            INSERT INTO issues(issue_key, title, status, severity, source, first_seen_commit, created_at, updated_at)
+            VALUES (?, ?, 'open', 1, 'test-loop', ?, ?, ?)
+            ON CONFLICT(issue_key) DO UPDATE SET
+                status = 'open',
+                severity = severity + 1,
+                updated_at = excluded.updated_at
+            """,
+            (f"test:{row['nodeid']}", f"Failing test: {row['nodeid']}", commit_sha, now, now),
+        )
     conn.commit()
 
 
