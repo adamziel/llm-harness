@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from llm_harness import __version__, db
 from llm_harness.codex import CODEX_MODEL, CODEX_REASONING_EFFORT, build_codex_command
@@ -106,6 +107,9 @@ class HarnessTests(unittest.TestCase):
                 db.set_goal(conn, "Ship measurable work", measure="tests pass")
                 db.record_metric(conn, "tests", 3, 4)
                 db.record_resource_sample(conn, {"cpu_percent": 12, "ram_percent": 34, "disk_free_gb": 56, "load1": 1})
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="working", cwd=tmp)
+                db.upsert_agent(conn, name="developer-2", role="Developer", current_status="crash", cwd=tmp)
+                db.upsert_agent(conn, name="developer-3", role="Developer", current_status="stopped", cwd=tmp)
                 db.log_event(conn, "note", "status is alive")
                 md, html = refresh_reports(conn, tmp)
                 self.assertTrue(md.exists())
@@ -115,6 +119,7 @@ class HarnessTests(unittest.TestCase):
                 text = dashboard(conn)
                 self.assertIn("Last generated", text)
                 self.assertIn("Progress", text)
+                self.assertIn("Agents: 1 active, 1 crashed, 3 tracked", text)
                 self.assertIn("status is alive", text)
 
     def test_mcp_tools_record_query_spawn_and_search(self):
@@ -132,6 +137,20 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("queued", spawn["content"][0]["text"])
             search = server.call_tool("code_search", {"query": "answer", "refresh": True})
             self.assertIn("example.py", search["content"][0]["text"])
+
+    def test_mcp_activity_status_keeps_agent_lifecycle_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            server = HarnessMCP(tmp, paths.db)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", cwd=tmp)
+            result = server.call_tool("memory_update_agent", {"name": "developer-1", "status": "working", "notes": "claimed lane"})
+            self.assertIn('"ok": true', result["content"][0]["text"])
+            with db.connect(paths.db) as conn:
+                agent = conn.execute("SELECT * FROM agents WHERE name = 'developer-1'").fetchone()
+            self.assertEqual(agent["current_status"], "running")
+            self.assertEqual(agent["notes"], "working: claimed lane")
 
     def test_stdio_mcp_initialize_and_tools_list(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -225,6 +244,45 @@ class HarnessTests(unittest.TestCase):
                 agents = db.list_agents(conn)
                 self.assertGreaterEqual(len(agents), 3)
 
+    def test_team_capacity_counts_live_non_terminal_developers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="manager-1", role="Manager", current_status="working", tmux_pane="%manager", cwd=tmp)
+                for index, status in enumerate(["working", "idle", "waiting", "running"], start=1):
+                    db.upsert_agent(conn, name=f"developer-{index}", role="Developer", current_status=status, tmux_pane=f"%developer-{index}", cwd=tmp)
+                db.upsert_agent(conn, name="integrator-1", role="Integrator", current_status="merging", tmux_pane="%integrator", cwd=tmp)
+                with mock.patch("llm_harness.roles.os.cpu_count", return_value=4):
+                    scheduler.ensure_team(conn, "building")
+            spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
+            self.assertEqual(spawned_developers, [])
+
+    def test_team_capacity_replaces_only_terminal_or_missing_developers(self):
+        class MissingOneTmux(FakeTmux):
+            def target_exists(self, target):
+                return target != "%missing"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = MissingOneTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="manager-1", role="Manager", current_status="running", tmux_pane="%manager", cwd=tmp)
+                db.upsert_agent(conn, name="integrator-1", role="Integrator", current_status="running", tmux_pane="%integrator", cwd=tmp)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="working", tmux_pane="%live", cwd=tmp)
+                db.upsert_agent(conn, name="developer-2", role="Developer", current_status="success", tmux_pane="%done", cwd=tmp)
+                db.upsert_agent(conn, name="developer-3", role="Developer", current_status="working", tmux_pane="%missing", cwd=tmp)
+                with mock.patch("llm_harness.roles.os.cpu_count", return_value=4):
+                    scheduler.ensure_team(conn, "building")
+                missing = conn.execute("SELECT current_status FROM agents WHERE name = 'developer-3'").fetchone()["current_status"]
+            spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
+            self.assertEqual(spawned_developers, ["developer-4", "developer-5"])
+            self.assertEqual(missing, "crash")
+
     def test_stop_cleans_harness_runtime_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -235,7 +293,7 @@ class HarnessTests(unittest.TestCase):
                 db.init_db(conn)
                 db.set_meta(conn, "tmux_session", "session")
                 conn.commit()
-                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_session="session", tmux_window="developer-1", tmux_pane="%1", cwd=tmp)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="working", tmux_session="session", tmux_window="developer-1", tmux_pane="%1", cwd=tmp)
                 db.queue_spawn_request(conn, role="Developer", title="later", prompt="do it")
                 db.queue_message(conn, "hello")
             (paths.tmp / "keep.tmp").write_text("next janitor owns this")
@@ -365,19 +423,33 @@ class HarnessTests(unittest.TestCase):
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
                 db.upsert_agent(conn, name="auditor-1", role="Auditor", current_status="running", tmux_pane="%stale", cwd=tmp)
-                db.upsert_agent(conn, name="auditor-2", role="Auditor", current_status="running", tmux_pane="%live", cwd=tmp)
+                db.upsert_agent(conn, name="auditor-2", role="Auditor", current_status="working", tmux_pane="%live", cwd=tmp)
                 scheduler.prompt_auditor(conn, "check this")
                 stale = conn.execute("SELECT * FROM agents WHERE name = 'auditor-1'").fetchone()
             self.assertEqual(stale["current_status"], "crash")
             self.assertEqual(fake.sent, [("%live", "check this")])
 
-    def test_architect_spawn_requests_reuse_one_running_architect(self):
+    def test_prompt_manager_reuses_active_manager(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
             fake = FakeTmux()
             scheduler = HarnessScheduler(tmp, tmux=fake)
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
+                db.upsert_agent(conn, name="manager-1", role="Manager", current_status="working", tmux_pane="%manager", cwd=tmp)
+                scheduler.prompt_manager(conn, "reorganize")
+            manager_windows = [window for _, window, _ in fake.commands if window.startswith("manager-")]
+            self.assertEqual(manager_windows, [])
+            self.assertEqual(fake.sent, [("%manager", "reorganize")])
+
+    def test_architect_spawn_requests_reuse_one_active_architect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="architect-1", role="Architect", current_status="working", tmux_pane="%architect", cwd=tmp)
                 for index in range(1, 4):
                     db.queue_spawn_request(
                         conn,
@@ -387,13 +459,11 @@ class HarnessTests(unittest.TestCase):
                         requester="test",
                     )
                 scheduler.handle_spawn_requests(conn)
-                architects = list(conn.execute("SELECT * FROM agents WHERE role = 'Architect' AND current_status = 'running'"))
                 requests = list(conn.execute("SELECT * FROM spawn_requests ORDER BY id"))
             architect_windows = [window for _, window, _ in fake.commands if window.startswith("architect-")]
-            self.assertEqual(architect_windows, ["architect-1"])
-            self.assertEqual(len(architects), 1)
+            self.assertEqual(architect_windows, [])
             self.assertEqual([request["agent_name"] for request in requests], ["architect-1", "architect-1", "architect-1"])
-            self.assertEqual(len(fake.sent), 2)
+            self.assertEqual(len(fake.sent), 3)
 
 
 if __name__ == "__main__":

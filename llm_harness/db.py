@@ -18,6 +18,14 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+AGENT_TERMINAL_STATUSES = ("crash", "success", "stopped")
+AGENT_LIFECYCLE_STATUSES = ("running", *AGENT_TERMINAL_STATUSES)
+
+
+def is_active_agent_status(status: str) -> bool:
+    """Return whether an agent status still represents a live harness worker."""
+
+    return status not in AGENT_TERMINAL_STATUSES
 
 
 @dataclass(frozen=True)

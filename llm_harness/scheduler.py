@@ -96,14 +96,19 @@ class HarnessScheduler:
                         self.tmux.kill_session(session)
                     except Exception:
                         pass
-            stopped_agents = conn.execute("SELECT COUNT(*) AS count FROM agents WHERE current_status = 'running'").fetchone()["count"]
+            terminal_statuses = db.AGENT_TERMINAL_STATUSES
+            status_placeholders = ",".join("?" for _ in terminal_statuses)
+            stopped_agents = conn.execute(
+                f"SELECT COUNT(*) AS count FROM agents WHERE current_status NOT IN ({status_placeholders})",
+                terminal_statuses,
+            ).fetchone()["count"]
             conn.execute(
-                """
+                f"""
                 UPDATE agents
                 SET current_status = 'stopped', ended_at = ?, last_seen_at = ?, notes = 'Stopped by harness stop'
-                WHERE current_status = 'running'
+                WHERE current_status NOT IN ({status_placeholders})
                 """,
-                (db.utc_now(), db.utc_now()),
+                (db.utc_now(), db.utc_now(), *terminal_statuses),
             )
             cancelled_spawns = conn.execute("UPDATE spawn_requests SET status = 'cancelled' WHERE status = 'queued'").rowcount
             cancelled_messages = conn.execute("UPDATE messages SET status = 'cancelled' WHERE status = 'queued'").rowcount
@@ -312,13 +317,28 @@ class HarnessScheduler:
 
         specs = specs_for_team(team)
         for spec in specs:
-            running = conn.execute(
-                "SELECT COUNT(*) AS count FROM agents WHERE role = ? AND current_status = 'running'",
-                (spec.name,),
-            ).fetchone()["count"]
-            missing = max(0, spec.min_count - int(running))
+            active = self.active_agent_count(conn, spec.name)
+            missing = max(0, spec.min_count - active)
             for _ in range(missing):
                 self.spawn_agent(conn, spec.name, title=f"Maintain {spec.name} capacity")
+
+    def active_agent_count(self, conn: sqlite3.Connection, role: str) -> int:
+        """Count live agents for capacity, including non-terminal self-reported statuses."""
+
+        active = 0
+        for agent in conn.execute("SELECT * FROM agents WHERE role = ?", (role,)):
+            if not db.is_active_agent_status(agent["current_status"]):
+                continue
+            target = _tmux_target(agent)
+            if target and hasattr(self.tmux, "target_exists"):
+                if self.tmux.target_exists(target):
+                    active += 1
+                else:
+                    db.update_agent_status(conn, agent["name"], "crash", "tmux pane no longer exists", ended=True)
+                    db.log_event(conn, "agent_missing", f"{agent['name']} tmux pane no longer exists", agent_name=agent["name"])
+                continue
+            active += 1
+        return active
 
     def handle_spawn_requests(self, conn: sqlite3.Connection) -> None:
         """Accept MCP spawn requests by starting agents through scheduler-owned code."""
@@ -339,9 +359,13 @@ class HarnessScheduler:
             db.mark_spawn_request(conn, request["id"], "started" if name else "failed", name or "")
 
     def prompt_running_role(self, conn: sqlite3.Connection, role: str, message: str) -> str:
-        """Deliver work to one reachable running agent for singleton specialist roles."""
+        """Deliver work to one reachable active agent for singleton specialist roles."""
 
-        agents = list(conn.execute("SELECT * FROM agents WHERE role = ? AND current_status = 'running' ORDER BY id", (role,)))
+        agents = [
+            agent
+            for agent in conn.execute("SELECT * FROM agents WHERE role = ? ORDER BY id", (role,))
+            if db.is_active_agent_status(agent["current_status"])
+        ]
         for agent in agents:
             target = _tmux_target(agent)
             if not target:
@@ -430,7 +454,11 @@ class HarnessScheduler:
     def check_agent_liveness(self, conn: sqlite3.Connection) -> None:
         """Detect crashed, idle, or suspicious agents and route correction prompts."""
 
-        agents = db.list_agents(conn, "running")
+        agents = [
+            agent
+            for agent in db.list_agents(conn)
+            if db.is_active_agent_status(agent["current_status"])
+        ]
         now = time.time()
         suspicious_agents: list[str] = []
         idle_agents: list[str] = []
@@ -489,7 +517,11 @@ class HarnessScheduler:
     def prompt_auditor(self, conn: sqlite3.Connection, message: str) -> None:
         """Ask a reachable auditor to intervene, or start one alert auditor."""
 
-        auditors = list(conn.execute("SELECT * FROM agents WHERE role = 'Auditor' AND current_status = 'running' ORDER BY id"))
+        auditors = [
+            agent
+            for agent in conn.execute("SELECT * FROM agents WHERE role = 'Auditor' ORDER BY id")
+            if db.is_active_agent_status(agent["current_status"])
+        ]
         for auditor in auditors:
             target = _tmux_target(auditor)
             if not target:
@@ -549,7 +581,14 @@ class HarnessScheduler:
     def prompt_manager(self, conn: sqlite3.Connection, message: str) -> None:
         """Ask the Manager to reorganize work when deterministic monitors fire."""
 
-        manager = conn.execute("SELECT * FROM agents WHERE role = 'Manager' AND current_status = 'running' ORDER BY id LIMIT 1").fetchone()
+        manager = next(
+            (
+                agent
+                for agent in conn.execute("SELECT * FROM agents WHERE role = 'Manager' ORDER BY id")
+                if db.is_active_agent_status(agent["current_status"])
+            ),
+            None,
+        )
         if manager and manager["tmux_pane"]:
             try:
                 self.tmux.send_prompt(manager["tmux_pane"], message)
@@ -591,7 +630,11 @@ class HarnessScheduler:
             message_id = db.queue_message(conn, message, target)
             delivered = 0
             if target == "broadcast":
-                agents = db.list_agents(conn, "running")
+                agents = [
+                    agent
+                    for agent in db.list_agents(conn)
+                    if db.is_active_agent_status(agent["current_status"])
+                ]
             else:
                 agents = list(conn.execute("SELECT * FROM agents WHERE name = ? OR role = ?", (target, target)))
             for agent in agents:

@@ -8,7 +8,7 @@ import sqlite3
 from pathlib import Path
 from textwrap import shorten
 
-from .db import latest_metric, recent_events, utc_now
+from .db import is_active_agent_status, latest_metric, recent_events, utc_now
 
 ANSI = {
     "reset": "\033[0m",
@@ -166,10 +166,10 @@ def dashboard(conn: sqlite3.Connection) -> str:
     lines.append(_box_line(width, f"Progress: {_bar(percent, 24)} {percent:5.1f}%"))
 
     agents = data["agents"]
-    running = sum(1 for a in agents if a.get("current_status") == "running")
+    active = sum(1 for a in agents if is_active_agent_status(str(a.get("current_status", ""))))
     crashed = sum(1 for a in agents if a.get("current_status") == "crash")
     agent_color = ANSI["green"] if crashed == 0 else ANSI["red"]
-    lines.append(_box_line(width, f"Agents: {running} running, {crashed} crashed, {len(agents)} tracked", agent_color))
+    lines.append(_box_line(width, f"Agents: {active} active, {crashed} crashed, {len(agents)} tracked", agent_color))
 
     test_run = data["test_run"]
     if isinstance(test_run, dict) and test_run:
