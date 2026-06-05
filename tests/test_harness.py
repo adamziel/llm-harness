@@ -99,7 +99,24 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("codex --yolo", command)
             self.assertIn(f"--model {CODEX_MODEL}", command)
             self.assertIn(f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"', command)
+            self.assertIn("mcp_servers.llm-harness.command", command)
+            self.assertIn("mcp_servers.llm-harness.args", command)
             self.assertIn(str(prompt), command)
+
+    def test_codex_command_uses_repo_harness_mcp_for_worktrees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            worktree = root / ".harness" / "worktrees" / "developer-1"
+            worktree.mkdir(parents=True)
+            prompt = root / ".harness" / "prompts" / "developer-1.md"
+            prompt.parent.mkdir(parents=True)
+            prompt.write_text("hello")
+            command = build_codex_command(prompt, worktree, root, root / ".harness" / "harness.sqlite3", root / "harness")
+            root = root.resolve()
+            worktree = worktree.resolve()
+            self.assertIn(f'mcp_servers.llm-harness.command="{root / "harness"}"', command)
+            self.assertIn(f'["--root","{root}","mcp"]', command)
+            self.assertNotIn(f'mcp_servers.llm-harness.command="{worktree / "harness"}"', command)
 
     def test_status_reports_and_dashboard_render_from_sqlite(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -193,6 +210,26 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(specs["Integrator"], 1)
         self.assertEqual(set(specs), {"Manager", "Developer", "Integrator"})
 
+    def test_missing_development_md_is_reported_before_agents_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                scheduler.check_project_context(conn)
+                event = conn.execute("SELECT * FROM events WHERE type = 'warning' ORDER BY id DESC LIMIT 1").fetchone()
+            self.assertIn("DEVELOPMENT.md is absent", event["message"])
+
+    def test_mcp_preflight_fails_when_harness_executable_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                with mock.patch.object(scheduler, "harness_executable", return_value=Path(tmp) / "missing-harness"):
+                    self.assertFalse(scheduler.check_codex_mcp(conn))
+                self.assertEqual(db.get_meta(conn, "red_banner"), "Harness MCP unavailable; refusing to start agents.")
+
     def test_testing_loop_records_run_and_parses_failures(self):
         parsed = parse_test_output("tests/test_x.py::test_a PASSED\ntests/test_x.py::test_b FAILED\n")
         self.assertEqual(parsed[1]["status"], "failed")
@@ -232,6 +269,10 @@ class HarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            paths = db.bootstrap(root)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "red_banner", "Harness stopped.")
             fake = FakeTmux()
             scheduler = HarnessScheduler(root, tmux=fake)
             code = scheduler.run(goal="Build something", team="minimal", once=True)
@@ -240,12 +281,14 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("manhole", window_names)
             self.assertIn("status", window_names)
             self.assertNotIn("switch:status", window_names)
+            self.assertIn(("fake-session", "status", "watch -c -n 5 ./harness status"), fake.commands)
             codex_commands = [command for _, window, command in fake.commands if window not in {"manhole", "status", "updater", "tests"} and not window.startswith("switch:")]
             self.assertTrue(codex_commands)
             self.assertTrue(all("--yolo" in command and f"--model {CODEX_MODEL}" in command and f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"' in command for command in codex_commands))
             with db.connect(root / ".harness" / "harness.sqlite3") as conn:
                 agents = db.list_agents(conn)
                 self.assertGreaterEqual(len(agents), 3)
+                self.assertEqual(db.get_meta(conn, "red_banner"), "")
 
     def test_team_capacity_counts_live_non_terminal_developers(self):
         with tempfile.TemporaryDirectory() as tmp:

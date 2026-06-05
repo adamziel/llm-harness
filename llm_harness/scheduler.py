@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import db
-from .codex import build_codex_command
+from .codex import MCP_SERVER_NAME, build_codex_command, codex_mcp_config_args
 from .janitor import run_janitor
 from .resources import sample_resources
 from .roles import prompt_for_role, slug_role, specs_for_team
@@ -45,7 +45,13 @@ class HarnessScheduler:
             db.set_meta(conn, "scheduler_pid", str(os.getpid()))
             self.ensure_git_repo(conn)
             self.check_gh(conn)
+            self.check_project_context(conn)
             self.ensure_goal(conn, goal)
+            if not self.check_codex_mcp(conn):
+                db.set_meta(conn, "scheduler_pid", "")
+                return 1
+            if db.get_meta(conn, "red_banner") == "Harness stopped.":
+                db.set_meta(conn, "red_banner", "")
             self.start_support_windows(conn)
             refresh_reports(conn, self.root)
             effective_team = self.effective_team(conn, team)
@@ -253,6 +259,77 @@ class HarnessScheduler:
         db.log_event(conn, "warning", "GitHub CLI is missing or unauthorized; continuing without automatic pushes/pages")
         print("\033[31mGitHub CLI is missing or unauthorized; continuing locally.\033[0m", file=sys.stderr)
 
+    def check_project_context(self, conn: sqlite3.Connection) -> None:
+        """Tell the user about optional project context files before agents start."""
+
+        if (self.root / "DEVELOPMENT.md").exists():
+            return
+        message = (
+            "DEVELOPMENT.md is absent; developers will fall back to "
+            "AGENTS.md, CLAUDE.md, README.md, and source inspection. "
+            "Create DEVELOPMENT.md to provide project-specific build/test guidance."
+        )
+        db.log_event(conn, "warning", message)
+        print(f"\033[33m{message}\033[0m", file=sys.stderr)
+
+    def check_codex_mcp(self, conn: sqlite3.Connection) -> bool:
+        """Fail startup if Codex will not expose the harness MCP memory tools."""
+
+        harness = self.harness_executable()
+        if not harness.exists():
+            return self._mcp_preflight_failed(conn, f"Harness executable not found for MCP: {harness}")
+        try:
+            server = subprocess.run(
+                [str(harness), "--root", str(self.root), "mcp"],
+                input='{"jsonrpc":"2.0","id":1,"method":"initialize"}\n{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n',
+                cwd=self.root,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return self._mcp_preflight_failed(conn, f"Harness MCP server did not start: {exc}")
+        if server.returncode != 0 or "memory_query" not in server.stdout:
+            detail = (server.stderr or server.stdout or "no MCP output").strip()
+            return self._mcp_preflight_failed(conn, f"Harness MCP server did not expose memory tools: {detail}")
+
+        try:
+            codex = subprocess.run(
+                ["codex", *codex_mcp_config_args(self.root, self.paths.db, harness), "mcp", "list"],
+                cwd=self.root,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return self._mcp_preflight_failed(conn, f"Codex MCP preflight failed: {exc}")
+        if codex.returncode != 0 or MCP_SERVER_NAME not in codex.stdout:
+            detail = (codex.stderr or codex.stdout or "no Codex MCP output").strip()
+            return self._mcp_preflight_failed(conn, f"Codex did not accept the harness MCP config: {detail}")
+        db.log_event(conn, "mcp", "Harness MCP tools exposed to Codex workers")
+        return True
+
+    def _mcp_preflight_failed(self, conn: sqlite3.Connection, message: str) -> bool:
+        db.set_meta(conn, "red_banner", "Harness MCP unavailable; refusing to start agents.")
+        db.log_event(conn, "mcp_failed", message)
+        print(f"\033[31m{message}\033[0m", file=sys.stderr)
+        return False
+
+    def harness_executable(self) -> Path:
+        """Resolve the harness executable agents should use for MCP stdio."""
+
+        candidates = [
+            Path(sys.argv[0]).resolve(),
+            self.root / "harness",
+            Path(__file__).resolve().parents[1] / "harness",
+        ]
+        for candidate in candidates:
+            if candidate.name == "harness" and candidate.exists():
+                return candidate
+        return self.root / "harness"
+
     def ensure_goal(self, conn: sqlite3.Connection, provided: str | None) -> None:
         """Capture the goal once and leave refinement to the Goal Planner agent."""
 
@@ -308,9 +385,9 @@ class HarnessScheduler:
                 ),
             )
         )
-        manhole_command = build_codex_command(manhole_prompt, self.root)
+        manhole_command = build_codex_command(manhole_prompt, self.root, self.root, self.paths.db, self.harness_executable())
         self.tmux.ensure_window(session, "manhole", manhole_command)
-        status_command = "watch -n 5 ./harness status"
+        status_command = "watch -c -n 5 ./harness status"
         self.tmux.ensure_window(session, "status", status_command)
         updater_command = "while true; do ./harness update-status; sleep 900; done"
         self.tmux.ensure_window(session, "updater", updater_command)
@@ -409,7 +486,7 @@ class HarnessScheduler:
         prompt_file = self.paths.prompts / f"{name}.md"
         prompt_file.write_text(prompt)
         window = name[:40]
-        command = build_codex_command(prompt_file, cwd)
+        command = build_codex_command(prompt_file, cwd, self.root, self.paths.db, self.harness_executable())
         try:
             pane = self.tmux.ensure_window(session, window, command)
         except Exception as exc:  # tmux can fail independently of the scheduler.
