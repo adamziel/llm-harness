@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="harness", description="Deterministic Codex agent harness")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--root", default=os.getcwd(), help=argparse.SUPPRESS)
-    sub = parser.add_subparsers(dest="command", required=True, metavar="{init,run,status,stop,poke,doctor,logs,lanes,agents}")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="{init,run,status,stop,reset-counters,poke,doctor,logs,lanes,agents}")
 
     init = sub.add_parser("init", help="Initialize or repair harness state")
     init.add_argument("--goal", help="Goal to record during initialization")
@@ -38,6 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     status.add_argument("--refresh", action="store_true", help=argparse.SUPPRESS)
 
     sub.add_parser("stop", help="Stop harness agents and runtime windows")
+    sub.add_parser("reset-counters", help="Clear stale harness counters after an upgrade")
 
     poke = sub.add_parser("poke", help="Inject a prompt into running agents")
     poke.add_argument("message")
@@ -83,6 +84,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "stop":
         result = HarnessScheduler(root).stop()
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "reset-counters":
+        result = HarnessScheduler(root).reset_counters()
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "poke":

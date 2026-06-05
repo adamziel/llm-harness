@@ -343,6 +343,74 @@ class HarnessScheduler:
             "scheduler_processes": signaled,
         }
 
+    def reset_counters(self) -> dict[str, int]:
+        """Clear stale harness telemetry after upgrading control-plane fixes."""
+
+        with db.connect(self.paths.db) as conn:
+            db.init_db(conn)
+            terminal_statuses = db.AGENT_TERMINAL_STATUSES
+            status_placeholders = ",".join("?" for _ in terminal_statuses)
+            terminal_agents = conn.execute(
+                f"SELECT COUNT(*) AS count FROM agents WHERE current_status IN ({status_placeholders})",
+                terminal_statuses,
+            ).fetchone()["count"]
+            conn.execute(f"DELETE FROM agents WHERE current_status IN ({status_placeholders})", terminal_statuses)
+
+            test_results = conn.execute("DELETE FROM test_results").rowcount
+            test_runs = conn.execute("DELETE FROM test_runs").rowcount
+            bug_reports = conn.execute("DELETE FROM bug_reports WHERE status = 'open'").rowcount
+            issues = conn.execute("DELETE FROM issues WHERE source = 'test-loop' AND status = 'open'").rowcount
+
+            now = db.utc_now()
+            integration_lanes = conn.execute(
+                """
+                UPDATE worklanes
+                SET status = 'ready_for_integration',
+                    integration_queue = 'ready_fast_path',
+                    last_activity_at = ?,
+                    notes = trim(notes || char(10) || 'Reset from integration_failed after harness upgrade; retry integration.')
+                WHERE status = 'integration_failed'
+                """,
+                (now,),
+            ).rowcount
+            spawn_requests = conn.execute("UPDATE spawn_requests SET status = 'cancelled' WHERE status = 'queued'").rowcount
+            messages = conn.execute("UPDATE messages SET status = 'cancelled' WHERE status = 'queued'").rowcount
+            for key in (
+                "red_banner",
+                "integration_backpressure_active",
+                "integration_backlog_since",
+                "last_progress_stall_alert",
+                "low_resource_since",
+                "last_low_resource_prompt",
+                "high_resource_since",
+            ):
+                db.set_meta(conn, key, "")
+            db.log_event(
+                conn,
+                "reset_counters",
+                "Reset stale harness telemetry after upgrade",
+                payload={
+                    "terminal_agents": int(terminal_agents),
+                    "test_runs": int(test_runs),
+                    "test_results": int(test_results),
+                    "bug_reports": int(bug_reports),
+                    "issues": int(issues),
+                    "integration_lanes": int(integration_lanes),
+                    "spawn_requests": int(spawn_requests),
+                    "messages": int(messages),
+                },
+            )
+        return {
+            "terminal_agents": int(terminal_agents),
+            "test_runs": int(test_runs),
+            "test_results": int(test_results),
+            "bug_reports": int(bug_reports),
+            "issues": int(issues),
+            "integration_lanes": int(integration_lanes),
+            "spawn_requests": int(spawn_requests),
+            "messages": int(messages),
+        }
+
     def harness_sessions(self, conn: sqlite3.Connection, windows: set[str]) -> dict[str, set[str]]:
         """Find tmux sessions containing harness windows, even after metadata was cleared."""
 

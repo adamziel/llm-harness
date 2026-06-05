@@ -512,7 +512,7 @@ class HarnessTests(unittest.TestCase):
     def test_public_help_only_lists_requested_commands(self):
         root = Path(__file__).resolve().parents[1]
         completed = subprocess.run([sys.executable, str(root / "harness"), "--help"], text=True, capture_output=True, check=True)
-        self.assertIn("{init,run,status,stop,poke,doctor,logs,lanes,agents}", completed.stdout)
+        self.assertIn("{init,run,status,stop,reset-counters,poke,doctor,logs,lanes,agents}", completed.stdout)
         self.assertNotIn("test-loop", completed.stdout)
         self.assertNotIn("update-status", completed.stdout)
         self.assertNotIn("integrate", completed.stdout)
@@ -825,6 +825,48 @@ class HarnessTests(unittest.TestCase):
             scheduler.stop()
             self.assertIn(("session", "developer-1"), fake.killed_windows)
             self.assertIn(("session", "status"), fake.killed_windows)
+
+    def test_reset_counters_clears_upgrade_noise_without_stopping_active_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-live", role="Developer", current_status="running", cwd=tmp)
+                db.upsert_agent(conn, name="developer-crashed", role="Developer", current_status="crash", cwd=tmp)
+                db.upsert_agent(conn, name="developer-stopped", role="Developer", current_status="stopped", cwd=tmp)
+                run_id = db.record_test_run(
+                    conn,
+                    command="python -m unittest",
+                    status="failed",
+                    full_log="failed",
+                    results=[{"nodeid": "tests/test_x.py::test_a", "file": "tests/test_x.py", "status": "failed"}],
+                )
+                db.note_failing_tests(conn, run_id, "bad")
+                lane_id = db.queue_worklane(conn, "Retry integration", status="integration_failed")
+                db.queue_spawn_request(conn, role="Architect", title="old", prompt="old")
+                db.queue_message(conn, "old")
+                db.set_meta(conn, "red_banner", "PROGRESS STALLED")
+                conn.commit()
+            result = scheduler.reset_counters()
+            with db.connect(paths.db) as conn:
+                agents = list(conn.execute("SELECT name, current_status FROM agents ORDER BY name"))
+                lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+                counts = {
+                    "test_runs": conn.execute("SELECT COUNT(*) AS count FROM test_runs").fetchone()["count"],
+                    "test_results": conn.execute("SELECT COUNT(*) AS count FROM test_results").fetchone()["count"],
+                    "bug_reports": conn.execute("SELECT COUNT(*) AS count FROM bug_reports WHERE status = 'open'").fetchone()["count"],
+                    "issues": conn.execute("SELECT COUNT(*) AS count FROM issues WHERE source = 'test-loop' AND status = 'open'").fetchone()["count"],
+                    "spawn_requests": conn.execute("SELECT COUNT(*) AS count FROM spawn_requests WHERE status = 'queued'").fetchone()["count"],
+                    "messages": conn.execute("SELECT COUNT(*) AS count FROM messages WHERE status = 'queued'").fetchone()["count"],
+                }
+                banner = db.get_meta(conn, "red_banner")
+            self.assertEqual(result["terminal_agents"], 2)
+            self.assertEqual([(row["name"], row["current_status"]) for row in agents], [("developer-live", "running")])
+            self.assertEqual(lane["status"], "ready_for_integration")
+            self.assertEqual(lane["integration_queue"], "ready_fast_path")
+            self.assertEqual(counts, {"test_runs": 0, "test_results": 0, "bug_reports": 0, "issues": 0, "spawn_requests": 0, "messages": 0})
+            self.assertEqual(banner, "")
 
     def test_stopped_harness_ignores_agent_status_updates(self):
         with tempfile.TemporaryDirectory() as tmp:
