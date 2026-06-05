@@ -276,6 +276,30 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(stale["current_status"], "crash")
             self.assertEqual(fake.sent, [("%live", "check this")])
 
+    def test_architect_spawn_requests_reuse_one_running_architect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                for index in range(1, 4):
+                    db.queue_spawn_request(
+                        conn,
+                        role="Architect",
+                        title=f"Investigate systemic issue {index}",
+                        prompt=f"Find root cause {index}",
+                        requester="test",
+                    )
+                scheduler.handle_spawn_requests(conn)
+                architects = list(conn.execute("SELECT * FROM agents WHERE role = 'Architect' AND current_status = 'running'"))
+                requests = list(conn.execute("SELECT * FROM spawn_requests ORDER BY id"))
+            architect_windows = [window for _, window, _ in fake.commands if window.startswith("architect-")]
+            self.assertEqual(architect_windows, ["architect-1"])
+            self.assertEqual(len(architects), 1)
+            self.assertEqual([request["agent_name"] for request in requests], ["architect-1", "architect-1", "architect-1"])
+            self.assertEqual(len(fake.sent), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

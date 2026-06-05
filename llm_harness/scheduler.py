@@ -23,6 +23,7 @@ from .tmux import Tmux, TmuxUnavailable, shell_command
 IDLE_SECONDS = 30 * 60
 IDLE_PROMPT_SECONDS = 30 * 60
 AUDITOR_SPAWN_SECONDS = 60
+SINGLETON_SPAWN_ROLES = {"Architect"}
 JANITOR_SECONDS = 60 * 60
 LOW_RESOURCE_SECONDS = 60
 HIGH_RESOURCE_SECONDS = 30
@@ -197,8 +198,39 @@ class HarnessScheduler:
         """Accept MCP spawn requests by starting agents through scheduler-owned code."""
 
         for request in db.next_spawn_requests(conn):
+            existing = ""
+            if request["role"] in SINGLETON_SPAWN_ROLES:
+                existing = self.prompt_running_role(
+                    conn,
+                    request["role"],
+                    f"Additional assigned work: {request['title']}\n\n{request['prompt']}",
+                )
+            if existing:
+                db.mark_spawn_request(conn, request["id"], "started", existing)
+                db.log_event(conn, "spawn_coalesced", f"Reused {existing} for {request['role']}: {request['title']}", agent_name=existing)
+                continue
             name = self.spawn_agent(conn, request["role"], request["title"], extra=request["prompt"])
             db.mark_spawn_request(conn, request["id"], "started" if name else "failed", name or "")
+
+    def prompt_running_role(self, conn: sqlite3.Connection, role: str, message: str) -> str:
+        """Deliver work to one reachable running agent for singleton specialist roles."""
+
+        agents = list(conn.execute("SELECT * FROM agents WHERE role = ? AND current_status = 'running' ORDER BY id", (role,)))
+        for agent in agents:
+            target = _tmux_target(agent)
+            if not target:
+                continue
+            if hasattr(self.tmux, "target_exists") and not self.tmux.target_exists(target):
+                db.update_agent_status(conn, agent["name"], "crash", "tmux pane no longer exists", ended=True)
+                db.log_event(conn, "agent_missing", f"{agent['name']} tmux pane no longer exists", agent_name=agent["name"])
+                continue
+            try:
+                self.tmux.send_prompt(target, message)
+                return str(agent["name"])
+            except Exception:
+                db.update_agent_status(conn, agent["name"], "crash", "tmux prompt failed", ended=True)
+                db.log_event(conn, "agent_missing", f"{agent['name']} tmux prompt failed", agent_name=agent["name"])
+        return ""
 
     def spawn_agent(self, conn: sqlite3.Connection, role: str, title: str, extra: str = "") -> str:
         """Create a Codex tmux window and agent row, using worktrees for developers."""
