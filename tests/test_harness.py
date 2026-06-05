@@ -27,12 +27,14 @@ class FakeTmux:
         self.sent = []
         self.killed_windows = []
         self.killed_sessions = []
+        self.windows = {}
 
     def current_or_create_session(self, root):
         return "fake-session"
 
     def ensure_window(self, session, window, command):
         self.commands.append((session, window, command))
+        self.windows.setdefault(session, {})[window] = ""
         return TmuxPane(session, window, f"%{window}")
 
     def switch_to(self, session, window):
@@ -51,10 +53,10 @@ class FakeTmux:
         return ""
 
     def list_sessions(self):
-        return []
+        return list(self.windows)
 
     def list_windows(self, session):
-        return {}
+        return self.windows.get(session, {})
 
     def kill_window(self, session, window):
         self.killed_windows.append((session, window))
@@ -289,6 +291,7 @@ class HarnessTests(unittest.TestCase):
             root = Path(tmp)
             paths = db.bootstrap(root)
             fake = FakeTmux()
+            fake.windows["session"] = {"developer-1": str(root), "manhole": str(root)}
             scheduler = HarnessScheduler(root, tmux=fake)
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
@@ -312,10 +315,12 @@ class HarnessTests(unittest.TestCase):
             self.assertIn(("session", "developer-1"), fake.killed_windows)
             self.assertIn(("session", "manhole"), fake.killed_windows)
             self.assertEqual(result["agents"], 1)
+            self.assertEqual(result["tmux_sessions"], 0)
             self.assertNotIn("tmp_entries", result)
             self.assertNotIn("prompt_files", result)
             self.assertTrue((paths.tmp / "keep.tmp").exists())
             self.assertTrue((paths.prompts / "keep.md").exists())
+            self.assertFalse((root / "STATUS.md").exists())
 
     def test_stop_kills_harness_created_session(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -326,8 +331,9 @@ class HarnessTests(unittest.TestCase):
                 db.init_db(conn)
                 db.set_meta(conn, "tmux_session", "llm-harness-repo")
                 conn.commit()
-            scheduler.stop()
+            result = scheduler.stop()
             self.assertEqual(fake.killed_sessions, ["llm-harness-repo"])
+            self.assertEqual(result["tmux_sessions"], 1)
 
     def test_stop_discovers_current_tmux_session_without_metadata(self):
         class CurrentSessionTmux(FakeTmux):
@@ -337,6 +343,7 @@ class HarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
             fake = CurrentSessionTmux()
+            fake.windows["session"] = {"developer-1": tmp, "status": tmp}
             scheduler = HarnessScheduler(tmp, tmux=fake)
             with db.connect(paths.db) as conn:
                 db.init_db(conn)

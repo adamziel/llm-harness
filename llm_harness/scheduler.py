@@ -18,7 +18,7 @@ from .janitor import run_janitor
 from .resources import sample_resources
 from .roles import prompt_for_role, slug_role, specs_for_team
 from .status import refresh_reports
-from .tmux import Tmux, TmuxUnavailable, shell_command
+from .tmux import Tmux, TmuxUnavailable, _session_name, shell_command
 
 IDLE_SECONDS = 30 * 60
 IDLE_PROMPT_SECONDS = 30 * 60
@@ -81,21 +81,23 @@ class HarnessScheduler:
             db.init_db(conn)
             windows = self.harness_windows(conn)
             killed_windows = 0
+            killed_sessions = 0
             sessions = self.harness_sessions(conn, windows)
             for session, session_windows in sessions.items():
-                for window in sorted(windows):
-                    if window not in session_windows:
-                        continue
+                if session.startswith("llm-harness-"):
+                    try:
+                        if self.tmux.kill_session(session):
+                            killed_sessions += 1
+                            killed_windows += len(session_windows)
+                    except Exception:
+                        pass
+                    continue
+                for window in sorted(session_windows):
                     try:
                         if self.tmux.kill_window(session, window):
                             killed_windows += 1
                     except Exception:
                         continue
-                if session.startswith("llm-harness-"):
-                    try:
-                        self.tmux.kill_session(session)
-                    except Exception:
-                        pass
             terminal_statuses = db.AGENT_TERMINAL_STATUSES
             status_placeholders = ",".join("?" for _ in terminal_statuses)
             stopped_agents = conn.execute(
@@ -124,15 +126,16 @@ class HarnessScheduler:
                 "Stopped harness runtime",
                 payload={
                     "tmux_windows": killed_windows,
+                    "tmux_sessions": killed_sessions,
                     "agents": int(stopped_agents),
                     "spawn_requests": int(cancelled_spawns),
                     "messages": int(cancelled_messages),
                     "scheduler_processes": signaled,
                 },
             )
-            refresh_reports(conn, self.root)
         return {
             "tmux_windows": killed_windows,
+            "tmux_sessions": killed_sessions,
             "agents": int(stopped_agents),
             "spawn_requests": int(cancelled_spawns),
             "messages": int(cancelled_messages),
@@ -142,24 +145,28 @@ class HarnessScheduler:
     def harness_sessions(self, conn: sqlite3.Connection, windows: set[str]) -> dict[str, set[str]]:
         """Find tmux sessions containing harness windows, even after metadata was cleared."""
 
-        sessions: dict[str, set[str]] = {}
-        recorded = db.get_meta(conn, "tmux_session", "")
-        if recorded:
-            sessions[recorded] = set(windows)
-        current = self.tmux.current_session() if hasattr(self.tmux, "current_session") else ""
-        if current:
-            sessions.setdefault(current, set(windows))
+        candidates = {db.get_meta(conn, "tmux_session", "")}
+        if hasattr(self.tmux, "current_session"):
+            candidates.add(self.tmux.current_session())
+        candidates.discard("")
         if not hasattr(self.tmux, "list_sessions") or not hasattr(self.tmux, "list_windows"):
-            return sessions
-        for session in self.tmux.list_sessions():
+            return {session: set(windows) for session in candidates}
+
+        expected_harness_session = _session_name(self.root)
+        session_names = set(candidates)
+        session_names.update(self.tmux.list_sessions())
+        sessions: dict[str, set[str]] = {}
+        for session in session_names:
             session_windows = self.tmux.list_windows(session)
             matched = {
                 window
                 for window, cwd in session_windows.items()
                 if window in windows and _path_belongs_to_root(cwd, self.root)
             }
-            if matched:
-                sessions.setdefault(session, set()).update(matched)
+            if session == expected_harness_session or (session.startswith("llm-harness-") and session in candidates):
+                sessions[session] = set(session_windows)
+            elif matched:
+                sessions[session] = matched
         return sessions
 
     def harness_windows(self, conn: sqlite3.Connection) -> set[str]:
