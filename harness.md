@@ -351,6 +351,8 @@ The Integrator should not block Developers from continuing work.
 
 The Manhole is a tmux window with a Codex session that has access to the state of the harness and can be used by the user to course-correct any part of the system.
 
+The Manhole defaults to supervisor/read-only mode. It should inspect and explain state unless the user explicitly authorizes a concrete action in that manhole session.
+
 It can:
 
 * inspect agents,
@@ -362,6 +364,8 @@ It can:
 * request more or fewer sessions,
 * invoke specialist roles,
 * instruct the Coordinator.
+
+It must not independently act as the Coordinator, create lanes, spawn agents, push branches, merge branches, or edit source files just because it sees work to do.
 
 Instructions from Manhole to Coordinator must be applied unconditionally unless unsafe or impossible.
 
@@ -739,6 +743,7 @@ If any test flips from passing to failing to passing repeatedly more than 3 time
 ## Status reporting
 
 A deterministic Status Renderer updates `STATUS.md` and `STATUS.html` every 15 minutes and on startup.
+Every time the status is updated, it must be committed and pushed to the main branch of the remote repo.
 
 The first run creates:
 
@@ -792,6 +797,8 @@ If CPU or RAM usage stays around 95%+ and the machine is slowed for more than 30
 If recent agents die after only a few seconds without producing useful results, assume possible resource exhaustion. Run Janitor. If that does not help, notify Coordinator and reduce concurrency.
 
 Do not scale Developer count based only on unused CPU/RAM. Integration health and test health are stronger signals.
+
+Do not spawn replacement Developers when no queued Developer or Designer worklane exists. An idle CPU is better than a no-op worker that opens a branch, finds no lane, and exits.
 
 ## Watchdog
 

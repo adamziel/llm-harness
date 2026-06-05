@@ -142,6 +142,31 @@ class HarnessTests(unittest.TestCase):
                 self.assertIn("Agents: 1 active, 1 crashed, 3 tracked", text)
                 self.assertIn("status is alive", text)
 
+    def test_status_update_commits_and_pushes_status_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "--allow-empty", "-m", "Initial"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "init", "--bare", remote], check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", remote], cwd=root, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "main"], cwd=root, check=True, capture_output=True)
+            paths = db.bootstrap(root)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_goal(conn, "Publish status", measure="status committed")
+                db.record_metric(conn, "status", 1, 1)
+                refresh_reports(conn, root)
+
+            last_subject = subprocess.check_output(["git", "log", "-1", "--pretty=%s"], cwd=root, text=True).strip()
+            self.assertEqual(last_subject, "Update harness status")
+            remote_status = subprocess.check_output(["git", f"--git-dir={remote}", "show", "main:STATUS.md"], text=True)
+            self.assertIn("Publish status", remote_status)
+            staged = subprocess.check_output(["git", "diff", "--cached", "--name-only"], cwd=root, text=True).strip()
+            self.assertEqual(staged, "")
+
     def test_mcp_tools_record_query_spawn_and_search(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -421,9 +446,10 @@ class HarnessTests(unittest.TestCase):
             codex_commands = [command for _, window, command in fake.commands if window not in {"manhole", "status", "updater", "tests"} and not window.startswith("switch:")]
             self.assertTrue(codex_commands)
             self.assertTrue(all("--yolo" in command and f"--model {CODEX_MODEL}" in command and f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"' in command for command in codex_commands))
+            self.assertIn("Default to supervisor/read-only mode", (root / ".harness" / "prompts" / "manhole.md").read_text())
             with db.connect(root / ".harness" / "harness.sqlite3") as conn:
                 agents = db.list_agents(conn)
-                self.assertGreaterEqual(len(agents), 3)
+                self.assertGreaterEqual(len(agents), 2)
                 self.assertEqual(db.get_meta(conn, "red_banner"), "")
 
     def test_team_capacity_counts_live_non_terminal_developers(self):
@@ -458,12 +484,62 @@ class HarnessTests(unittest.TestCase):
                 db.upsert_agent(conn, name="developer-1", role="Developer", current_status="working", tmux_pane="%live", cwd=tmp)
                 db.upsert_agent(conn, name="developer-2", role="Developer", current_status="success", tmux_pane="%done", cwd=tmp)
                 db.upsert_agent(conn, name="developer-3", role="Developer", current_status="working", tmux_pane="%missing", cwd=tmp)
+                for index in range(3):
+                    db.queue_worklane(conn, f"Queued lane {index}")
                 with mock.patch("llm_harness.roles.os.cpu_count", return_value=4):
                     scheduler.ensure_team(conn, "building")
                 missing = conn.execute("SELECT current_status FROM agents WHERE name = 'developer-3'").fetchone()["current_status"]
             spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
             self.assertEqual(spawned_developers, ["developer-4", "developer-5", "developer-6"])
             self.assertEqual(missing, "crash")
+
+    def test_team_capacity_does_not_spawn_developers_without_queued_lanes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="coordinator-1", role="Coordinator", current_status="running", tmux_pane="%coordinator", cwd=tmp)
+                db.upsert_agent(conn, name="integrator-1", role="Integrator", current_status="running", tmux_pane="%integrator", cwd=tmp)
+                scheduler.ensure_team(conn, "building")
+            spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
+            self.assertEqual(spawned_developers, [])
+
+    def test_developer_spawn_requests_are_rejected_without_queued_lanes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                request_id = db.queue_spawn_request(conn, role="Developer", title="extra", prompt="do work")
+                scheduler.handle_spawn_requests(conn, "building")
+                request = conn.execute("SELECT * FROM spawn_requests WHERE id = ?", (request_id,)).fetchone()
+                event = conn.execute("SELECT * FROM events WHERE type = 'spawn_rejected' ORDER BY id DESC LIMIT 1").fetchone()
+            spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
+            self.assertEqual(spawned_developers, [])
+            self.assertEqual(request["status"], "rejected")
+            self.assertIn("no queued Developer worklane", event["message"])
+
+    def test_developer_spawn_requests_respect_team_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                for index in range(1, 5):
+                    db.upsert_agent(conn, name=f"developer-{index}", role="Developer", current_status="running", tmux_pane=f"%developer-{index}", cwd=tmp)
+                db.queue_worklane(conn, "Queued lane")
+                request_id = db.queue_spawn_request(conn, role="Developer", title="extra", prompt="do work")
+                scheduler.handle_spawn_requests(conn, "building")
+                request = conn.execute("SELECT * FROM spawn_requests WHERE id = ?", (request_id,)).fetchone()
+                event = conn.execute("SELECT * FROM events WHERE type = 'spawn_rejected' ORDER BY id DESC LIMIT 1").fetchone()
+            spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
+            self.assertEqual(spawned_developers, [])
+            self.assertEqual(request["status"], "rejected")
+            self.assertIn("capacity is already full", event["message"])
 
     def test_integration_backpressure_prevents_developer_scaleup(self):
         old = str(__import__("time").time() - 21 * 60)

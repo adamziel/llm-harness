@@ -44,10 +44,12 @@ directly.
 `init` records the goal in `.harness/harness.sqlite3`, initializes Git if needed,
 creates `DEVELOPMENT.md`, `PLAN.md`, status templates, role prompt files, and
 validates the harness MCP. `run` then starts a small resident control plane:
-Coordinator, Developer pool, Integrator, and Manhole/support windows. Conceptual
+Coordinator, Integrator, queued Developer capacity, and Manhole/support windows. Conceptual
 roles such as Architect, Conflict Resolver, Lane Scout, and Goal Planner are
 capabilities invoked as short-lived jobs rather than standing sessions. All
 Codex worker commands are generated with `--yolo` and `--model gpt-5.5 -c model_reasoning_effort="xhigh"`.
+The Manhole starts in supervisor/read-only mode and should only take concrete
+actions when the user explicitly authorizes them.
 
 ## Persistent state
 
@@ -64,6 +66,9 @@ The MCP server exposes that state through deterministic tools documented in
 `./harness status` prints a compact TUI dashboard with Unicode borders and ANSI
 colors. The updater writes `STATUS.md` and `STATUS.html` from templates created
 on first run at `.harness/STATUS_TEMPLATE.md` and `.harness/STATUS_TEMPLATE.html`.
+Each deterministic status update stages only the status artifacts, commits them,
+and pushes that commit to the repository's `origin` mainline branch when a safe
+remote is configured.
 
 ## Watchdog
 

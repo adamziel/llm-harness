@@ -5,10 +5,12 @@ from __future__ import annotations
 import html
 import json
 import sqlite3
+import subprocess
+import time
 from pathlib import Path
 from textwrap import shorten
 
-from .db import is_active_agent_status, latest_metric, recent_events, utc_now
+from .db import is_active_agent_status, latest_metric, log_event, recent_events, set_meta, utc_now
 
 ANSI = {
     "reset": "\033[0m",
@@ -18,6 +20,17 @@ ANSI = {
     "blue": "\033[34m",
     "bold": "\033[1m",
 }
+
+STATUS_REFRESH_SECONDS = 15 * 60
+STATUS_PUBLISH_PATHS = (
+    "STATUS.md",
+    "STATUS.html",
+    "progress.md",
+    "progress.html",
+    ".harness/STATUS_TEMPLATE.md",
+    ".harness/STATUS_TEMPLATE.html",
+)
+MAINLINE_BRANCH_FALLBACKS = ("main", "master", "trunk")
 
 MD_TEMPLATE = """# Harness Status
 
@@ -116,8 +129,79 @@ def refresh_reports(conn: sqlite3.Connection, root: str | Path) -> tuple[Path, P
     (root_path / "progress.md").write_text(md)
     (root_path / "progress.html").write_text(html_text)
     conn.execute("INSERT INTO status_snapshots(created_at, summary_json) VALUES (?, ?)", (generated, json.dumps(data, sort_keys=True)))
+    set_meta(conn, "last_status_refresh_epoch", str(time.time()))
     conn.commit()
+    commit_and_push_status(conn, root_path)
     return status_md, status_html
+
+
+def commit_and_push_status(conn: sqlite3.Connection, root: str | Path) -> bool:
+    """Commit and push status artifacts without staging unrelated user work."""
+
+    root_path = Path(root)
+    if not _git_ok(root_path, ["rev-parse", "--is-inside-work-tree"]):
+        return False
+    branch = _git_stdout(root_path, ["branch", "--show-current"])
+    mainline = _mainline_branch(root_path)
+    if not branch or branch != mainline:
+        log_event(
+            conn,
+            "status_publish_skipped",
+            "Status files were updated but not pushed because this is not the mainline worktree branch",
+            payload={"branch": branch, "mainline_branch": mainline},
+        )
+        return False
+    if not _git_ok(root_path, ["remote", "get-url", "origin"]):
+        log_event(conn, "status_publish_skipped", "Status files were updated but no origin remote is configured")
+        return False
+    staged_before = _git_stdout(root_path, ["diff", "--cached", "--name-only", "--"])
+    if staged_before.strip():
+        log_event(conn, "status_publish_skipped", "Status files were updated but existing staged changes would make an automatic commit unsafe")
+        return False
+
+    existing = [path for path in STATUS_PUBLISH_PATHS if (root_path / path).exists()]
+    if not existing:
+        return False
+    add = subprocess.run(["git", "add", "--", *existing], cwd=root_path, text=True, capture_output=True, check=False, timeout=20)
+    if add.returncode != 0:
+        log_event(conn, "status_publish_failed", f"Failed to stage status files: {(add.stderr or add.stdout).strip()}")
+        return False
+    changed = _git_stdout(root_path, ["diff", "--cached", "--name-only", "--", *existing])
+    if not changed.strip():
+        return False
+    commit = subprocess.run(["git", "commit", "-m", "Update harness status"], cwd=root_path, text=True, capture_output=True, check=False, timeout=20)
+    if commit.returncode != 0:
+        subprocess.run(["git", "restore", "--staged", "--", *existing], cwd=root_path, text=True, capture_output=True, check=False, timeout=20)
+        log_event(conn, "status_publish_failed", f"Failed to commit status files: {(commit.stderr or commit.stdout).strip()}")
+        return False
+    push = subprocess.run(["git", "push", "origin", f"HEAD:{mainline}"], cwd=root_path, text=True, capture_output=True, check=False, timeout=30)
+    if push.returncode != 0:
+        log_event(conn, "status_publish_failed", f"Committed status files but failed to push: {(push.stderr or push.stdout).strip()}", payload={"branch": branch, "mainline_branch": mainline})
+        return False
+    log_event(conn, "status_published", f"Committed and pushed status update to origin/{mainline}", payload={"branch": branch, "mainline_branch": mainline})
+    return True
+
+
+def _git_stdout(root: Path, args: list[str]) -> str:
+    result = subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, check=False, timeout=20)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _git_ok(root: Path, args: list[str]) -> bool:
+    return subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, check=False, timeout=20).returncode == 0
+
+
+def _mainline_branch(root: Path) -> str:
+    origin_head = _git_stdout(root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+    if origin_head.startswith("origin/"):
+        return origin_head.removeprefix("origin/")
+    branch = _git_stdout(root, ["branch", "--show-current"])
+    if branch in MAINLINE_BRANCH_FALLBACKS:
+        return branch
+    for candidate in MAINLINE_BRANCH_FALLBACKS:
+        if _git_ok(root, ["show-ref", "--verify", f"refs/heads/{candidate}"]):
+            return candidate
+    return ""
 
 
 def collect_status(conn: sqlite3.Connection) -> dict[str, object]:

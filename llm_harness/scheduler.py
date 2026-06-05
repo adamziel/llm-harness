@@ -18,7 +18,7 @@ from .indexer import refresh_index
 from .janitor import run_janitor
 from .resources import sample_resources
 from .roles import prompt_for_role, slug_role, specs_for_team
-from .status import ensure_templates, refresh_reports
+from .status import STATUS_REFRESH_SECONDS, ensure_templates, refresh_reports
 from .tmux import Tmux, TmuxUnavailable, _session_name, shell_command
 
 IDLE_SECONDS = 30 * 60
@@ -144,7 +144,8 @@ class HarnessScheduler:
             while True:
                 def tick(conn: sqlite3.Connection) -> None:
                     self.tick_once(conn, self.effective_team(conn, team))
-                    refresh_reports(conn, self.root)
+                    if self.status_refresh_due(conn):
+                        refresh_reports(conn, self.root)
 
                 self.with_retrying_db("scheduler tick", tick)
                 time.sleep(5)
@@ -172,6 +173,12 @@ class HarnessScheduler:
                 print(f"\033[33mSQLite database is locked during {label}; waiting and retrying.\033[0m", file=sys.stderr)
                 time.sleep(2)
 
+    def status_refresh_due(self, conn: sqlite3.Connection) -> bool:
+        """Throttle deterministic status publishing to the renderer interval."""
+
+        last = float(db.get_meta(conn, "last_status_refresh_epoch", "0") or 0)
+        return time.time() - last >= STATUS_REFRESH_SECONDS
+
     def validate_initialized(self, conn: sqlite3.Connection) -> bool:
         """Require explicit initialization before resident sessions are started."""
 
@@ -190,7 +197,7 @@ class HarnessScheduler:
         roles_dir.mkdir(parents=True, exist_ok=True)
         goal = db.get_goal(conn)
         goal_text = goal["text"] if goal else ""
-        for role in ("Coordinator", "Developer", "Integrator", "Auditor", "Goal Planner", "Architect"):
+        for role in ("Manhole", "Coordinator", "Developer", "Integrator", "Auditor", "Goal Planner", "Architect"):
             prompt = prompt_for_role(role, slug_role(role), goal_text, str(self.paths.db), str(self.root))
             path = roles_dir / f"{slug_role(role)}.md"
             if not path.exists():
@@ -395,7 +402,7 @@ class HarnessScheduler:
         sample = sample_resources(self.root)
         db.record_resource_sample(conn, sample)
         self.handle_resource_pressure(conn, sample)
-        self.handle_spawn_requests(conn)
+        self.handle_spawn_requests(conn, team)
         self.ensure_team(conn, team)
         self.check_agent_liveness(conn)
         self.check_progress_stall(conn)
@@ -544,15 +551,14 @@ class HarnessScheduler:
         manhole_prompt = self.paths.prompts / "manhole.md"
         manhole_prompt.write_text(
             prompt_for_role(
-                "Coordinator",
+                "Manhole",
                 "manhole",
                 (db.get_goal(conn) or {"text": ""})["text"],
                 str(self.paths.db),
                 str(self.root),
                 extra=(
-                    "You are the user's manhole session. You may inspect tmux panes, "
-                    "route corrections through ./harness poke, request agents through MCP, "
-                    "and help the user course-correct any part of the harness."
+                    "The user may ask you to inspect tmux panes or harness memory. "
+                    "Stay read-only until the user explicitly authorizes a concrete action."
                 ),
             )
         )
@@ -575,9 +581,36 @@ class HarnessScheduler:
             target = spec.min_count
             if spec.name == "Developer" and self.integration_backpressure(conn):
                 target = min(target, max(1, active))
+            if spec.name == "Developer":
+                queued = self.queued_developer_worklanes(conn)
+                target = min(target, active + queued) if queued else active
             missing = max(0, target - active)
             for _ in range(missing):
                 self.spawn_agent(conn, spec.name, title=f"Maintain {spec.name} capacity")
+
+    def queued_developer_worklanes(self, conn: sqlite3.Connection) -> int:
+        """Count unassigned implementation lanes; capacity should not create no-op workers."""
+
+        return int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM worklanes
+                WHERE status = 'queued' AND role_type IN ('Developer', 'Designer')
+                """
+            ).fetchone()["count"]
+        )
+
+    def developer_spawn_blocker(self, conn: sqlite3.Connection, team: str) -> str:
+        """Return why another Developer would be unstable, or an empty string if allowed."""
+
+        queued = self.queued_developer_worklanes(conn)
+        if queued <= 0:
+            return "no queued Developer worklane is available"
+        cap = next((spec.min_count for spec in specs_for_team(team) if spec.name == "Developer"), 0)
+        active = self.active_agent_count(conn, "Developer")
+        if cap and active >= cap:
+            return f"Developer capacity is already full ({active}/{cap})"
+        return ""
 
     def integration_backpressure(self, conn: sqlite3.Connection) -> bool:
         """Detect when integration queues are too full to justify more feature work."""
@@ -621,11 +654,17 @@ class HarnessScheduler:
             active += 1
         return active
 
-    def handle_spawn_requests(self, conn: sqlite3.Connection) -> None:
+    def handle_spawn_requests(self, conn: sqlite3.Connection, team: str = "building") -> None:
         """Accept MCP spawn requests by starting agents through scheduler-owned code."""
 
         for request in db.next_spawn_requests(conn):
             role = "Coordinator" if request["role"] == "Manager" else request["role"]
+            if role == "Developer":
+                reason = self.developer_spawn_blocker(conn, team)
+                if reason:
+                    db.mark_spawn_request(conn, request["id"], "rejected", "")
+                    db.log_event(conn, "spawn_rejected", f"Rejected Developer spawn request: {reason}", payload={"request_id": request["id"], "title": request["title"]})
+                    continue
             existing = ""
             if role in SINGLETON_SPAWN_ROLES or role == "Coordinator":
                 existing = self.prompt_running_role(
