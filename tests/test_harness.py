@@ -512,6 +512,60 @@ class HarnessTests(unittest.TestCase):
             for column in {"card_type", "stage", "review_required", "integration_required", "planned_at", "review_ready_at", "reviewed_at", "done_at", "source_key"}:
                 self.assertIn(column, columns)
 
+    def test_init_db_migrates_legacy_worklanes_before_card_indexes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.paths_for(tmp)
+            db.ensure_dirs(paths)
+            raw = sqlite3.connect(paths.db)
+            raw.executescript(
+                """
+                CREATE TABLE worklanes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    role_type TEXT NOT NULL DEFAULT 'Developer',
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    expected_metric_impact REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    last_activity_at TEXT,
+                    notes TEXT NOT NULL DEFAULT ''
+                );
+                INSERT INTO worklanes(title, status, created_at, last_activity_at)
+                VALUES ('legacy lane', 'queued', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+
+                CREATE TABLE agent_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    agent_name TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    report_json TEXT NOT NULL
+                );
+
+                CREATE TABLE spawn_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    requester TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    agent_name TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+            raw.close()
+
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                lane = conn.execute("SELECT stage, source_key FROM worklanes WHERE title = 'legacy lane'").fetchone()
+                conn.execute("INSERT INTO work_lanes(title, role, status) VALUES ('compat lane', 'Developer', 'queued')")
+                compat = conn.execute("SELECT stage FROM worklanes WHERE title = 'compat lane'").fetchone()
+
+            self.assertEqual((lane["stage"], lane["source_key"]), ("planned", ""))
+            self.assertEqual(compat["stage"], "planned")
+
     def test_work_lanes_compat_view_creation_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)

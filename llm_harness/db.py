@@ -458,17 +458,11 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
         CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(current_status);
         CREATE INDEX IF NOT EXISTS idx_worklanes_status ON worklanes(status);
-        CREATE INDEX IF NOT EXISTS idx_worklanes_stage ON worklanes(stage, priority, id);
-        CREATE INDEX IF NOT EXISTS idx_worklanes_source_key ON worklanes(source_key, stage, status);
-        CREATE INDEX IF NOT EXISTS idx_worklanes_queue ON worklanes(integration_queue, status, priority);
         CREATE INDEX IF NOT EXISTS idx_messages_target_status ON messages(target, status);
         CREATE INDEX IF NOT EXISTS idx_agent_messages_target_status ON agent_messages(target, status);
-        CREATE INDEX IF NOT EXISTS idx_agent_reports_card ON agent_reports(card_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_agent_reports_worklane ON agent_reports(worklane_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_worktrees_owner ON worktrees(owner_agent, status);
         CREATE INDEX IF NOT EXISTS idx_integration_attempts_lane ON integration_attempts(worklane_id, status);
         CREATE INDEX IF NOT EXISTS idx_spawn_requests_status ON spawn_requests(status);
-        CREATE INDEX IF NOT EXISTS idx_spawn_requests_card ON spawn_requests(card_id, status);
         CREATE INDEX IF NOT EXISTS idx_card_stage_transitions_card ON card_stage_transitions(card_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_resource_samples_ts ON resource_samples(ts DESC);
         CREATE INDEX IF NOT EXISTS idx_metric_samples_ts ON metric_samples(ts DESC);
@@ -494,15 +488,30 @@ def ensure_card_schema(conn: sqlite3.Connection) -> None:
         conn,
         "worklanes",
         [
+            ("description", "TEXT NOT NULL DEFAULT ''"),
+            ("goal", "TEXT NOT NULL DEFAULT ''"),
+            ("acceptance_criteria", "TEXT NOT NULL DEFAULT ''"),
+            ("owner_agent_id", "INTEGER"),
             ("card_type", "TEXT NOT NULL DEFAULT 'implementation'"),
             ("stage", "TEXT NOT NULL DEFAULT 'planned'"),
             ("review_required", "INTEGER NOT NULL DEFAULT 1"),
             ("integration_required", "INTEGER NOT NULL DEFAULT 1"),
+            ("base_branch", "TEXT NOT NULL DEFAULT ''"),
+            ("branch_name", "TEXT NOT NULL DEFAULT ''"),
+            ("worktree_path", "TEXT NOT NULL DEFAULT ''"),
+            ("dependencies", "TEXT NOT NULL DEFAULT '[]'"),
+            ("conflict_risk", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("integration_queue", "TEXT NOT NULL DEFAULT ''"),
+            ("test_evidence", "TEXT NOT NULL DEFAULT '[]'"),
             ("source_key", "TEXT NOT NULL DEFAULT ''"),
             ("planned_at", "TEXT"),
+            ("assigned_at", "TEXT"),
             ("review_ready_at", "TEXT"),
             ("reviewed_at", "TEXT"),
+            ("ready_for_integration_at", "TEXT"),
+            ("integrated_at", "TEXT"),
             ("done_at", "TEXT"),
+            ("abandoned_at", "TEXT"),
         ],
     )
     _ensure_columns(
@@ -510,6 +519,7 @@ def ensure_card_schema(conn: sqlite3.Connection) -> None:
         "agent_reports",
         [
             ("card_id", "INTEGER"),
+            ("worklane_id", "INTEGER"),
             ("stage", "TEXT NOT NULL DEFAULT ''"),
         ],
     )
@@ -538,7 +548,9 @@ def ensure_card_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_worklanes_stage ON worklanes(stage, priority, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_worklanes_source_key ON worklanes(source_key, stage, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_worklanes_queue ON worklanes(integration_queue, status, priority)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_reports_card ON agent_reports(card_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_reports_worklane ON agent_reports(worklane_id, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_spawn_requests_card ON spawn_requests(card_id, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_card_stage_transitions_card ON card_stage_transitions(card_id, created_at)")
     now = utc_now()

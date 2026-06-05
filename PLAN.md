@@ -115,6 +115,12 @@ The refined spec now requires these behavior changes:
 - Deduplicate repeated failures.
 - Do not create a new card every time the same unresolved test fails.
 
+Follow-up: global full-suite failures should create or update one unresolved
+stabilization card for the current global integration failure. Lane-specific
+review failures may move the affected card back to development, but repeated
+main-branch test-loop failures must not fill the planned queue with one card per
+run.
+
 ### 8. Status and diagnostics
 
 - Update `./harness status` to show:
