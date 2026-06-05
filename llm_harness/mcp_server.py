@@ -126,6 +126,8 @@ class HarnessMCP:
                 rows = db.read_only_query(conn, str(args["sql"]), args.get("params") or [])
                 return _text(rows)
             if name == "memory_update_agent":
+                if db.get_meta(conn, "red_banner") == "Harness stopped.":
+                    return _text({"ok": False, "status": "harness_stopped"})
                 db.update_agent_status(conn, str(args["name"]), str(args["status"]), args.get("notes"), bool(args.get("ended", False)))
                 return _text({"ok": True})
             if name == "spawn_agent":

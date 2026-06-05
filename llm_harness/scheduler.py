@@ -79,11 +79,13 @@ class HarnessScheduler:
 
         with db.connect(self.paths.db) as conn:
             db.init_db(conn)
-            session = db.get_meta(conn, "tmux_session", "")
             windows = self.harness_windows(conn)
             killed_windows = 0
-            if session:
+            sessions = self.harness_sessions(conn, windows)
+            for session, session_windows in sessions.items():
                 for window in sorted(windows):
+                    if window not in session_windows:
+                        continue
                     try:
                         if self.tmux.kill_window(session, window):
                             killed_windows += 1
@@ -131,6 +133,29 @@ class HarnessScheduler:
             "messages": int(cancelled_messages),
             "scheduler_processes": signaled,
         }
+
+    def harness_sessions(self, conn: sqlite3.Connection, windows: set[str]) -> dict[str, set[str]]:
+        """Find tmux sessions containing harness windows, even after metadata was cleared."""
+
+        sessions: dict[str, set[str]] = {}
+        recorded = db.get_meta(conn, "tmux_session", "")
+        if recorded:
+            sessions[recorded] = set(windows)
+        current = self.tmux.current_session() if hasattr(self.tmux, "current_session") else ""
+        if current:
+            sessions.setdefault(current, set(windows))
+        if not hasattr(self.tmux, "list_sessions") or not hasattr(self.tmux, "list_windows"):
+            return sessions
+        for session in self.tmux.list_sessions():
+            session_windows = self.tmux.list_windows(session)
+            matched = {
+                window
+                for window, cwd in session_windows.items()
+                if window in windows and _path_belongs_to_root(cwd, self.root)
+            }
+            if matched:
+                sessions.setdefault(session, set()).update(matched)
+        return sessions
 
     def harness_windows(self, conn: sqlite3.Connection) -> set[str]:
         """Return tmux windows owned by this harness run."""
@@ -636,6 +661,18 @@ def _process_cwd(pid: int) -> Path | None:
         return Path(f"/proc/{pid}/cwd").resolve()
     except OSError:
         return None
+
+
+def _path_belongs_to_root(path: str, root: Path) -> bool:
+    """Return whether a tmux pane path is inside this harness repository."""
+
+    if not path:
+        return False
+    try:
+        Path(path).resolve().relative_to(root)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def watchdog_loop(root: str | Path, once: bool = False) -> int:

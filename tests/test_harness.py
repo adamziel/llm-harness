@@ -46,6 +46,15 @@ class FakeTmux:
     def send_prompt(self, target, message):
         self.sent.append((target, message))
 
+    def current_session(self):
+        return ""
+
+    def list_sessions(self):
+        return []
+
+    def list_windows(self, session):
+        return {}
+
     def kill_window(self, session, window):
         self.killed_windows.append((session, window))
         return True
@@ -260,6 +269,37 @@ class HarnessTests(unittest.TestCase):
                 conn.commit()
             scheduler.stop()
             self.assertEqual(fake.killed_sessions, ["llm-harness-repo"])
+
+    def test_stop_discovers_current_tmux_session_without_metadata(self):
+        class CurrentSessionTmux(FakeTmux):
+            def current_session(self):
+                return "session"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = CurrentSessionTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_window="developer-1", cwd=tmp)
+            scheduler.stop()
+            self.assertIn(("session", "developer-1"), fake.killed_windows)
+            self.assertIn(("session", "status"), fake.killed_windows)
+
+    def test_stopped_harness_ignores_agent_status_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="stopped", cwd=tmp)
+                db.set_meta(conn, "red_banner", "Harness stopped.")
+                conn.commit()
+            server = HarnessMCP(tmp, paths.db)
+            result = server.call_tool("memory_update_agent", {"name": "developer-1", "status": "running"})
+            self.assertIn("harness_stopped", result["content"][0]["text"])
+            with db.connect(paths.db) as conn:
+                agent = conn.execute("SELECT * FROM agents WHERE name = 'developer-1'").fetchone()
+            self.assertEqual(agent["current_status"], "stopped")
 
     def test_liveness_marks_missing_tmux_panes_crashed(self):
         class MissingTmux(FakeTmux):

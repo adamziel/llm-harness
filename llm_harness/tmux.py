@@ -53,6 +53,33 @@ class Tmux:
             self.run(["new-session", "-d", "-s", session, "-n", "harness", "bash", "-lc", "printf 'llm harness session ready\\n'; exec bash"])
         return session
 
+    def current_session(self) -> str:
+        """Return the current tmux session name, or empty when outside tmux."""
+
+        if not os.environ.get("TMUX"):
+            return ""
+        result = self.run(["display-message", "-p", "#S"], check=False)
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def list_sessions(self) -> list[str]:
+        """List known tmux sessions without creating one."""
+
+        result = self.run(["list-sessions", "-F", "#{session_name}"], check=False)
+        return result.stdout.splitlines() if result.returncode == 0 else []
+
+    def list_windows(self, session: str) -> dict[str, str]:
+        """Return window names and their current pane paths for one session."""
+
+        result = self.run(["list-windows", "-t", f"{session}:", "-F", "#{window_name}\t#{pane_current_path}"], check=False)
+        windows: dict[str, str] = {}
+        if result.returncode != 0:
+            return windows
+        for line in result.stdout.splitlines():
+            name, _, path = line.partition("\t")
+            if name:
+                windows[name] = path
+        return windows
+
     def ensure_window(self, session: str, window: str, command: str) -> TmuxPane:
         """Start a named tmux window unless it already exists."""
 
