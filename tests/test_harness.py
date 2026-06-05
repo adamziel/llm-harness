@@ -17,7 +17,7 @@ from llm_harness.codex import CODEX_MODEL, CODEX_REASONING_EFFORT, build_codex_c
 from llm_harness.integration import integrate_once
 from llm_harness.mcp_server import HarnessMCP, serve
 from llm_harness.roles import developer_count_for_building, specs_for_team
-from llm_harness.scheduler import AUDITOR_SPAWN_SECONDS, IDLE_PROMPT_SECONDS, IDLE_SECONDS, HarnessScheduler
+from llm_harness.scheduler import AUDITOR_SPAWN_SECONDS, IDLE_PROMPT_SECONDS, IDLE_SECONDS, HarnessScheduler, watchdog_loop
 from llm_harness.status import dashboard, refresh_reports
 from llm_harness.testing_loop import parse_test_output, run_tests_once
 from llm_harness.tmux import TmuxPane
@@ -629,6 +629,7 @@ class HarnessTests(unittest.TestCase):
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
                 db.set_meta(conn, "red_banner", "Harness stopped.")
+                db.set_meta(conn, "harness_stopped", "1")
                 db.set_meta(conn, "initialized_at", db.utc_now())
                 conn.commit()
             fake = FakeTmux()
@@ -651,6 +652,7 @@ class HarnessTests(unittest.TestCase):
                 agents = db.list_agents(conn)
                 self.assertGreaterEqual(len(agents), 2)
                 self.assertEqual(db.get_meta(conn, "red_banner"), "")
+                self.assertEqual(db.get_meta(conn, "harness_stopped"), "0")
 
     def test_team_capacity_counts_live_non_terminal_developers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -782,10 +784,12 @@ class HarnessTests(unittest.TestCase):
                 request = conn.execute("SELECT * FROM spawn_requests").fetchone()
                 message = conn.execute("SELECT * FROM messages").fetchone()
                 banner = db.get_meta(conn, "red_banner")
+                stopped = db.get_meta(conn, "harness_stopped")
             self.assertEqual(agent["current_status"], "stopped")
             self.assertEqual(request["status"], "cancelled")
             self.assertEqual(message["status"], "cancelled")
             self.assertEqual(banner, "Harness stopped.")
+            self.assertEqual(stopped, "1")
             self.assertIn(("session", "developer-1"), fake.killed_windows)
             self.assertIn(("session", "manhole"), fake.killed_windows)
             self.assertEqual(result["agents"], 1)
@@ -826,6 +830,29 @@ class HarnessTests(unittest.TestCase):
             self.assertIn(("session", "developer-1"), fake.killed_windows)
             self.assertIn(("session", "status"), fake.killed_windows)
 
+    def test_watchdog_does_not_restart_stopped_harness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "harness_stopped", "1")
+                conn.commit()
+            with mock.patch.object(HarnessScheduler, "run", side_effect=AssertionError("watchdog restarted stopped harness")):
+                self.assertEqual(watchdog_loop(tmp, once=True), 0)
+
+    def test_stopped_harness_flag_blocks_agent_status_updates_after_banner_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="stopped", cwd=tmp)
+                db.set_meta(conn, "harness_stopped", "1")
+                db.set_meta(conn, "red_banner", "")
+                conn.commit()
+            server = HarnessMCP(tmp, paths.db)
+            result = server.call_tool("memory_update_agent", {"name": "developer-1", "status": "running"})
+            self.assertIn("harness_stopped", result["content"][0]["text"])
+
     def test_reset_counters_clears_upgrade_noise_without_stopping_active_agents(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
@@ -847,6 +874,7 @@ class HarnessTests(unittest.TestCase):
                 db.queue_spawn_request(conn, role="Architect", title="old", prompt="old")
                 db.queue_message(conn, "old")
                 db.set_meta(conn, "red_banner", "PROGRESS STALLED")
+                db.set_meta(conn, "harness_stopped", "1")
                 conn.commit()
             result = scheduler.reset_counters()
             with db.connect(paths.db) as conn:
@@ -861,12 +889,14 @@ class HarnessTests(unittest.TestCase):
                     "messages": conn.execute("SELECT COUNT(*) AS count FROM messages WHERE status = 'queued'").fetchone()["count"],
                 }
                 banner = db.get_meta(conn, "red_banner")
+                stopped = db.get_meta(conn, "harness_stopped")
             self.assertEqual(result["terminal_agents"], 2)
             self.assertEqual([(row["name"], row["current_status"]) for row in agents], [("developer-live", "running")])
             self.assertEqual(lane["status"], "ready_for_integration")
             self.assertEqual(lane["integration_queue"], "ready_fast_path")
             self.assertEqual(counts, {"test_runs": 0, "test_results": 0, "bug_reports": 0, "issues": 0, "spawn_requests": 0, "messages": 0})
             self.assertEqual(banner, "")
+            self.assertEqual(stopped, "1")
 
     def test_stopped_harness_ignores_agent_status_updates(self):
         with tempfile.TemporaryDirectory() as tmp:

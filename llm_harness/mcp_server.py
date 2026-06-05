@@ -149,7 +149,7 @@ class HarnessMCP:
                     rows = db.read_only_query(conn, str(args["sql"]), args.get("params") or [])
                     result = _text(rows)
                 elif name == "memory_update_agent":
-                    if db.get_meta(conn, "red_banner") == "Harness stopped.":
+                    if db.get_meta(conn, "harness_stopped") == "1" or db.get_meta(conn, "red_banner") == "Harness stopped.":
                         result = _text({"ok": False, "status": "harness_stopped"})
                     else:
                         requested_status = str(args["status"])

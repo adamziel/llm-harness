@@ -118,6 +118,7 @@ class HarnessScheduler:
             if not self.check_codex_mcp(conn):
                 db.set_meta(conn, "scheduler_pid", "")
                 return 1
+            db.set_meta(conn, "harness_stopped", "0")
             if db.get_meta(conn, "red_banner") == "Harness stopped.":
                 db.set_meta(conn, "red_banner", "")
             self.start_support_windows(conn)
@@ -280,10 +281,18 @@ class HarnessScheduler:
 
         with db.connect(self.paths.db) as conn:
             db.init_db(conn)
+            pids = self.scheduler_pids(conn)
             windows = self.harness_windows(conn)
+            sessions = self.harness_sessions(conn, windows)
+            db.set_meta(conn, "harness_stopped", "1")
+            db.set_meta(conn, "scheduler_pid", "")
+            db.set_meta(conn, "tmux_session", "")
+            db.set_meta(conn, "tmux_attach", "")
+            db.set_meta(conn, "red_banner", "Harness stopped.")
+            conn.commit()
+            signaled = self.signal_processes(pids)
             killed_windows = 0
             killed_sessions = 0
-            sessions = self.harness_sessions(conn, windows)
             for session, session_windows in sessions.items():
                 if session.startswith("llm-harness-"):
                     try:
@@ -315,12 +324,6 @@ class HarnessScheduler:
             )
             cancelled_spawns = conn.execute("UPDATE spawn_requests SET status = 'cancelled' WHERE status = 'queued'").rowcount
             cancelled_messages = conn.execute("UPDATE messages SET status = 'cancelled' WHERE status = 'queued'").rowcount
-            pids = self.scheduler_pids(conn)
-            signaled = self.signal_processes(pids)
-            db.set_meta(conn, "scheduler_pid", "")
-            db.set_meta(conn, "tmux_session", "")
-            db.set_meta(conn, "tmux_attach", "")
-            db.set_meta(conn, "red_banner", "Harness stopped.")
             db.log_event(
                 conn,
                 "stop",
@@ -1158,10 +1161,26 @@ def watchdog_loop(root: str | Path, once: bool = False) -> int:
 
     scheduler = HarnessScheduler(root)
     while True:
+        if _harness_is_stopped(scheduler.paths.db):
+            if once:
+                return 0
+            time.sleep(10)
+            continue
         code = scheduler.run(once=True)
         if once:
             return code
         time.sleep(10)
+
+
+def _harness_is_stopped(db_path: Path) -> bool:
+    """Return whether ./harness stop intentionally paused watchdog restarts."""
+
+    try:
+        with db.connect(db_path) as conn:
+            db.init_db(conn)
+            return db.get_meta(conn, "harness_stopped") == "1"
+    except sqlite3.Error:
+        return False
 
 
 def watchdog_service(root: str | Path) -> str:
