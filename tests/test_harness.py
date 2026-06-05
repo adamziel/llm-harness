@@ -358,12 +358,15 @@ class HarnessTests(unittest.TestCase):
                 result = integrate_once(conn, root)
                 lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
                 attempt = conn.execute("SELECT * FROM integration_attempts WHERE worklane_id = ?", (lane_id,)).fetchone()
+                conflict_card = conn.execute("SELECT * FROM worklanes WHERE role_type = 'Conflict Resolver'").fetchone()
 
             self.assertEqual(result["failed"], 1)
             self.assertEqual((lane["stage"], lane["status"]), ("integration", "integration_failed"))
             self.assertEqual(attempt["merge_result"], "push_failed")
             self.assertEqual(attempt["remote_sha"], "")
             self.assertIn("rejected", attempt["push_result"])
+            self.assertEqual((conflict_card["stage"], conflict_card["status"]), ("planned", "queued"))
+            self.assertIn("push_failed", conflict_card["description"])
 
     def test_integrate_once_records_conflicts_without_running_full_tests(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
@@ -395,12 +398,15 @@ class HarnessTests(unittest.TestCase):
                 result = integrate_once(conn, root)
                 lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
                 attempt = conn.execute("SELECT * FROM integration_attempts WHERE worklane_id = ?", (lane_id,)).fetchone()
+                conflict_card = conn.execute("SELECT * FROM worklanes WHERE role_type = 'Conflict Resolver'").fetchone()
 
             self.assertEqual(result["failed"], 1)
             self.assertEqual(lane["status"], "integration_failed")
             self.assertEqual(lane["stage"], "integration")
             self.assertEqual(attempt["merge_result"], "merge_conflicts")
             self.assertEqual(json.loads(attempt["tests_json"]), [])
+            self.assertEqual((conflict_card["stage"], conflict_card["status"]), ("planned", "queued"))
+            self.assertIn("merge_conflicts", conflict_card["description"])
 
     def test_mcp_tools_record_query_spawn_and_search(self):
         with tempfile.TemporaryDirectory() as tmp:

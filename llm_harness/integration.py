@@ -76,6 +76,7 @@ def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainli
     if not candidate:
         _finish_attempt(conn, attempt_id, "integration_failed", "", "candidate branch not found")
         db.update_worklane_status(conn, lane_id, "integration_failed", f"Candidate branch not found: {branch}")
+        _queue_conflict_card(conn, lane, "candidate_missing", f"Candidate branch not found: {branch}")
         return "failed"
 
     _reset_worktree(worktree, mainline)
@@ -92,6 +93,7 @@ def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainli
         reason = _output(merge)
         _finish_attempt(conn, attempt_id, "integration_failed", "merge_conflicts", reason)
         db.update_worklane_status(conn, lane_id, "integration_failed", reason)
+        _queue_conflict_card(conn, lane, "merge_conflicts", reason)
         return "failed"
 
     smoke = _git(worktree, ["diff", "--check", "HEAD"])
@@ -100,6 +102,7 @@ def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainli
         reason = _output(smoke)
         _finish_attempt(conn, attempt_id, "integration_failed", "smoke_failed", reason, tests=["git diff --check HEAD"])
         db.update_worklane_status(conn, lane_id, "integration_failed", reason)
+        _queue_conflict_card(conn, lane, "smoke_failed", reason)
         return "failed"
 
     title = re.sub(r"\s+", " ", str(lane["title"])).strip()[:60]
@@ -109,6 +112,7 @@ def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainli
         reason = _output(commit)
         _finish_attempt(conn, attempt_id, "integration_failed", "commit_failed", reason, tests=["git diff --check HEAD"])
         db.update_worklane_status(conn, lane_id, "integration_failed", reason)
+        _queue_conflict_card(conn, lane, "commit_failed", reason)
         return "failed"
 
     push = _git(worktree, ["push", "origin", f"HEAD:{mainline}"])
@@ -116,6 +120,7 @@ def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainli
         reason = _output(push)
         _finish_attempt(conn, attempt_id, "integration_failed", "push_failed", reason, tests=["git diff --check HEAD"], push_result=reason)
         db.update_worklane_status(conn, lane_id, "integration_failed", reason)
+        _queue_conflict_card(conn, lane, "push_failed", reason)
         return "failed"
 
     sha = _git_stdout(worktree, ["rev-parse", "HEAD"])
@@ -143,6 +148,28 @@ def _record_attempt(conn: sqlite3.Connection, lane_id: int, branch: str) -> int:
         (lane_id, branch, db.utc_now()),
     )
     return int(cur.lastrowid)
+
+
+def _queue_conflict_card(conn: sqlite3.Connection, lane: sqlite3.Row, failure_type: str, reason: str) -> None:
+    """Create one planned conflict-resolution card for a failed integration lane."""
+
+    lane_id = int(lane["id"])
+    title = f"Resolve integration failure for card #{lane_id}: {lane['title']}"
+    db.find_or_create_card(
+        conn,
+        source_key=f"integration-failure:{lane_id}:{failure_type}",
+        title=title,
+        role_type="Conflict Resolver",
+        description=(
+            f"Integration failed for card #{lane_id} ({lane['title']}) with {failure_type}.\n"
+            f"Branch: {lane['branch_name']}\n"
+            f"Reason:\n{reason}"
+        ),
+        goal="Repair the candidate branch and return the original card to integration.",
+        acceptance_criteria="Original card can be integrated by the deterministic integration loop.",
+        priority=max(0, int(lane["priority"]) - 1),
+        integration_required=True,
+    )
 
 
 def _finish_attempt(
