@@ -215,6 +215,39 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
     metric = latest_metric(conn)
     metric_history = conn.execute("SELECT * FROM metric_samples ORDER BY id DESC LIMIT 24").fetchall()
     events = recent_events(conn, 12)
+    active_work = conn.execute(
+        """
+        SELECT
+            a.name AS agent_name,
+            a.role AS agent_role,
+            a.current_status AS agent_status,
+            a.branch AS agent_branch,
+            a.worktree AS agent_worktree,
+            a.notes AS agent_notes,
+            w.id AS lane_id,
+            w.title AS lane_title,
+            w.status AS lane_status,
+            w.branch_name AS lane_branch,
+            w.worktree_path AS lane_worktree,
+            w.expected_metric_impact AS lane_delta
+        FROM agents a
+        LEFT JOIN worklanes w
+            ON w.owner_agent_id = a.id
+            OR (a.branch != '' AND w.branch_name = a.branch)
+            OR (a.worktree != '' AND w.worktree_path = a.worktree)
+        WHERE a.current_status NOT IN ('crash', 'success', 'stopped')
+        ORDER BY
+            CASE a.role
+                WHEN 'Coordinator' THEN 0
+                WHEN 'Integrator' THEN 1
+                WHEN 'Developer' THEN 2
+                ELSE 3
+            END,
+            a.name,
+            w.id
+        LIMIT 12
+        """
+    ).fetchall()
     queued_integration = conn.execute(
         "SELECT COUNT(*) AS count, COALESCE(SUM(expected_metric_impact), 0) AS delta FROM worklanes WHERE status IN ('needs_verification', 'ready_for_integration')"
     ).fetchone()
@@ -231,6 +264,7 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         "metric": dict(metric) if metric else None,
         "metric_history": [dict(row) for row in metric_history],
         "events": [dict(row) for row in events],
+        "active_work": [dict(row) for row in active_work],
         "queued_integration": dict(queued_integration) if queued_integration else {"count": 0, "delta": 0},
         "failed_integration": dict(failed_integration) if failed_integration else {"count": 0},
         "metadata": metadata,
@@ -282,11 +316,45 @@ def dashboard(conn: sqlite3.Connection) -> str:
         lines.append(_box_line(width, f"Integration failed queue: {failed.get('count', 0)} lanes", ANSI["red"]))
 
     lines.append(_box_sep(width))
+    lines.append(_box_line(width, "Active work (agents ↔ lanes)", ANSI["bold"]))
+    work_lines = _active_work_lines(data.get("active_work", []))
+    for line in work_lines[:8]:
+        lines.append(_box_line(width, line))
+    extra = max(0, len(work_lines) - 8)
+    if extra:
+        lines.append(_box_line(width, f"… {extra} more active work rows"))
+
+    lines.append(_box_sep(width))
     lines.append(_box_line(width, "Recent events", ANSI["bold"]))
     for event in data["events"][-8:]:
         lines.append(_box_line(width, f"{event['ts']} {event['type']}: {shorten(event['message'], width=width-32, placeholder='…')}"))
     lines.append(_box_bottom(width))
     return "\n".join(lines)
+
+
+def _active_work_lines(rows: object) -> list[str]:
+    """Render active agent/lane correlations for the compact TUI."""
+
+    if not isinstance(rows, list) or not rows:
+        return ["No active agents or assigned lanes."]
+    lines: list[str] = []
+    for row in rows:
+        agent = str(row.get("agent_name") or "unknown-agent")
+        role = str(row.get("agent_role") or "agent")
+        status = str(row.get("agent_status") or "unknown")
+        lane_id = row.get("lane_id")
+        if lane_id is None:
+            note = str(row.get("agent_notes") or "no assigned lane")
+            lane = f"no lane · {note}" if note else "no lane"
+        else:
+            title = str(row.get("lane_title") or "untitled")
+            lane_status = str(row.get("lane_status") or "unknown")
+            lane = f"lane#{lane_id} {lane_status}: {title}"
+        branch = str(row.get("lane_branch") or row.get("agent_branch") or "")
+        if branch:
+            lane = f"{lane} ({branch})"
+        lines.append(f"{agent} [{role}/{status}] → {lane}")
+    return lines
 
 
 def _markdown_context(data: dict[str, object]) -> dict[str, str]:

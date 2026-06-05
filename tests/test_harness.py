@@ -214,9 +214,17 @@ class HarnessTests(unittest.TestCase):
                 db.set_goal(conn, "Ship measurable work", measure="tests pass")
                 db.record_metric(conn, "tests", 3, 4)
                 db.record_resource_sample(conn, {"cpu_percent": 12, "ram_percent": 34, "disk_free_gb": 56, "load1": 1})
-                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="working", cwd=tmp)
+                worktree = str(Path(tmp) / ".harness" / "worktrees" / "developer-1")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="working", cwd=tmp, worktree=worktree, branch="work/developer-1")
                 db.upsert_agent(conn, name="developer-2", role="Developer", current_status="crash", cwd=tmp)
                 db.upsert_agent(conn, name="developer-3", role="Developer", current_status="stopped", cwd=tmp)
+                agent = conn.execute("SELECT id FROM agents WHERE name = 'developer-1'").fetchone()
+                lane_id = db.queue_worklane(conn, "Fix parser lowering", status="assigned")
+                conn.execute(
+                    "UPDATE worklanes SET owner_agent_id = ?, branch_name = ?, worktree_path = ? WHERE id = ?",
+                    (agent["id"], "work/developer-1", worktree, lane_id),
+                )
+                conn.commit()
                 db.log_event(conn, "note", "status is alive")
                 md, html = refresh_reports(conn, tmp)
                 self.assertTrue(md.exists())
@@ -227,6 +235,9 @@ class HarnessTests(unittest.TestCase):
                 self.assertIn("Last generated", text)
                 self.assertIn("Progress", text)
                 self.assertIn("Agents: 1 active, 1 crashed, 3 tracked", text)
+                self.assertIn("Active work (agents ↔ lanes)", text)
+                self.assertIn("developer-1 [Developer/working] → lane#", text)
+                self.assertIn("Fix parser lowering", text)
                 self.assertIn("status is alive", text)
 
     def test_status_update_commits_and_pushes_status_artifacts(self):
