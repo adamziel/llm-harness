@@ -22,6 +22,7 @@ from .tmux import Tmux, TmuxUnavailable, shell_command
 
 IDLE_SECONDS = 30 * 60
 IDLE_PROMPT_SECONDS = 30 * 60
+AUDITOR_SPAWN_SECONDS = 60
 JANITOR_SECONDS = 60 * 60
 LOW_RESOURCE_SECONDS = 60
 HIGH_RESOURCE_SECONDS = 30
@@ -273,8 +274,10 @@ class HarnessScheduler:
 
         agents = db.list_agents(conn, "running")
         now = time.time()
+        suspicious_agents: list[str] = []
+        idle_agents: list[str] = []
         for agent in agents:
-            target = agent["tmux_pane"] or f"{agent['tmux_session']}:{agent['tmux_window']}"
+            target = _tmux_target(agent)
             if target and hasattr(self.tmux, "target_exists") and not self.tmux.target_exists(target):
                 db.update_agent_status(conn, agent["name"], "crash", "tmux pane no longer exists", ended=True)
                 db.log_event(conn, "agent_missing", f"{agent['name']} tmux pane no longer exists", agent_name=agent["name"])
@@ -286,14 +289,18 @@ class HarnessScheduler:
                 except Exception:
                     pane_text = ""
             if "sleep 3600" in pane_text or "sleep 600" in pane_text or "sleep infinity" in pane_text:
-                self.prompt_auditor(conn, f"Investigate suspicious sleep command in {agent['name']} and get it back to measurable work.")
+                suspicious_agents.append(agent["name"])
             last_seen = _parse_epoch(agent["last_seen_at"])
             if last_seen and now - last_seen > IDLE_SECONDS:
                 last_prompt = _parse_epoch(agent["last_prompt_at"])
                 if not last_prompt or now - last_prompt > IDLE_PROMPT_SECONDS:
-                    self.prompt_auditor(conn, f"{agent['name']} appears idle for more than {IDLE_SECONDS // 60} minutes. Diagnose and force progress toward the metric.")
+                    idle_agents.append(agent["name"])
                     conn.execute("UPDATE agents SET last_prompt_at = ? WHERE name = ?", (db.utc_now(), agent["name"]))
-                    conn.commit()
+        conn.commit()
+        if suspicious_agents:
+            self.prompt_auditor(conn, f"Investigate suspicious sleep commands in {_agent_list(suspicious_agents)} and get them back to measurable work.")
+        if idle_agents:
+            self.prompt_auditor(conn, f"{len(idle_agents)} agents appear idle for more than {IDLE_SECONDS // 60} minutes: {_agent_list(idle_agents)}. Diagnose and force progress toward the metric.")
 
     def check_progress_stall(self, conn: sqlite3.Connection) -> None:
         """Raise a visible alert if the progress metric has not increased in 30 minutes."""
@@ -322,16 +329,30 @@ class HarnessScheduler:
             self.prompt_manager(conn, banner + " Reorganize work so progress resumes.")
 
     def prompt_auditor(self, conn: sqlite3.Connection, message: str) -> None:
-        """Ask an existing auditor to intervene, or start one if none is running."""
+        """Ask a reachable auditor to intervene, or start one alert auditor."""
 
-        auditor = conn.execute("SELECT * FROM agents WHERE role = 'Auditor' AND current_status = 'running' ORDER BY id LIMIT 1").fetchone()
-        if auditor and auditor["tmux_pane"]:
+        auditors = list(conn.execute("SELECT * FROM agents WHERE role = 'Auditor' AND current_status = 'running' ORDER BY id"))
+        for auditor in auditors:
+            target = _tmux_target(auditor)
+            if not target:
+                continue
+            if hasattr(self.tmux, "target_exists") and not self.tmux.target_exists(target):
+                db.update_agent_status(conn, auditor["name"], "crash", "tmux pane no longer exists", ended=True)
+                db.log_event(conn, "agent_missing", f"{auditor['name']} tmux pane no longer exists", agent_name=auditor["name"])
+                continue
             try:
-                self.tmux.send_prompt(auditor["tmux_pane"], message)
+                self.tmux.send_prompt(target, message)
                 db.log_event(conn, "auditor_prompt", message, agent_name=auditor["name"])
                 return
             except Exception:
-                pass
+                db.update_agent_status(conn, auditor["name"], "crash", "tmux prompt failed", ended=True)
+                db.log_event(conn, "agent_missing", f"{auditor['name']} tmux prompt failed", agent_name=auditor["name"])
+        last_spawn = float(db.get_meta(conn, "last_auditor_spawn_epoch", "0") or 0)
+        now = time.time()
+        if now - last_spawn < AUDITOR_SPAWN_SECONDS:
+            db.log_event(conn, "auditor_prompt_throttled", message)
+            return
+        db.set_meta(conn, "last_auditor_spawn_epoch", str(now))
         self.spawn_agent(conn, "Auditor", "Investigate scheduler alert", extra=message)
 
     def handle_resource_pressure(self, conn: sqlite3.Connection, sample: dict[str, Any]) -> None:
@@ -436,6 +457,24 @@ def _parse_epoch(value: str) -> float:
         return datetime.fromisoformat(value).timestamp()
     except (TypeError, ValueError):
         return 0.0
+
+
+def _agent_list(names: list[str], limit: int = 10) -> str:
+    """Format a bounded agent list for one batched scheduler alert."""
+
+    shown = names[:limit]
+    suffix = f", and {len(names) - limit} more" if len(names) > limit else ""
+    return ", ".join(shown) + suffix
+
+
+def _tmux_target(agent: sqlite3.Row) -> str:
+    """Resolve an agent row to a concrete tmux target, if one was recorded."""
+
+    if agent["tmux_pane"]:
+        return str(agent["tmux_pane"])
+    if agent["tmux_session"] and agent["tmux_window"]:
+        return f"{agent['tmux_session']}:{agent['tmux_window']}"
+    return ""
 
 
 def watchdog_loop(root: str | Path, once: bool = False) -> int:

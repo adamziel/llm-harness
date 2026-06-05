@@ -14,7 +14,7 @@ from llm_harness import __version__, db
 from llm_harness.codex import CODEX_MODEL, CODEX_REASONING_EFFORT, build_codex_command
 from llm_harness.mcp_server import HarnessMCP, serve
 from llm_harness.roles import developer_count_for_building, specs_for_team
-from llm_harness.scheduler import IDLE_PROMPT_SECONDS, IDLE_SECONDS, HarnessScheduler
+from llm_harness.scheduler import AUDITOR_SPAWN_SECONDS, IDLE_PROMPT_SECONDS, IDLE_SECONDS, HarnessScheduler
 from llm_harness.status import dashboard, refresh_reports
 from llm_harness.testing_loop import parse_test_output, run_tests_once
 from llm_harness.tmux import TmuxPane
@@ -238,6 +238,43 @@ class HarnessTests(unittest.TestCase):
                 scheduler.check_agent_liveness(conn)
             self.assertEqual(len(fake.sent), 1)
             self.assertIn("30 minutes", fake.sent[0][1])
+
+    def test_liveness_batches_many_idle_agents_into_one_auditor_spawn(self):
+        old = (datetime.now(timezone.utc) - timedelta(seconds=max(IDLE_SECONDS, IDLE_PROMPT_SECONDS, AUDITOR_SPAWN_SECONDS) + 1)).isoformat(timespec="seconds")
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                for index in range(1, 6):
+                    db.upsert_agent(conn, name=f"developer-{index}", role="Developer", current_status="running", tmux_pane=f"%developer-{index}", cwd=tmp)
+                conn.execute("UPDATE agents SET last_seen_at = ?, last_prompt_at = ?", (old, old))
+                conn.commit()
+                scheduler.check_agent_liveness(conn)
+                auditors = list(conn.execute("SELECT * FROM agents WHERE role = 'Auditor' AND current_status = 'running'"))
+            auditor_windows = [window for _, window, _ in fake.commands if window.startswith("auditor-")]
+            self.assertEqual(auditor_windows, ["auditor-1"])
+            self.assertEqual(len(auditors), 1)
+            self.assertIn("5 agents appear idle", (Path(tmp) / ".harness" / "prompts" / "auditor-1.md").read_text())
+
+    def test_prompt_auditor_skips_stale_auditor_before_spawning(self):
+        class StaleAuditorTmux(FakeTmux):
+            def target_exists(self, target):
+                return target != "%stale"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = StaleAuditorTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="auditor-1", role="Auditor", current_status="running", tmux_pane="%stale", cwd=tmp)
+                db.upsert_agent(conn, name="auditor-2", role="Auditor", current_status="running", tmux_pane="%live", cwd=tmp)
+                scheduler.prompt_auditor(conn, "check this")
+                stale = conn.execute("SELECT * FROM agents WHERE name = 'auditor-1'").fetchone()
+            self.assertEqual(stale["current_status"], "crash")
+            self.assertEqual(fake.sent, [("%live", "check this")])
 
 
 if __name__ == "__main__":
