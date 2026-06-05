@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import tempfile
@@ -27,7 +28,7 @@ from llm_harness.testing_loop import (
     resolve_fixed_tests,
     summarize_results,
 )
-from llm_harness.tmux import _session_name, shell_command
+from llm_harness.tmux import Tmux, _session_name, shell_command
 
 
 @contextmanager
@@ -525,6 +526,24 @@ def _shell_quote_case(self: unittest.TestCase, parts: tuple[str, ...]) -> None:
     self.assertNotIn("\n", command)
 
 
+def _tmux_new_window_case(self: unittest.TestCase, command: str) -> None:
+    calls = []
+
+    def runner(args, check=True, text=True, capture_output=True):
+        calls.append(args)
+        if args[1] == "list-windows":
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if args[1] == "display-message":
+            return subprocess.CompletedProcess(args, 0, stdout="%1\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    Tmux(runner=runner).ensure_window("session", "manhole", command)
+    new_window = [args for args in calls if args[1] == "new-window"][0]
+    self.assertEqual(new_window[:6], ["tmux", "new-window", "-t", "session", "-n", "manhole"])
+    self.assertEqual(len(new_window), 7)
+    self.assertEqual(shlex.split(new_window[6]), ["bash", "-lc", command])
+
+
 def _spawn_spec_case(self: unittest.TestCase, team: str) -> None:
     specs = specs_for_team(team)
     self.assertTrue(specs)
@@ -534,4 +553,10 @@ def _spawn_spec_case(self: unittest.TestCase, team: str) -> None:
 add_cases(SchedulerAndTmuxTests, "effective", [("planning", "planning"), ("building", "building"), ("complete", "building")], _effective_team_case)
 add_cases(SchedulerAndTmuxTests, "session_name", [("repo name", "repo-name"), ("repo.name", "repo.name"), ("repo_name", "repo_name")], _session_name_case)
 add_cases(SchedulerAndTmuxTests, "shell_quote", [("watch", "-n", "5"), ("./harness", "status"), ("echo", "hello world")], _shell_quote_case)
+add_cases(
+    SchedulerAndTmuxTests,
+    "new_window",
+    ["echo hello", "cd /repo && codex --yolo", 'codex -c \'model_reasoning_effort="xhigh"\' "$(cat prompt.md)"'],
+    _tmux_new_window_case,
+)
 add_cases(SchedulerAndTmuxTests, "spec", ["planning", "unknown"], _spawn_spec_case)

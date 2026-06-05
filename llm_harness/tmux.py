@@ -58,7 +58,7 @@ class Tmux:
 
         windows = self.run(["list-windows", "-t", session, "-F", "#{window_name}"]).stdout.splitlines()
         if window not in windows:
-            self.run(["new-window", "-t", session, "-n", window, "bash", "-lc", command])
+            self.run(["new-window", "-t", session, "-n", window, shell_command("bash", "-lc", command)])
         pane = self.run(["display-message", "-p", "-t", f"{session}:{window}", "#{pane_id}"]).stdout.strip()
         return TmuxPane(session=session, window=window, pane=pane)
 
