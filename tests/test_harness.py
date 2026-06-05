@@ -426,6 +426,18 @@ class HarnessTests(unittest.TestCase):
             }:
                 self.assertIn(name, names)
 
+    def test_work_lanes_compat_view_creation_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                with mock.patch("llm_harness.db._sqlite_object_type", return_value=""):
+                    db.ensure_worklane_compat(conn)
+                    db.ensure_worklane_compat(conn)
+                conn.execute("INSERT INTO work_lanes(title, role, status) VALUES ('lane', 'Developer', 'queued')")
+                lane = conn.execute("SELECT * FROM worklanes WHERE title = 'lane'").fetchone()
+            self.assertEqual(lane["status"], "queued")
+
     def test_agent_report_updates_worklane_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)

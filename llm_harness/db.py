@@ -462,15 +462,9 @@ def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
                 ),
             )
         conn.execute("DROP TABLE work_lanes")
-    elif object_type == "view":
-        conn.execute("DROP VIEW work_lanes")
     conn.executescript(
         """
-        DROP TRIGGER IF EXISTS work_lanes_insert;
-        DROP TRIGGER IF EXISTS work_lanes_update;
-        DROP TRIGGER IF EXISTS work_lanes_delete;
-
-        CREATE VIEW work_lanes AS
+        CREATE VIEW IF NOT EXISTS work_lanes AS
         SELECT
             id,
             created_at AS ts,
@@ -483,7 +477,7 @@ def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
             notes
         FROM worklanes;
 
-        CREATE TRIGGER work_lanes_insert INSTEAD OF INSERT ON work_lanes
+        CREATE TRIGGER IF NOT EXISTS work_lanes_insert INSTEAD OF INSERT ON work_lanes
         BEGIN
             INSERT INTO worklanes(
                 id, title, role_type, status, branch_name, worktree_path,
@@ -502,7 +496,7 @@ def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
             );
         END;
 
-        CREATE TRIGGER work_lanes_update INSTEAD OF UPDATE ON work_lanes
+        CREATE TRIGGER IF NOT EXISTS work_lanes_update INSTEAD OF UPDATE ON work_lanes
         BEGIN
             UPDATE worklanes SET
                 title = COALESCE(NEW.title, title),
@@ -516,7 +510,7 @@ def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
             WHERE id = OLD.id;
         END;
 
-        CREATE TRIGGER work_lanes_delete INSTEAD OF DELETE ON work_lanes
+        CREATE TRIGGER IF NOT EXISTS work_lanes_delete INSTEAD OF DELETE ON work_lanes
         BEGIN
             DELETE FROM worklanes WHERE id = OLD.id;
         END;
