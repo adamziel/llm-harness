@@ -881,6 +881,29 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(spawned_developers, ["developer-4", "developer-5", "developer-6"])
             self.assertEqual(missing, "crash")
 
+    def test_team_capacity_replaces_active_developer_without_tmux_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="coordinator-1", role="Coordinator", current_status="running", tmux_pane="%coordinator", cwd=tmp)
+                lane_id = db.queue_worklane(conn, "Recover stale card")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", cwd=tmp)
+                db.assign_card(conn, lane_id, "developer-1")
+                db.queue_worklane(conn, "Queued lane")
+                scheduler.ensure_team(conn, "building")
+                stale = conn.execute("SELECT current_status FROM agents WHERE name = 'developer-1'").fetchone()["current_status"]
+                lane = conn.execute("SELECT owner_agent_id, stage FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+                capacity_cards = conn.execute("SELECT COUNT(*) AS count FROM worklanes WHERE title = 'Maintain Developer capacity'").fetchone()["count"]
+            spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
+            self.assertGreaterEqual(len(spawned_developers), 1)
+            self.assertEqual(stale, "crash")
+            self.assertEqual(lane["stage"], "development")
+            self.assertIsNotNone(lane["owner_agent_id"])
+            self.assertEqual(capacity_cards, 0)
+
     def test_team_capacity_does_not_spawn_developers_without_queued_lanes(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)

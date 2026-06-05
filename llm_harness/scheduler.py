@@ -767,13 +767,14 @@ class HarnessScheduler:
             if not db.is_active_agent_status(agent["current_status"]):
                 continue
             target = _tmux_target(agent)
-            if target and hasattr(self.tmux, "target_exists"):
-                if self.tmux.target_exists(target):
-                    active += 1
-                else:
-                    self.requeue_agent_cards(conn, agent, "tmux pane no longer exists")
-                    db.update_agent_status(conn, agent["name"], "crash", "tmux pane no longer exists", ended=True)
-                    db.log_event(conn, "agent_missing", f"{agent['name']} tmux pane no longer exists", agent_name=agent["name"])
+            if not target:
+                self.mark_agent_missing(conn, agent, "tmux target was not recorded")
+                continue
+            if hasattr(self.tmux, "target_exists"):
+                if not self.tmux.target_exists(target):
+                    self.mark_agent_missing(conn, agent, "tmux pane no longer exists")
+                    continue
+                active += 1
                 continue
             active += 1
         return active
@@ -828,11 +829,10 @@ class HarnessScheduler:
         for agent in agents:
             target = _tmux_target(agent)
             if not target:
+                self.mark_agent_missing(conn, agent, "tmux target was not recorded")
                 continue
             if hasattr(self.tmux, "target_exists") and not self.tmux.target_exists(target):
-                self.requeue_agent_cards(conn, agent, "tmux pane no longer exists")
-                db.update_agent_status(conn, agent["name"], "crash", "tmux pane no longer exists", ended=True)
-                db.log_event(conn, "agent_missing", f"{agent['name']} tmux pane no longer exists", agent_name=agent["name"])
+                self.mark_agent_missing(conn, agent, "tmux pane no longer exists")
                 continue
             return agent
         return None
@@ -875,6 +875,13 @@ class HarnessScheduler:
         if rows:
             db.log_event(conn, "card_requeued", f"Requeued {len(rows)} cards from {agent['name']}", agent_name=agent["name"], payload={"reason": reason})
         return len(rows)
+
+    def mark_agent_missing(self, conn: sqlite3.Connection, agent: sqlite3.Row, reason: str) -> None:
+        """Mark a supposedly active worker dead when Python cannot reach its tmux pane."""
+
+        self.requeue_agent_cards(conn, agent, reason)
+        db.update_agent_status(conn, agent["name"], "crash", reason, ended=True)
+        db.log_event(conn, "agent_missing", f"{agent['name']} {reason}", agent_name=agent["name"])
 
     def card_prompt(self, conn: sqlite3.Connection, card_id: int, title: str, prompt: str) -> str:
         """Build the bounded prompt for a concrete card-backed assignment."""
@@ -922,7 +929,7 @@ class HarnessScheduler:
         if role == "Developer" and card_id is None and self.queued_developer_worklanes(conn) <= 0:
             db.log_event(conn, "spawn_rejected", "Rejected Developer spawn because no planned implementation card is available", payload={"role": role, "title": title})
             return ""
-        if role not in SUPPORT_ROLES and card_id is None and not (role == "Coordinator" and title.startswith("Maintain ")):
+        if role not in SUPPORT_ROLES and role != "Developer" and card_id is None and not (role == "Coordinator" and title.startswith("Maintain ")):
             card_id = db.create_card(
                 conn,
                 title,
@@ -1035,17 +1042,17 @@ class HarnessScheduler:
         idle_agents: list[str] = []
         for agent in agents:
             target = _tmux_target(agent)
-            if target and hasattr(self.tmux, "target_exists") and not self.tmux.target_exists(target):
-                self.requeue_agent_cards(conn, agent, "tmux pane no longer exists")
-                db.update_agent_status(conn, agent["name"], "crash", "tmux pane no longer exists", ended=True)
-                db.log_event(conn, "agent_missing", f"{agent['name']} tmux pane no longer exists", agent_name=agent["name"])
+            if not target:
+                self.mark_agent_missing(conn, agent, "tmux target was not recorded")
+                continue
+            if hasattr(self.tmux, "target_exists") and not self.tmux.target_exists(target):
+                self.mark_agent_missing(conn, agent, "tmux pane no longer exists")
                 continue
             pane_text = ""
-            if target:
-                try:
-                    pane_text = self.tmux.capture(target, lines=120)
-                except Exception:
-                    pane_text = ""
+            try:
+                pane_text = self.tmux.capture(target, lines=120)
+            except Exception:
+                pane_text = ""
             if "sleep 3600" in pane_text or "sleep 600" in pane_text or "sleep infinity" in pane_text:
                 suspicious_agents.append(agent["name"])
             last_seen = _parse_epoch(agent["last_seen_at"])
