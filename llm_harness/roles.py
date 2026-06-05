@@ -41,17 +41,14 @@ TEAM_PRESETS: dict[str, list[RoleSpec]] = {
     "minimal": [
         RoleSpec("Coordinator", 1),
         RoleSpec("Developer", 1),
-        RoleSpec("Integrator", 1),
     ],
     "small": [
         RoleSpec("Coordinator", 1),
         RoleSpec("Developer", 2),
-        RoleSpec("Integrator", 1),
     ],
     "medium": [
         RoleSpec("Coordinator", 1),
         RoleSpec("Developer", 4),
-        RoleSpec("Integrator", 1),
     ],
 }
 
@@ -71,7 +68,6 @@ def specs_for_team(team: str) -> list[RoleSpec]:
         return [
             RoleSpec("Coordinator", 1),
             RoleSpec("Developer", min(8, max(6, int(cores * 0.5)))),
-            RoleSpec("Integrator", 2),
         ]
     if team in {"auto", "building", "planning"}:
         team = "small" if team != "building" else "medium"
@@ -101,8 +97,9 @@ development on additional planning.
 You are a Developer. Work on one assigned worklane at a time in your dedicated git worktree. Read the repository-root
 DEVELOPMENT.md before coding. Commit reasonably often, run lane-specific tests, and do not run the entire suite unless
 the Coordinator or Integrator explicitly asks. When done, produce a structured agent_report containing agent_id,
-worklane_id, status, summary, files_changed, commits, tests_run, test_result, blockers, and next_action. Mark completed
-work needs_verification or ready_for_integration, then immediately request another lane.
+card_id, worklane_id, stage, status, summary, files_changed, commits, tests_run, test_result, blockers, and next_action.
+Report stage=development and status=ready_for_review when the assigned card is ready; Python owns review and integration
+stage movement. Then request another card instead of switching to unrelated work.
 """,
     "Designer": """
 You are a Designer. Build UI parts only when needed. If DESIGN.md exists, follow it. Avoid generic agentic-looking output;
@@ -126,6 +123,7 @@ You are the Integrator. Continuously scan ready_for_integration worklanes, favor
 integration attempts, run targeted smoke checks, and requeue conflicted or failing lanes with actionable detail instead of
 blocking on one bad branch. The deterministic `./harness integrate` loop owns routine merges and pushes; do not run the
 full test suite as part of integration because `./harness test-loop` runs it continuously in a separate support window.
+Only do concrete triage when the scheduler assigns you a card; otherwise stay advisory/idle.
 """,
     "Lane Scout": """
 You are a short-lived Lane Scout. Find independently executable worklanes such as isolated modules, clear failing tests,
@@ -170,7 +168,7 @@ Use the harness SQLite MCP tools for shared memory:
 - memory_record_event: append important events and decisions.
 - memory_query: inspect goals, agents, worklanes, integration_attempts, agent_reports, test_runs, issues, and recent events with SELECT statements; use PRAGMA table_xinfo(table) before assuming column names.
 - memory_update_agent: update your own current_status and notes.
-- agent_report: submit structured Developer/Integrator reports; structured reports are authoritative.
+- agent_report: submit structured reports with card_id, worklane_id, stage, status, summary, evidence, and next_action; structured reports are authoritative.
 - spawn_agent: request a new agent through the central scheduler; never start Codex directly yourself.
 - code_search: search the current repository/worktree before falling back to grep.
 """

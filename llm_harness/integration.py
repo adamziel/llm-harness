@@ -57,7 +57,9 @@ def _ready_lanes(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
         conn.execute(
             f"""
             SELECT * FROM worklanes
-            WHERE status IN ({placeholders}) AND branch_name != ''
+            WHERE (stage = 'integration' OR status IN ({placeholders}))
+              AND status != 'integration_failed'
+              AND branch_name != ''
             ORDER BY priority ASC, ready_for_integration_at IS NULL, ready_for_integration_at ASC, id ASC
             LIMIT ?
             """,
@@ -78,8 +80,9 @@ def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainli
 
     _reset_worktree(worktree, mainline)
     if _git_stdout(worktree, ["rev-list", "--count", f"HEAD..{candidate}"]) == "0":
-        _finish_attempt(conn, attempt_id, "integrated", "already_merged", "")
-        db.update_worklane_status(conn, lane_id, "integrated", f"{branch} already merged")
+        sha = _git_stdout(worktree, ["rev-parse", "HEAD"])
+        _finish_attempt(conn, attempt_id, "integrated", "already_merged", "", remote_ref=f"origin/{mainline}", remote_sha=sha, push_result="already on remote")
+        db.complete_card(conn, lane_id, f"{branch} already merged on origin/{mainline} at {sha}")
         _delete_integrated_branch(root, branch)
         return "integrated"
 
@@ -111,7 +114,7 @@ def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainli
     push = _git(worktree, ["push", "origin", f"HEAD:{mainline}"])
     if push.returncode != 0:
         reason = _output(push)
-        _finish_attempt(conn, attempt_id, "integration_failed", "push_failed", reason, tests=["git diff --check HEAD"])
+        _finish_attempt(conn, attempt_id, "integration_failed", "push_failed", reason, tests=["git diff --check HEAD"], push_result=reason)
         db.update_worklane_status(conn, lane_id, "integration_failed", reason)
         return "failed"
 
@@ -123,8 +126,8 @@ def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainli
         """,
         (sha, mainline, lane_id, db.utc_now(), f"Integrated {branch}"),
     )
-    _finish_attempt(conn, attempt_id, "integrated", f"pushed {sha} to origin/{mainline}", "", tests=["git diff --check HEAD"])
-    db.update_worklane_status(conn, lane_id, "integrated", f"Integrated {branch} as {sha}")
+    _finish_attempt(conn, attempt_id, "integrated", f"pushed {sha} to origin/{mainline}", "", tests=["git diff --check HEAD"], remote_ref=f"origin/{mainline}", remote_sha=sha, push_result=_output(push) or "pushed")
+    db.complete_card(conn, lane_id, f"Integrated {branch} as {sha} and pushed origin/{mainline}")
     db.log_event(conn, "integration_pushed", f"Integrated worklane#{lane_id} and pushed origin/{mainline}", payload={"branch": branch, "sha": sha})
     _delete_integrated_branch(root, branch)
     _reset_worktree(worktree, mainline)
@@ -149,14 +152,18 @@ def _finish_attempt(
     merge_result: str,
     failure_reason: str,
     tests: list[str] | None = None,
+    remote_ref: str = "",
+    remote_sha: str = "",
+    push_result: str = "",
 ) -> None:
     conn.execute(
         """
         UPDATE integration_attempts
-        SET status = ?, merge_result = ?, tests_json = ?, failure_reason = ?, ended_at = ?
+        SET status = ?, merge_result = ?, tests_json = ?, failure_reason = ?,
+            remote_ref = ?, remote_sha = ?, push_result = ?, ended_at = ?
         WHERE id = ?
         """,
-        (status, merge_result, json.dumps(tests or []), failure_reason, db.utc_now(), attempt_id),
+        (status, merge_result, json.dumps(tests or []), failure_reason, remote_ref, remote_sha, push_result, db.utc_now(), attempt_id),
     )
 
 

@@ -40,7 +40,8 @@ JANITOR_SECONDS = 60 * 60
 LOW_RESOURCE_SECONDS = 60
 HIGH_RESOURCE_SECONDS = 30
 INTEGRATION_BACKPRESSURE_SECONDS = 20 * 60
-INTEGRATION_READY_STATUSES = ("needs_verification", "ready_for_integration")
+INTEGRATION_READY_STATUSES = ("ready_for_integration",)
+SUPPORT_ROLES = {"Manhole", "Status reporter", "Janitor"}
 DEFAULT_DEVELOPMENT_MD = """# Development Guide
 
 This starter file was created by the harness because DEVELOPMENT.md was missing.
@@ -369,6 +370,7 @@ class HarnessScheduler:
                 """
                 UPDATE worklanes
                 SET status = 'ready_for_integration',
+                    stage = 'integration',
                     integration_queue = 'ready_fast_path',
                     last_activity_at = ?,
                     notes = trim(notes || char(10) || 'Reset from integration_failed after harness upgrade; retry integration.')
@@ -488,7 +490,11 @@ class HarnessScheduler:
         db.record_resource_sample(conn, sample)
         self.handle_resource_pressure(conn, sample)
         self.handle_spawn_requests(conn, team)
+        reviewed = db.review_ready_cards(conn)
+        if reviewed:
+            db.log_event(conn, "review", f"Accepted {reviewed} review cards")
         self.ensure_team(conn, team)
+        self.requeue_developers_without_cards(conn)
         self.check_agent_liveness(conn)
         self.check_progress_stall(conn)
         self.maybe_run_janitor(conn)
@@ -676,16 +682,46 @@ class HarnessScheduler:
                 self.spawn_agent(conn, spec.name, title=f"Maintain {spec.name} capacity")
 
     def queued_developer_worklanes(self, conn: sqlite3.Connection) -> int:
-        """Count unassigned implementation lanes; capacity should not create no-op workers."""
+        """Count planned implementation cards; capacity should not create no-op workers."""
 
         return int(
             conn.execute(
                 """
                 SELECT COUNT(*) AS count FROM worklanes
-                WHERE status = 'queued' AND role_type IN ('Developer', 'Designer')
+                WHERE stage = 'planned' AND role_type IN ('Developer', 'Designer')
                 """
             ).fetchone()["count"]
         )
+
+    def requeue_developers_without_cards(self, conn: sqlite3.Connection) -> None:
+        """Stop live Developer panes that are not attached to exactly one card."""
+
+        developers = conn.execute(
+            "SELECT * FROM agents WHERE role = 'Developer' AND current_status NOT IN ('crash', 'success', 'stopped')"
+        ).fetchall()
+        for agent in developers:
+            rows = conn.execute(
+                """
+                SELECT id FROM worklanes
+                WHERE stage = 'development'
+                  AND (
+                    owner_agent_id = ?
+                    OR (? != '' AND branch_name = ?)
+                    OR (? != '' AND worktree_path = ?)
+                  )
+                """,
+                (agent["id"], agent["branch"], agent["branch"], agent["worktree"], agent["worktree"]),
+            ).fetchall()
+            if len(rows) == 1:
+                continue
+            db.update_agent_status(conn, agent["name"], "stopped", "Stopped because no assigned development card was found", ended=True)
+            target = _tmux_target(agent)
+            if target:
+                try:
+                    self.tmux.kill_window(agent["tmux_session"], agent["tmux_window"])
+                except Exception:
+                    pass
+            db.log_event(conn, "uncarded_agent_stopped", f"Stopped {agent['name']} because it had {len(rows)} development cards", agent_name=agent["name"])
 
     def developer_spawn_blocker(self, conn: sqlite3.Connection, team: str) -> str:
         """Return why another Developer would be unstable, or an empty string if allowed."""
@@ -704,7 +740,7 @@ class HarnessScheduler:
 
         placeholders = ",".join("?" for _ in INTEGRATION_READY_STATUSES)
         ready = conn.execute(
-            f"SELECT COUNT(*) AS count FROM worklanes WHERE status IN ({placeholders})",
+            f"SELECT COUNT(*) AS count FROM worklanes WHERE stage = 'integration' AND status IN ({placeholders})",
             INTEGRATION_READY_STATUSES,
         ).fetchone()["count"]
         failed = conn.execute("SELECT COUNT(*) AS count FROM worklanes WHERE status = 'integration_failed'").fetchone()["count"]
@@ -746,25 +782,90 @@ class HarnessScheduler:
 
         for request in db.next_spawn_requests(conn):
             role = "Coordinator" if request["role"] == "Manager" else request["role"]
+            card_id = int(request["card_id"] or 0)
             if role == "Developer":
                 reason = self.developer_spawn_blocker(conn, team)
                 if reason:
                     db.mark_spawn_request(conn, request["id"], "rejected", "")
                     db.log_event(conn, "spawn_rejected", f"Rejected Developer spawn request: {reason}", payload={"request_id": request["id"], "title": request["title"]})
                     continue
-            existing = ""
+            existing: sqlite3.Row | None = None
             if role in SINGLETON_SPAWN_ROLES or role == "Coordinator":
-                existing = self.prompt_running_role(
-                    conn,
-                    role,
-                    f"Additional assigned work: {request['title']}\n\n{request['prompt']}",
-                )
+                existing = self.running_role_agent(conn, role)
             if existing:
-                db.mark_spawn_request(conn, request["id"], "started", existing)
-                db.log_event(conn, "spawn_coalesced", f"Reused {existing} for {role}: {request['title']}", agent_name=existing)
+                if self.agent_development_card_count(conn, existing) > 0:
+                    db.mark_spawn_request(conn, request["id"], "deferred", existing["name"])
+                    db.log_event(conn, "spawn_deferred", f"Deferred {role} work because {existing['name']} already has a card", agent_name=existing["name"], payload={"request_id": request["id"], "card_id": card_id})
+                    continue
+                if card_id:
+                    db.assign_card(conn, card_id, existing["name"])
+                try:
+                    self.tmux.send_prompt(
+                        existing["tmux_pane"],
+                        self.card_prompt(conn, card_id, request["title"], request["prompt"]),
+                    )
+                except Exception:
+                    db.update_agent_status(conn, existing["name"], "crash", "tmux prompt failed", ended=True)
+                    db.log_event(conn, "agent_missing", f"{existing['name']} tmux prompt failed", agent_name=existing["name"])
+                    db.mark_spawn_request(conn, request["id"], "failed", existing["name"])
+                    continue
+                db.mark_spawn_request(conn, request["id"], "started", existing["name"])
+                db.log_event(conn, "spawn_coalesced", f"Reused {existing['name']} for {role}: {request['title']}", agent_name=existing["name"], payload={"card_id": card_id})
                 continue
-            name = self.spawn_agent(conn, role, request["title"], extra=request["prompt"])
+            name = self.spawn_agent(conn, role, request["title"], extra=request["prompt"], card_id=card_id or None)
             db.mark_spawn_request(conn, request["id"], "started" if name else "failed", name or "")
+
+    def running_role_agent(self, conn: sqlite3.Connection, role: str) -> sqlite3.Row | None:
+        """Return one reachable active agent for a singleton role."""
+
+        agents = [
+            agent
+            for agent in conn.execute("SELECT * FROM agents WHERE role = ? ORDER BY id", (role,))
+            if db.is_active_agent_status(agent["current_status"])
+        ]
+        for agent in agents:
+            target = _tmux_target(agent)
+            if not target:
+                continue
+            if hasattr(self.tmux, "target_exists") and not self.tmux.target_exists(target):
+                db.update_agent_status(conn, agent["name"], "crash", "tmux pane no longer exists", ended=True)
+                db.log_event(conn, "agent_missing", f"{agent['name']} tmux pane no longer exists", agent_name=agent["name"])
+                continue
+            return agent
+        return None
+
+    def agent_development_card_count(self, conn: sqlite3.Connection, agent: sqlite3.Row) -> int:
+        """Count development cards attached to an active agent."""
+
+        return int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM worklanes
+                WHERE stage = 'development'
+                  AND (
+                    owner_agent_id = ?
+                    OR (? != '' AND branch_name = ?)
+                    OR (? != '' AND worktree_path = ?)
+                  )
+                """,
+                (agent["id"], agent["branch"], agent["branch"], agent["worktree"], agent["worktree"]),
+            ).fetchone()["count"]
+        )
+
+    def card_prompt(self, conn: sqlite3.Connection, card_id: int, title: str, prompt: str) -> str:
+        """Build the bounded prompt for a concrete card-backed assignment."""
+
+        if card_id:
+            card = conn.execute("SELECT * FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+            if card:
+                return (
+                    f"Assigned card #{card['id']}: {card['title']}\n"
+                    f"Stage: {card['stage']}\n"
+                    f"Goal: {card['goal'] or card['description'] or card['notes'] or prompt}\n"
+                    f"Acceptance criteria: {card['acceptance_criteria'] or 'Produce structured evidence and report stage/status.'}\n"
+                    "Report with agent_report including card_id, worklane_id, stage, status, summary, evidence, and next_action."
+                )
+        return f"Assigned card-backed work: {title}\n\n{prompt}"
 
     def prompt_running_role(self, conn: sqlite3.Connection, role: str, message: str) -> str:
         """Deliver work to one reachable active agent for singleton specialist roles."""
@@ -790,8 +891,22 @@ class HarnessScheduler:
                 db.log_event(conn, "agent_missing", f"{agent['name']} tmux prompt failed", agent_name=agent["name"])
         return ""
 
-    def spawn_agent(self, conn: sqlite3.Connection, role: str, title: str, extra: str = "") -> str:
+    def spawn_agent(self, conn: sqlite3.Connection, role: str, title: str, extra: str = "", card_id: int | None = None) -> str:
         """Create a Codex tmux window and agent row, using worktrees for developers."""
+
+        if role == "Developer" and card_id is None and self.queued_developer_worklanes(conn) <= 0:
+            db.log_event(conn, "spawn_rejected", "Rejected Developer spawn because no planned implementation card is available", payload={"role": role, "title": title})
+            return ""
+        if role not in SUPPORT_ROLES and card_id is None and not (role == "Coordinator" and title.startswith("Maintain ")):
+            card_id = db.create_card(
+                conn,
+                title,
+                role_type=role,
+                description=extra,
+                priority=50,
+                integration_required=db.role_requires_integration(role),
+                source_key=f"spawn-direct:{role}:{title}",
+            )
 
         session = db.get_meta(conn, "tmux_session")
         if not session:
@@ -807,7 +922,8 @@ class HarnessScheduler:
         cwd, branch = self.agent_cwd(role, name)
         goal = db.get_goal(conn)
         goal_text = goal["text"] if goal else ""
-        prompt = prompt_for_role(role, name, goal_text, str(self.paths.db), str(self.root), extra=f"Assigned work: {title}\n\n{extra}")
+        assignment = self.card_prompt(conn, card_id, title, extra) if card_id else f"Assigned work: {title}\n\n{extra}"
+        prompt = prompt_for_role(role, name, goal_text, str(self.paths.db), str(self.root), extra=assignment)
         prompt_file = self.paths.prompts / f"{name}.md"
         prompt_file.write_text(prompt)
         window = name[:40]
@@ -831,21 +947,21 @@ class HarnessScheduler:
             notes=title,
         )
         if role == "Developer":
-            lane = db.claim_next_worklane(conn, name, str(cwd), branch)
+            lane = db.assign_card(conn, card_id, name, str(cwd), branch) if card_id else db.claim_next_worklane(conn, name, str(cwd), branch)
+            if lane is None:
+                db.update_agent_status(conn, name, "stopped", "Stopped because no planned implementation card was available", ended=True)
+                return ""
             db.record_worktree(conn, str(cwd), branch=branch, owner_agent=name, worklane_id=lane["id"] if lane else None, base_commit=self.current_head())
             if lane:
                 try:
                     self.tmux.send_prompt(
                         pane.pane,
-                        (
-                            f"Assigned worklane #{lane['id']}: {lane['title']}\n"
-                            f"Goal: {lane['goal'] or lane['description'] or lane['notes']}\n"
-                            f"Acceptance criteria: {lane['acceptance_criteria'] or 'Use lane-specific tests and deterministic evidence.'}\n"
-                            "Report with the agent_report MCP tool when this lane changes status."
-                        ),
+                        self.card_prompt(conn, int(lane["id"]), lane["title"], extra),
                     )
                 except Exception:
                     pass
+        elif role not in SUPPORT_ROLES and card_id:
+            db.assign_card(conn, card_id, name)
         db.log_event(conn, "agent_started", f"Started {name} for {title}", agent_name=name, payload={"role": role, "window": window})
         return name
 
@@ -947,6 +1063,15 @@ class HarnessScheduler:
     def prompt_auditor(self, conn: sqlite3.Connection, message: str) -> None:
         """Ask a reachable auditor to intervene, or start one alert auditor."""
 
+        card_id = db.find_or_create_card(
+            conn,
+            source_key=f"auditor-alert:{message[:120]}",
+            title="Investigate scheduler alert",
+            role_type="Auditor",
+            description=message,
+            priority=10,
+            integration_required=False,
+        )
         auditors = [
             agent
             for agent in conn.execute("SELECT * FROM agents WHERE role = 'Auditor' ORDER BY id")
@@ -960,9 +1085,13 @@ class HarnessScheduler:
                 db.update_agent_status(conn, auditor["name"], "crash", "tmux pane no longer exists", ended=True)
                 db.log_event(conn, "agent_missing", f"{auditor['name']} tmux pane no longer exists", agent_name=auditor["name"])
                 continue
+            if self.agent_development_card_count(conn, auditor) > 0:
+                db.log_event(conn, "auditor_prompt_deferred", message, agent_name=auditor["name"], payload={"card_id": card_id})
+                return
+            db.assign_card(conn, card_id, auditor["name"])
             try:
-                self.tmux.send_prompt(target, message)
-                db.log_event(conn, "auditor_prompt", message, agent_name=auditor["name"])
+                self.tmux.send_prompt(target, self.card_prompt(conn, card_id, "Investigate scheduler alert", message))
+                db.log_event(conn, "auditor_prompt", message, agent_name=auditor["name"], payload={"card_id": card_id})
                 return
             except Exception:
                 db.update_agent_status(conn, auditor["name"], "crash", "tmux prompt failed", ended=True)
@@ -973,7 +1102,7 @@ class HarnessScheduler:
             db.log_event(conn, "auditor_prompt_throttled", message)
             return
         db.set_meta(conn, "last_auditor_spawn_epoch", str(now))
-        self.spawn_agent(conn, "Auditor", "Investigate scheduler alert", extra=message)
+        self.spawn_agent(conn, "Auditor", "Investigate scheduler alert", extra=message, card_id=card_id)
 
     def handle_resource_pressure(self, conn: sqlite3.Connection, sample: dict[str, Any]) -> None:
         """Escalate sustained low/high resource use to Manager or Janitor."""
@@ -1014,6 +1143,15 @@ class HarnessScheduler:
     def prompt_coordinator(self, conn: sqlite3.Connection, message: str) -> None:
         """Ask the Coordinator to reorganize work when deterministic monitors fire."""
 
+        card_id = db.find_or_create_card(
+            conn,
+            source_key=f"coordinator-alert:{message[:120]}",
+            title="Respond to scheduler alert",
+            role_type="Coordinator",
+            description=message,
+            priority=10,
+            integration_required=False,
+        )
         coordinator = next(
             (
                 agent
@@ -1023,13 +1161,17 @@ class HarnessScheduler:
             None,
         )
         if coordinator and coordinator["tmux_pane"]:
+            if self.agent_development_card_count(conn, coordinator) > 0:
+                db.log_event(conn, "coordinator_prompt_deferred", message, agent_name=coordinator["name"], payload={"card_id": card_id})
+                return
+            db.assign_card(conn, card_id, coordinator["name"])
             try:
-                self.tmux.send_prompt(coordinator["tmux_pane"], message)
-                db.log_event(conn, "coordinator_prompt", message, agent_name=coordinator["name"])
+                self.tmux.send_prompt(coordinator["tmux_pane"], self.card_prompt(conn, card_id, "Respond to scheduler alert", message))
+                db.log_event(conn, "coordinator_prompt", message, agent_name=coordinator["name"], payload={"card_id": card_id})
                 return
             except Exception:
                 pass
-        self.spawn_agent(conn, "Coordinator", "Respond to scheduler alert", extra=message)
+        self.spawn_agent(conn, "Coordinator", "Respond to scheduler alert", extra=message, card_id=card_id)
 
     def prompt_manager(self, conn: sqlite3.Connection, message: str) -> None:
         """Compatibility wrapper for older tests and queued Manager requests."""

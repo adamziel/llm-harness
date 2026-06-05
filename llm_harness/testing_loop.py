@@ -112,20 +112,45 @@ def summarize_results(results: list[dict[str, Any]], returncode: int) -> dict[st
 
 
 def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dict[str, Any]], commit: str) -> None:
-    """Put main-branch test failures at the top of the durable work queue."""
+    """Put main-branch test failures at the top of the durable card queue."""
 
     failures = [result["nodeid"] for result in results if result.get("status") in {"failed", "error"}]
+    run = conn.execute("SELECT command FROM test_runs WHERE id = ?", (run_id,)).fetchone()
+    command = run["command"] if run else ""
+    failure_key = ",".join(sorted(failures)) if failures else "command-level-failure"
     title = f"Fix failing tests from run {run_id}"
     notes = "Failed tests: " + (", ".join(failures) if failures else "see full test log") + f"\nFirst failing commit: {commit}"
-    db.queue_worklane(
+    source_key = f"test-failure:{command}:{failure_key}"
+    existing = conn.execute(
+        """
+        SELECT id FROM worklanes
+        WHERE source_key = ? AND stage != 'done' AND status NOT IN ('abandoned', 'cancelled', 'stale')
+        ORDER BY id LIMIT 1
+        """,
+        (source_key,),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE worklanes
+            SET notes = ?, priority = MIN(priority, 0), last_activity_at = ?
+            WHERE id = ?
+            """,
+            (notes + f"\nLatest failing run: {run_id}", db.utc_now(), existing["id"]),
+        )
+        db.log_event(conn, "worklane_deduplicated", f"Updated existing failing-test card#{existing['id']} from run {run_id}", payload={"card_id": existing["id"], "run_id": run_id})
+        return
+    db.create_card(
         conn,
         title,
         role_type="Developer",
         status="queued",
+        stage="planned",
         notes=notes,
         priority=0,
         goal="Restore the main-branch full test suite.",
         acceptance_criteria="The failing tests pass in the deterministic test loop.",
+        source_key=source_key,
     )
 
 

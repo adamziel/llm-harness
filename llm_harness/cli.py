@@ -137,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "integrate":
         with db.connect(paths.db) as conn:
             db.init_db(conn)
+            db.review_ready_cards(conn)
             result = integrate_once(conn, root)
         print(json.dumps(result, sort_keys=True))
         return 0

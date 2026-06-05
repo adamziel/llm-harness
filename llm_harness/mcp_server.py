@@ -53,13 +53,15 @@ TOOLS = [
     },
     {
         "name": "agent_report",
-        "description": "Store a structured Developer or Integrator report and update its worklane status.",
+        "description": "Store a structured card report. Python moves card stages after validating the report.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "agent_id": {"type": "string"},
                 "integrator_id": {"type": "string"},
+                "card_id": {"type": "string"},
                 "worklane_id": {"type": "string"},
+                "stage": {"type": "string"},
                 "status": {"type": "string"},
                 "summary": {"type": "string"},
                 "files_changed": {"type": "array"},
@@ -69,7 +71,7 @@ TOOLS = [
                 "blockers": {"type": "array"},
                 "next_action": {"type": "string"},
             },
-            "required": ["status", "summary"],
+            "required": ["card_id", "stage", "status", "summary"],
         },
     },
     {

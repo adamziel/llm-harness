@@ -227,6 +227,8 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
             w.id AS lane_id,
             w.title AS lane_title,
             w.status AS lane_status,
+            w.stage AS lane_stage,
+            w.card_type AS card_type,
             w.branch_name AS lane_branch,
             w.worktree_path AS lane_worktree,
             w.expected_metric_impact AS lane_delta
@@ -254,11 +256,13 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
             w.id,
             w.title,
             w.status,
+            w.stage,
+            w.card_type,
             w.role_type,
             w.branch_name,
             w.expected_metric_impact
         FROM worklanes w
-        WHERE w.status IN ('queued', 'assigned', 'needs_verification', 'ready_for_integration', 'integration_failed')
+        WHERE w.stage != 'done'
           AND NOT EXISTS (
               SELECT 1
               FROM agents a
@@ -272,9 +276,13 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         ORDER BY
             CASE w.status
                 WHEN 'integration_failed' THEN 0
-                WHEN 'ready_for_integration' THEN 1
-                WHEN 'needs_verification' THEN 2
-                WHEN 'assigned' THEN 3
+                ELSE 1
+            END,
+            CASE w.stage
+                WHEN 'integration' THEN 0
+                WHEN 'review' THEN 1
+                WHEN 'development' THEN 2
+                WHEN 'planned' THEN 3
                 ELSE 4
             END,
             w.priority ASC,
@@ -282,8 +290,31 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         LIMIT 8
         """
     ).fetchall()
+    card_counts = conn.execute(
+        """
+        SELECT stage, COUNT(*) AS count
+        FROM worklanes
+        GROUP BY stage
+        ORDER BY CASE stage
+            WHEN 'planned' THEN 0
+            WHEN 'development' THEN 1
+            WHEN 'review' THEN 2
+            WHEN 'integration' THEN 3
+            WHEN 'done' THEN 4
+            ELSE 5
+        END
+        """
+    ).fetchall()
+    uncarded_agents = [
+        dict(row)
+        for row in active_work
+        if row["lane_id"] is None
+        and row["agent_role"] not in {"Manhole", "Status reporter", "Janitor"}
+        and str(row["agent_notes"] or "")
+        and not str(row["agent_notes"]).startswith("Maintain ")
+    ]
     queued_integration = conn.execute(
-        "SELECT COUNT(*) AS count, COALESCE(SUM(expected_metric_impact), 0) AS delta FROM worklanes WHERE status IN ('needs_verification', 'ready_for_integration')"
+        "SELECT COUNT(*) AS count, COALESCE(SUM(expected_metric_impact), 0) AS delta FROM worklanes WHERE stage = 'integration' AND status = 'ready_for_integration'"
     ).fetchone()
     failed_integration = conn.execute(
         "SELECT COUNT(*) AS count FROM worklanes WHERE status = 'integration_failed'"
@@ -300,6 +331,8 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         "events": [dict(row) for row in events],
         "active_work": [dict(row) for row in active_work],
         "pending_lanes": [dict(row) for row in pending_lanes],
+        "card_counts": [dict(row) for row in card_counts],
+        "uncarded_agents": uncarded_agents,
         "queued_integration": dict(queued_integration) if queued_integration else {"count": 0, "delta": 0},
         "failed_integration": dict(failed_integration) if failed_integration else {"count": 0},
         "metadata": metadata,
@@ -349,9 +382,18 @@ def dashboard(conn: sqlite3.Connection) -> str:
     failed = data.get("failed_integration")
     if isinstance(failed, dict) and failed.get("count", 0):
         lines.append(_box_line(width, f"Integration failed queue: {failed.get('count', 0)} lanes", ANSI["red"]))
+    card_counts = _card_count_text(data.get("card_counts", []))
+    if card_counts:
+        lines.append(_box_line(width, f"Cards: {card_counts}"))
 
     lines.append(_box_sep(width))
-    lines.append(_box_line(width, "Active work (agents ↔ lanes)", ANSI["bold"]))
+    uncarded = data.get("uncarded_agents", [])
+    if isinstance(uncarded, list) and uncarded:
+        lines.append(_box_line(width, "Uncarded active work", ANSI["red"]))
+        for row in uncarded[:4]:
+            lines.append(_box_line(width, f"{row.get('agent_name')} [{row.get('agent_role')}] has no card: {row.get('agent_notes')}", ANSI["red"]))
+        lines.append(_box_sep(width))
+    lines.append(_box_line(width, "Active work (agents ↔ cards)", ANSI["bold"]))
     work_lines = _active_work_lines(data.get("active_work", []))
     for line in work_lines[:8]:
         lines.append(_box_line(width, line))
@@ -360,7 +402,7 @@ def dashboard(conn: sqlite3.Connection) -> str:
         lines.append(_box_line(width, f"… {extra} more active work rows"))
     lane_lines = _pending_lane_lines(data.get("pending_lanes", []))
     if lane_lines:
-        lines.append(_box_line(width, "Unassigned lanes", ANSI["bold"]))
+        lines.append(_box_line(width, "Unassigned cards", ANSI["bold"]))
         for line in lane_lines:
             lines.append(_box_line(width, line))
 
@@ -373,7 +415,7 @@ def dashboard(conn: sqlite3.Connection) -> str:
 
 
 def _active_work_lines(rows: object) -> list[str]:
-    """Render active agent/lane correlations for the compact TUI."""
+    """Render active agent/card correlations for the compact TUI."""
 
     if not isinstance(rows, list) or not rows:
         return ["No active agents or assigned lanes."]
@@ -389,7 +431,8 @@ def _active_work_lines(rows: object) -> list[str]:
         else:
             title = str(row.get("lane_title") or "untitled")
             lane_status = str(row.get("lane_status") or "unknown")
-            lane = f"lane#{lane_id} {lane_status}: {title}"
+            lane_stage = str(row.get("lane_stage") or "unknown")
+            lane = f"card#{lane_id} {lane_stage}/{lane_status}: {title}"
         branch = str(row.get("lane_branch") or row.get("agent_branch") or "")
         if branch:
             lane = f"{lane} ({branch})"
@@ -398,7 +441,7 @@ def _active_work_lines(rows: object) -> list[str]:
 
 
 def _pending_lane_lines(rows: object) -> list[str]:
-    """Render queued or integration-ready lanes that have no active agent."""
+    """Render non-done cards that have no active agent."""
 
     if not isinstance(rows, list) or not rows:
         return []
@@ -406,12 +449,21 @@ def _pending_lane_lines(rows: object) -> list[str]:
     for row in rows:
         lane_id = row.get("id")
         status = str(row.get("status") or "unknown")
+        stage = str(row.get("stage") or "unknown")
         role = str(row.get("role_type") or "Developer")
         title = str(row.get("title") or "untitled")
         branch = str(row.get("branch_name") or "")
         branch_text = f" ({branch})" if branch else ""
-        lines.append(f"lane#{lane_id} {status}/{role}: {title}{branch_text}")
+        lines.append(f"card#{lane_id} {stage}/{status}/{role}: {title}{branch_text}")
     return lines
+
+
+def _card_count_text(rows: object) -> str:
+    """Render card counts in board order."""
+
+    if not isinstance(rows, list) or not rows:
+        return ""
+    return ", ".join(f"{row.get('stage')}={row.get('count')}" for row in rows)
 
 
 def _markdown_context(data: dict[str, object]) -> dict[str, str]:
@@ -424,7 +476,7 @@ def _markdown_context(data: dict[str, object]) -> dict[str, str]:
         "goal": str(goal.get("text", "No goal recorded yet") if isinstance(goal, dict) else "No goal recorded yet"),
         "metric": _metric_text(metric),
         "agents": _markdown_table(data.get("agents", []), ["name", "role", "current_status", "tmux_window", "worktree"]),
-        "work_lanes": _markdown_table(data.get("work_lanes", []), ["id", "title", "role_type", "status", "integration_queue", "expected_metric_impact"]),
+        "work_lanes": _markdown_table(data.get("work_lanes", []), ["id", "title", "role_type", "card_type", "stage", "status", "integration_queue", "expected_metric_impact"]),
         "tests": _test_text(data.get("test_run")),
         "resources": _resource_text(data.get("resources", [])),
         "events": "\n".join(f"- {e['ts']} **{e['type']}**: {e['message']}" for e in data.get("events", [])) or "No events yet.",
@@ -447,7 +499,7 @@ def _html_context(data: dict[str, object]) -> dict[str, str]:
         "resources_html": _html_resource(data.get("resources", [])),
         "tests_html": html.escape(_test_text(data.get("test_run"))).replace("\n", "<br>"),
         "agents_html": _html_table(data.get("agents", []), ["name", "role", "current_status", "tmux_window", "worktree"]),
-        "work_lanes_html": _html_table(data.get("work_lanes", []), ["id", "title", "role_type", "status", "integration_queue", "expected_metric_impact"]),
+        "work_lanes_html": _html_table(data.get("work_lanes", []), ["id", "title", "role_type", "card_type", "stage", "status", "integration_queue", "expected_metric_impact"]),
         "events_html": "<ul>" + "".join(f"<li>{html.escape(e['ts'])} <strong>{html.escape(e['type'])}</strong>: {html.escape(e['message'])}</li>" for e in data.get("events", [])) + "</ul>",
         "next_steps_html": html.escape(_next_steps(data)),
     }

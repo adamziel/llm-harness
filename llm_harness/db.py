@@ -21,6 +21,27 @@ SCHEMA_VERSION = 1
 SQLITE_BUSY_TIMEOUT_MS = 60_000
 AGENT_TERMINAL_STATUSES = ("crash", "success", "stopped")
 AGENT_LIFECYCLE_STATUSES = ("running", *AGENT_TERMINAL_STATUSES)
+CARD_STAGES = ("planned", "development", "review", "integration", "done")
+STATUS_STAGE = {
+    "queued": "planned",
+    "assigned": "development",
+    "active": "development",
+    "working": "development",
+    "needs_verification": "review",
+    "ready_for_integration": "integration",
+    "integrating": "integration",
+    "integration_failed": "integration",
+    "integrated": "done",
+    "done": "done",
+}
+STAGE_STATUS = {
+    "planned": "queued",
+    "development": "assigned",
+    "review": "needs_verification",
+    "integration": "ready_for_integration",
+    "done": "done",
+}
+CODE_PRODUCING_ROLES = {"Developer", "Designer", "Conflict Resolver", "Reproducer"}
 MCP_COMPAT_COLUMNS = {
     "events": [
         ("created_at", "TEXT GENERATED ALWAYS AS (ts) VIRTUAL"),
@@ -228,8 +249,12 @@ def init_db(conn: sqlite3.Connection) -> None:
             acceptance_criteria TEXT NOT NULL DEFAULT '',
             owner_agent_id INTEGER,
             role_type TEXT NOT NULL DEFAULT 'Developer',
+            card_type TEXT NOT NULL DEFAULT 'implementation',
             priority INTEGER NOT NULL DEFAULT 100,
             status TEXT NOT NULL DEFAULT 'queued',
+            stage TEXT NOT NULL DEFAULT 'planned',
+            review_required INTEGER NOT NULL DEFAULT 1,
+            integration_required INTEGER NOT NULL DEFAULT 1,
             base_branch TEXT NOT NULL DEFAULT '',
             branch_name TEXT NOT NULL DEFAULT '',
             worktree_path TEXT NOT NULL DEFAULT '',
@@ -238,11 +263,16 @@ def init_db(conn: sqlite3.Connection) -> None:
             expected_metric_impact REAL NOT NULL DEFAULT 0,
             integration_queue TEXT NOT NULL DEFAULT '',
             test_evidence TEXT NOT NULL DEFAULT '[]',
+            source_key TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
+            planned_at TEXT,
             assigned_at TEXT,
             last_activity_at TEXT,
+            review_ready_at TEXT,
+            reviewed_at TEXT,
             ready_for_integration_at TEXT,
             integrated_at TEXT,
+            done_at TEXT,
             abandoned_at TEXT,
             notes TEXT NOT NULL DEFAULT ''
         );
@@ -268,8 +298,10 @@ def init_db(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
             agent_name TEXT NOT NULL DEFAULT '',
+            card_id INTEGER,
             worklane_id INTEGER,
             role TEXT NOT NULL DEFAULT '',
+            stage TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT '',
             report_json TEXT NOT NULL
         );
@@ -303,6 +335,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             merge_result TEXT NOT NULL DEFAULT '',
             tests_json TEXT NOT NULL DEFAULT '[]',
             failure_reason TEXT,
+            remote_ref TEXT NOT NULL DEFAULT '',
+            remote_sha TEXT NOT NULL DEFAULT '',
+            push_result TEXT NOT NULL DEFAULT '',
             started_at TEXT NOT NULL,
             ended_at TEXT
         );
@@ -316,7 +351,18 @@ def init_db(conn: sqlite3.Connection) -> None:
             prompt TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'queued',
             agent_name TEXT NOT NULL DEFAULT '',
+            card_id INTEGER,
             notes TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS card_stage_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_id INTEGER NOT NULL,
+            from_stage TEXT NOT NULL DEFAULT '',
+            to_stage TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            agent_name TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS resource_samples (
@@ -412,13 +458,18 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
         CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(current_status);
         CREATE INDEX IF NOT EXISTS idx_worklanes_status ON worklanes(status);
+        CREATE INDEX IF NOT EXISTS idx_worklanes_stage ON worklanes(stage, priority, id);
+        CREATE INDEX IF NOT EXISTS idx_worklanes_source_key ON worklanes(source_key, stage, status);
         CREATE INDEX IF NOT EXISTS idx_worklanes_queue ON worklanes(integration_queue, status, priority);
         CREATE INDEX IF NOT EXISTS idx_messages_target_status ON messages(target, status);
         CREATE INDEX IF NOT EXISTS idx_agent_messages_target_status ON agent_messages(target, status);
+        CREATE INDEX IF NOT EXISTS idx_agent_reports_card ON agent_reports(card_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_agent_reports_worklane ON agent_reports(worklane_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_worktrees_owner ON worktrees(owner_agent, status);
         CREATE INDEX IF NOT EXISTS idx_integration_attempts_lane ON integration_attempts(worklane_id, status);
         CREATE INDEX IF NOT EXISTS idx_spawn_requests_status ON spawn_requests(status);
+        CREATE INDEX IF NOT EXISTS idx_spawn_requests_card ON spawn_requests(card_id, status);
+        CREATE INDEX IF NOT EXISTS idx_card_stage_transitions_card ON card_stage_transitions(card_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_resource_samples_ts ON resource_samples(ts DESC);
         CREATE INDEX IF NOT EXISTS idx_metric_samples_ts ON metric_samples(ts DESC);
         CREATE INDEX IF NOT EXISTS idx_test_runs_started ON test_runs(started_at DESC);
@@ -428,11 +479,115 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_code_index_worktree_path ON code_index(worktree, path);
         """
     )
+    ensure_card_schema(conn)
     ensure_worklane_compat(conn)
     ensure_mcp_compat_columns(conn)
     if get_meta(conn, "schema_version") != str(SCHEMA_VERSION):
         set_meta(conn, "schema_version", str(SCHEMA_VERSION))
     conn.commit()
+
+
+def ensure_card_schema(conn: sqlite3.Connection) -> None:
+    """Add card-board columns to older harness databases and backfill stages."""
+
+    _ensure_columns(
+        conn,
+        "worklanes",
+        [
+            ("card_type", "TEXT NOT NULL DEFAULT 'implementation'"),
+            ("stage", "TEXT NOT NULL DEFAULT 'planned'"),
+            ("review_required", "INTEGER NOT NULL DEFAULT 1"),
+            ("integration_required", "INTEGER NOT NULL DEFAULT 1"),
+            ("source_key", "TEXT NOT NULL DEFAULT ''"),
+            ("planned_at", "TEXT"),
+            ("review_ready_at", "TEXT"),
+            ("reviewed_at", "TEXT"),
+            ("done_at", "TEXT"),
+        ],
+    )
+    _ensure_columns(
+        conn,
+        "agent_reports",
+        [
+            ("card_id", "INTEGER"),
+            ("stage", "TEXT NOT NULL DEFAULT ''"),
+        ],
+    )
+    _ensure_columns(
+        conn,
+        "integration_attempts",
+        [
+            ("remote_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("remote_sha", "TEXT NOT NULL DEFAULT ''"),
+            ("push_result", "TEXT NOT NULL DEFAULT ''"),
+        ],
+    )
+    _ensure_columns(conn, "spawn_requests", [("card_id", "INTEGER")])
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS card_stage_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_id INTEGER NOT NULL,
+            from_stage TEXT NOT NULL DEFAULT '',
+            to_stage TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            agent_name TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_worklanes_stage ON worklanes(stage, priority, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_worklanes_source_key ON worklanes(source_key, stage, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_reports_card ON agent_reports(card_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_spawn_requests_card ON spawn_requests(card_id, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_card_stage_transitions_card ON card_stage_transitions(card_id, created_at)")
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE worklanes
+        SET
+            stage = CASE status
+                WHEN 'queued' THEN 'planned'
+                WHEN 'assigned' THEN 'development'
+                WHEN 'active' THEN 'development'
+                WHEN 'working' THEN 'development'
+                WHEN 'needs_verification' THEN 'review'
+                WHEN 'ready_for_integration' THEN 'integration'
+                WHEN 'integrating' THEN 'integration'
+                WHEN 'integration_failed' THEN 'integration'
+                WHEN 'integrated' THEN 'done'
+                WHEN 'done' THEN 'done'
+                ELSE stage
+            END,
+            card_type = CASE
+                WHEN card_type != '' THEN card_type
+                WHEN role_type IN ('Developer', 'Designer', 'Conflict Resolver', 'Reproducer') THEN 'implementation'
+                ELSE 'advisory'
+            END,
+            integration_required = CASE
+                WHEN role_type IN ('Developer', 'Designer', 'Conflict Resolver', 'Reproducer') THEN integration_required
+                ELSE 0
+            END,
+            review_required = CASE WHEN review_required IS NULL THEN 1 ELSE review_required END,
+            planned_at = COALESCE(planned_at, created_at, ?),
+            review_ready_at = CASE WHEN status = 'needs_verification' THEN COALESCE(review_ready_at, last_activity_at, created_at, ?) ELSE review_ready_at END,
+            reviewed_at = CASE WHEN status IN ('ready_for_integration', 'integrating', 'integration_failed') THEN COALESCE(reviewed_at, last_activity_at, created_at, ?) ELSE reviewed_at END,
+            done_at = CASE WHEN status IN ('integrated', 'done') THEN COALESCE(done_at, integrated_at, last_activity_at, created_at, ?) ELSE done_at END
+        """,
+        (now, now, now, now),
+    )
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: Iterable[tuple[str, str]]) -> None:
+    """Add missing SQLite columns using definitions from the current schema."""
+
+    existing = {
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in conn.execute(f"PRAGMA table_xinfo({table})")
+    }
+    for name, definition in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
@@ -481,7 +636,7 @@ def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
         BEGIN
             INSERT INTO worklanes(
                 id, title, role_type, status, branch_name, worktree_path,
-                expected_metric_impact, created_at, last_activity_at, notes
+                expected_metric_impact, stage, integration_required, created_at, planned_at, last_activity_at, notes
             ) VALUES (
                 NEW.id,
                 COALESCE(NEW.title, ''),
@@ -490,6 +645,17 @@ def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
                 COALESCE(NEW.branch, ''),
                 COALESCE(NEW.worktree, ''),
                 COALESCE(NEW.expected_metric_delta, 0),
+                CASE COALESCE(NEW.status, 'queued')
+                    WHEN 'queued' THEN 'planned'
+                    WHEN 'assigned' THEN 'development'
+                    WHEN 'needs_verification' THEN 'review'
+                    WHEN 'ready_for_integration' THEN 'integration'
+                    WHEN 'integration_failed' THEN 'integration'
+                    WHEN 'integrated' THEN 'done'
+                    ELSE 'planned'
+                END,
+                CASE WHEN COALESCE(NEW.role, 'Developer') IN ('Developer', 'Designer', 'Conflict Resolver', 'Reproducer') THEN 1 ELSE 0 END,
+                COALESCE(NEW.ts, datetime('now')),
                 COALESCE(NEW.ts, datetime('now')),
                 COALESCE(NEW.ts, datetime('now')),
                 COALESCE(NEW.notes, '')
@@ -502,6 +668,15 @@ def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
                 title = COALESCE(NEW.title, title),
                 role_type = COALESCE(NEW.role, role_type),
                 status = COALESCE(NEW.status, status),
+                stage = CASE COALESCE(NEW.status, status)
+                    WHEN 'queued' THEN 'planned'
+                    WHEN 'assigned' THEN 'development'
+                    WHEN 'needs_verification' THEN 'review'
+                    WHEN 'ready_for_integration' THEN 'integration'
+                    WHEN 'integration_failed' THEN 'integration'
+                    WHEN 'integrated' THEN 'done'
+                    ELSE stage
+                END,
                 branch_name = COALESCE(NEW.branch, branch_name),
                 worktree_path = COALESCE(NEW.worktree, worktree_path),
                 expected_metric_impact = COALESCE(NEW.expected_metric_delta, expected_metric_impact),
@@ -771,93 +946,333 @@ def queue_worklane(
     goal: str = "",
     acceptance_criteria: str = "",
     expected_metric_impact: float = 0,
+    card_type: str = "",
+    stage: str = "",
+    review_required: bool = True,
+    integration_required: bool | None = None,
+    source_key: str = "",
 ) -> int:
     """Create a refined worklane row and return its durable id."""
 
     now = utc_now()
+    resolved_stage = normalize_stage(stage or stage_for_status(status))
+    resolved_card_type = card_type or card_type_for_role(role_type)
+    resolved_integration_required = role_requires_integration(role_type) if integration_required is None else bool(integration_required)
     cur = conn.execute(
         """
         INSERT INTO worklanes(
-            title, description, goal, acceptance_criteria, role_type, priority,
-            status, expected_metric_impact, created_at, last_activity_at, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            title, description, goal, acceptance_criteria, role_type, card_type, priority,
+            status, stage, review_required, integration_required, expected_metric_impact,
+            source_key, created_at, planned_at, last_activity_at, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (title, description, goal, acceptance_criteria, role_type, priority, status, expected_metric_impact, now, now, notes),
+        (
+            title,
+            description,
+            goal,
+            acceptance_criteria,
+            role_type,
+            resolved_card_type,
+            priority,
+            status,
+            resolved_stage,
+            1 if review_required else 0,
+            1 if resolved_integration_required else 0,
+            expected_metric_impact,
+            source_key,
+            now,
+            now if resolved_stage == "planned" else None,
+            now,
+            notes,
+        ),
     )
-    log_event(conn, "worklane_created", title, payload={"worklane_id": int(cur.lastrowid), "status": status})
-    return int(cur.lastrowid)
+    card_id = int(cur.lastrowid)
+    record_card_transition(conn, card_id, "", resolved_stage, "created")
+    log_event(conn, "worklane_created", title, payload={"worklane_id": card_id, "card_id": card_id, "status": status, "stage": resolved_stage})
+    return card_id
+
+
+def create_card(conn: sqlite3.Connection, title: str, **fields: Any) -> int:
+    """Create a durable card; implementation cards are represented as worklanes."""
+
+    return queue_worklane(conn, title, **fields)
+
+
+def normalize_stage(stage: str) -> str:
+    """Return a known card stage, defaulting unknown input to planned."""
+
+    return stage if stage in CARD_STAGES else "planned"
+
+
+def stage_for_status(status: str) -> str:
+    """Map legacy worklane statuses onto the card board."""
+
+    return STATUS_STAGE.get(status, "planned")
+
+
+def status_for_stage(stage: str, integration_required: bool = True) -> str:
+    """Return the legacy status that best represents a card stage."""
+
+    if stage == "done" and integration_required:
+        return "integrated"
+    return STAGE_STATUS.get(stage, "queued")
+
+
+def card_type_for_role(role_type: str) -> str:
+    """Classify cards by the kind of worker output they authorize."""
+
+    if role_type in {"Coordinator", "Manager"}:
+        return "control-plane"
+    if role_type in {"Integrator", "Verifier", "Auditor", "Conflict Resolver"}:
+        return "integration-support"
+    if role_type in CODE_PRODUCING_ROLES:
+        return "implementation"
+    return "advisory"
+
+
+def role_requires_integration(role_type: str) -> bool:
+    """Return whether this role normally produces source changes to merge."""
+
+    return role_type in CODE_PRODUCING_ROLES
+
+
+def record_card_transition(
+    conn: sqlite3.Connection,
+    card_id: int,
+    from_stage: str,
+    to_stage: str,
+    reason: str = "",
+    agent_name: str = "",
+) -> None:
+    """Append a stage transition audit row."""
+
+    conn.execute(
+        """
+        INSERT INTO card_stage_transitions(card_id, from_stage, to_stage, reason, agent_name, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (card_id, from_stage, to_stage, reason, agent_name, utc_now()),
+    )
 
 
 def claim_next_worklane(conn: sqlite3.Connection, agent_name: str, worktree: str, branch: str) -> sqlite3.Row | None:
-    """Assign the highest-priority queued lane to a developer, if one exists."""
+    """Assign the highest-priority planned implementation card to a developer."""
 
     lane = conn.execute(
         """
         SELECT * FROM worklanes
-        WHERE status = 'queued' AND role_type IN ('Developer', 'Designer')
+        WHERE stage = 'planned' AND role_type IN ('Developer', 'Designer')
         ORDER BY priority ASC, id ASC
         LIMIT 1
         """
     ).fetchone()
     if lane is None:
         return None
+    return assign_card(conn, int(lane["id"]), agent_name, worktree, branch)
+
+
+def assign_card(conn: sqlite3.Connection, card_id: int, agent_name: str, worktree: str = "", branch: str = "") -> sqlite3.Row:
+    """Move one planned card into development and attach it to an agent."""
+
     now = utc_now()
     agent = conn.execute("SELECT id FROM agents WHERE name = ?", (agent_name,)).fetchone()
+    lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+    old_stage = str(lane["stage"] if lane else "")
     conn.execute(
         """
         UPDATE worklanes
-        SET status = 'assigned', owner_agent_id = ?, branch_name = ?, worktree_path = ?,
+        SET status = 'assigned', stage = 'development', owner_agent_id = ?, branch_name = ?, worktree_path = ?,
             assigned_at = ?, last_activity_at = ?
         WHERE id = ?
         """,
-        (agent["id"] if agent else None, branch, worktree, now, now, lane["id"]),
+        (agent["id"] if agent else None, branch, worktree, now, now, card_id),
     )
-    log_event(conn, "worklane_assigned", f"Assigned worklane#{lane['id']} to {agent_name}", agent_name=agent_name, payload={"worklane_id": lane["id"]})
-    return conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane["id"],)).fetchone()
+    if old_stage != "development":
+        record_card_transition(conn, card_id, old_stage, "development", "assigned", agent_name)
+    log_event(conn, "worklane_assigned", f"Assigned worklane#{card_id} to {agent_name}", agent_name=agent_name, payload={"worklane_id": card_id, "card_id": card_id, "stage": "development"})
+    return conn.execute("SELECT * FROM worklanes WHERE id = ?", (card_id,)).fetchone()
 
 
 def update_worklane_status(conn: sqlite3.Connection, lane_id: int, status: str, notes: str | None = None) -> None:
-    """Move one worklane through its per-lane lifecycle."""
+    """Move one worklane through its per-lane lifecycle and card stage."""
 
     now = utc_now()
-    fields = ["status = ?", "last_activity_at = ?"]
-    params: list[Any] = [status, now]
+    row = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+    stage = stage_for_status(status)
+    old_stage = str(row["stage"] if row else "")
+    fields = ["status = ?", "stage = ?", "last_activity_at = ?"]
+    params: list[Any] = [status, stage, now]
     if status == "ready_for_integration":
         fields.extend(["ready_for_integration_at = ?", "integration_queue = ?"])
         params.extend([now, "ready_fast_path"])
     elif status == "integrated":
-        fields.append("integrated_at = ?")
-        params.append(now)
+        fields.extend(["integrated_at = ?", "done_at = ?"])
+        params.extend([now, now])
     elif status == "abandoned":
         fields.append("abandoned_at = ?")
+        params.append(now)
+    if stage == "planned":
+        fields.append("planned_at = COALESCE(planned_at, ?)")
+        params.append(now)
+    elif stage == "review":
+        fields.append("review_ready_at = COALESCE(review_ready_at, ?)")
+        params.append(now)
+    elif stage == "integration":
+        fields.append("reviewed_at = COALESCE(reviewed_at, ?)")
+        params.append(now)
+    elif stage == "done":
+        fields.append("done_at = COALESCE(done_at, ?)")
         params.append(now)
     if notes is not None:
         fields.append("notes = ?")
         params.append(notes)
     params.append(lane_id)
     conn.execute(f"UPDATE worklanes SET {', '.join(fields)} WHERE id = ?", tuple(params))
-    log_event(conn, "worklane_status", f"worklane#{lane_id} -> {status}", payload={"worklane_id": lane_id, "status": status})
+    if old_stage != stage:
+        record_card_transition(conn, lane_id, old_stage, stage, status)
+    log_event(conn, "worklane_status", f"worklane#{lane_id} -> {status}", payload={"worklane_id": lane_id, "card_id": lane_id, "status": status, "stage": stage})
+
+
+def move_card_stage(
+    conn: sqlite3.Connection,
+    card_id: int,
+    stage: str,
+    status: str | None = None,
+    notes: str | None = None,
+    reason: str = "",
+    agent_name: str = "",
+) -> None:
+    """Move a card between board stages using the legacy status for compatibility."""
+
+    target_stage = normalize_stage(stage)
+    row = conn.execute("SELECT * FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"unknown card_id {card_id}")
+    old_stage = str(row["stage"])
+    integration_required = bool(row["integration_required"])
+    next_status = status or status_for_stage(target_stage, integration_required)
+    now = utc_now()
+    fields = ["stage = ?", "status = ?", "last_activity_at = ?"]
+    params: list[Any] = [target_stage, next_status, now]
+    if target_stage == "planned":
+        fields.extend(["planned_at = COALESCE(planned_at, ?)", "owner_agent_id = NULL"])
+        params.append(now)
+    elif target_stage == "development":
+        fields.append("assigned_at = COALESCE(assigned_at, ?)")
+        params.append(now)
+    elif target_stage == "review":
+        fields.append("review_ready_at = COALESCE(review_ready_at, ?)")
+        params.append(now)
+    elif target_stage == "integration":
+        fields.extend(["reviewed_at = COALESCE(reviewed_at, ?)", "ready_for_integration_at = COALESCE(ready_for_integration_at, ?)", "integration_queue = COALESCE(NULLIF(integration_queue, ''), 'ready_fast_path')"])
+        params.extend([now, now])
+    elif target_stage == "done":
+        fields.append("done_at = COALESCE(done_at, ?)")
+        params.append(now)
+        if integration_required:
+            fields.append("integrated_at = COALESCE(integrated_at, ?)")
+            params.append(now)
+    if notes is not None:
+        fields.append("notes = ?")
+        params.append(notes)
+    params.append(card_id)
+    conn.execute(f"UPDATE worklanes SET {', '.join(fields)} WHERE id = ?", tuple(params))
+    if old_stage != target_stage:
+        record_card_transition(conn, card_id, old_stage, target_stage, reason or next_status, agent_name)
+    log_event(conn, "card_stage", f"card#{card_id} {old_stage or '?'} -> {target_stage}", agent_name=agent_name or None, payload={"card_id": card_id, "from_stage": old_stage, "to_stage": target_stage, "status": next_status})
+
+
+def requeue_card(conn: sqlite3.Connection, card_id: int, notes: str | None = None) -> None:
+    """Return a card to planned so Python can assign it again."""
+
+    move_card_stage(conn, card_id, "planned", "queued", notes, reason="requeued")
+
+
+def complete_card(conn: sqlite3.Connection, card_id: int, notes: str | None = None) -> None:
+    """Mark a card done; integration-required cards should only call this after push."""
+
+    row = conn.execute("SELECT integration_required FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+    status = "integrated" if row and row["integration_required"] else "done"
+    move_card_stage(conn, card_id, "done", status, notes, reason="completed")
+
+
+def review_ready_cards(conn: sqlite3.Connection, limit: int = 10) -> int:
+    """Accept structured reports in review and route cards to integration or done."""
+
+    moved = 0
+    rows = conn.execute(
+        """
+        SELECT * FROM worklanes
+        WHERE stage = 'review'
+        ORDER BY priority ASC, review_ready_at IS NULL, review_ready_at ASC, id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    for row in rows:
+        report = conn.execute(
+            "SELECT * FROM agent_reports WHERE card_id = ? OR worklane_id = ? ORDER BY id DESC LIMIT 1",
+            (row["id"], row["id"]),
+        ).fetchone()
+        if report is None:
+            continue
+        if row["integration_required"]:
+            move_card_stage(conn, int(row["id"]), "integration", "ready_for_integration", "Review accepted structured report", reason="review_passed")
+        else:
+            complete_card(conn, int(row["id"]), "Review accepted structured report")
+        moved += 1
+    return moved
 
 
 def record_agent_report(conn: sqlite3.Connection, report: Mapping[str, Any]) -> int:
-    """Store a structured agent report and reflect authoritative lane status."""
+    """Store a structured agent report and route card stages deterministically."""
 
     now = utc_now()
     agent_name = str(report.get("agent_id") or report.get("integrator_id") or report.get("agent_name") or "")
-    lane_value = report.get("worklane_id")
-    lane_id = int(lane_value) if str(lane_value or "").isdigit() else None
+    card_value = report.get("card_id") or report.get("worklane_id")
+    lane_id = int(card_value) if str(card_value or "").isdigit() else None
+    reported_stage = str(report.get("stage") or "")
     status = str(report.get("status") or "")
     agent = conn.execute("SELECT role FROM agents WHERE name = ?", (agent_name,)).fetchone()
     cur = conn.execute(
         """
-        INSERT INTO agent_reports(created_at, agent_name, worklane_id, role, status, report_json)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO agent_reports(created_at, agent_name, card_id, worklane_id, role, stage, status, report_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (now, agent_name, lane_id, agent["role"] if agent else "", status, json.dumps(report, sort_keys=True)),
+        (now, agent_name, lane_id, lane_id, agent["role"] if agent else "", reported_stage, status, json.dumps(report, sort_keys=True)),
     )
-    if lane_id and status:
-        update_worklane_status(conn, lane_id, status, str(report.get("summary") or ""))
-    log_event(conn, "agent_report", f"{agent_name or 'agent'} reported {status or 'status'}", agent_name=agent_name, payload={"report_id": int(cur.lastrowid), "worklane_id": lane_id})
+    accepted = bool(lane_id and reported_stage and status)
+    if accepted:
+        lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+        if lane is None:
+            accepted = False
+        elif lane["stage"] == "development" and status in {"ready_for_review", "needs_verification", "ready_for_integration", "completed", "complete"}:
+            move_card_stage(conn, lane_id, "review", "needs_verification", str(report.get("summary") or ""), reason="agent_report", agent_name=agent_name)
+        elif lane["stage"] == "review" and status in {"review_passed", "accepted", "ready_for_integration", "done"}:
+            if lane["integration_required"]:
+                move_card_stage(conn, lane_id, "integration", "ready_for_integration", str(report.get("summary") or ""), reason="review_report", agent_name=agent_name)
+            else:
+                complete_card(conn, lane_id, str(report.get("summary") or ""))
+        elif status in {"blocked", "failed"}:
+            conn.execute(
+                "UPDATE worklanes SET status = ?, notes = ?, last_activity_at = ? WHERE id = ?",
+                (status, str(report.get("summary") or ""), now, lane_id),
+            )
+    elif lane_id and status:
+        log_event(
+            conn,
+            "agent_report_rejected",
+            "agent_report did not include required card_id/worklane_id, stage, and status; card state was not changed",
+            agent_name=agent_name,
+            payload={"report_id": int(cur.lastrowid), "card_id": lane_id, "status": status, "stage": reported_stage},
+        )
+    log_event(
+        conn,
+        "agent_report",
+        f"{agent_name or 'agent'} reported {status or 'status'}",
+        agent_name=agent_name,
+        payload={"report_id": int(cur.lastrowid), "worklane_id": lane_id, "card_id": lane_id, "accepted": accepted},
+    )
     conn.commit()
     return int(cur.lastrowid)
 
@@ -940,15 +1355,44 @@ def queue_spawn_request(
 ) -> int:
     """Route sub-agent spawning requests through scheduler-owned state."""
 
+    normalized_role = "Coordinator" if role == "Manager" else role
+    card_id = find_or_create_card(
+        conn,
+        source_key=f"spawn:{normalized_role}:{title}",
+        title=title,
+        role_type=normalized_role,
+        description=prompt,
+        notes=notes,
+        priority=25 if normalized_role != "Developer" else 100,
+        integration_required=role_requires_integration(normalized_role),
+    )
     cur = conn.execute(
         """
-        INSERT INTO spawn_requests(ts, requester, role, title, prompt, notes)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO spawn_requests(ts, requester, role, title, prompt, card_id, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (utc_now(), requester, role, title, prompt, notes),
+        (utc_now(), requester, role, title, prompt, card_id, notes),
     )
-    log_event(conn, "spawn_request", f"{requester or 'agent'} requested {role}: {title}")
+    log_event(conn, "spawn_request", f"{requester or 'agent'} requested {normalized_role}: {title}", payload={"card_id": card_id})
     return int(cur.lastrowid)
+
+
+def find_or_create_card(conn: sqlite3.Connection, source_key: str, title: str, **fields: Any) -> int:
+    """Return an unresolved card for a deterministic source, creating one if needed."""
+
+    if source_key:
+        existing = conn.execute(
+            """
+            SELECT id FROM worklanes
+            WHERE source_key = ? AND stage != 'done' AND status NOT IN ('abandoned', 'cancelled', 'stale')
+            ORDER BY id LIMIT 1
+            """,
+            (source_key,),
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
+    fields.setdefault("source_key", source_key)
+    return create_card(conn, title, **fields)
 
 
 def next_spawn_requests(conn: sqlite3.Connection, limit: int = 5) -> list[sqlite3.Row]:

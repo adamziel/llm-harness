@@ -238,12 +238,12 @@ class HarnessTests(unittest.TestCase):
                 self.assertIn("Last generated", text)
                 self.assertIn("Progress", text)
                 self.assertIn("Agents: 1 active, 1 crashed, 3 tracked", text)
-                self.assertIn("Active work (agents ↔ lanes)", text)
-                self.assertIn("developer-1 [Developer/working] → lane#", text)
+                self.assertIn("Active work (agents ↔ cards)", text)
+                self.assertIn("developer-1 [Developer/working] → card#", text)
                 self.assertIn("Fix parser lowering", text)
-                self.assertIn("Unassigned lanes", text)
-                self.assertIn(f"lane#{queued_lane_id} queued/Developer: Review queued runtime lane", text)
-                self.assertIn(f"lane#{ready_lane_id} ready_for_integration/Developer: Merge finished runtime lane (work/developer-99)", text)
+                self.assertIn("Unassigned cards", text)
+                self.assertIn(f"card#{queued_lane_id} planned/queued/Developer: Review queued runtime lane", text)
+                self.assertIn(f"card#{ready_lane_id} integration/ready_for_integration/Developer: Merge finished runtime lane", text)
                 self.assertIn("status is alive", text)
 
     def test_status_update_commits_and_pushes_status_artifacts(self):
@@ -270,6 +270,24 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("Publish status", remote_status)
             staged = subprocess.check_output(["git", "diff", "--cached", "--name-only"], cwd=root, text=True).strip()
             self.assertEqual(staged, "")
+
+    def test_dashboard_marks_uncarded_active_specialist_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(
+                    conn,
+                    name="architect-1",
+                    role="Architect",
+                    current_status="working",
+                    cwd=tmp,
+                    tmux_pane="%architect",
+                    notes="Investigate repeated failures",
+                )
+                text = dashboard(conn)
+            self.assertIn("Uncarded active work", text)
+            self.assertIn("architect-1 [Architect] has no card", text)
 
     def test_integrate_once_merges_pushes_and_deletes_ready_branch(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
@@ -301,11 +319,51 @@ class HarnessTests(unittest.TestCase):
 
             self.assertEqual(result["integrated"], 1)
             self.assertEqual(lane["status"], "integrated")
+            self.assertEqual(lane["stage"], "done")
             self.assertEqual(attempt["status"], "integrated")
+            self.assertEqual(attempt["remote_ref"], "origin/master")
+            self.assertTrue(attempt["remote_sha"])
             remote_file = subprocess.check_output(["git", f"--git-dir={remote}", "show", "master:compiler.rs"], text=True)
             self.assertIn("feature", remote_file)
             branch_exists = subprocess.run(["git", f"--git-dir={remote}", "show-ref", "--verify", "refs/heads/work/developer-1"], capture_output=True)
             self.assertNotEqual(branch_exists.returncode, 0)
+
+    def test_integrate_once_failed_push_keeps_card_out_of_done(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=root, check=True)
+            (root / "compiler.rs").write_text("base\n")
+            subprocess.run(["git", "add", "compiler.rs"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "Initial"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "init", "--bare", remote], check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", remote], cwd=root, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "work/developer-1"], cwd=root, check=True, capture_output=True)
+            (root / "compiler.rs").write_text("base\nfeature\n")
+            subprocess.run(["git", "commit", "-am", "Add feature"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "push", "-u", "origin", "work/developer-1"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "master"], cwd=root, check=True, capture_output=True)
+            hook = Path(remote) / "hooks" / "pre-receive"
+            hook.write_text("#!/bin/sh\necho rejected >&2\nexit 1\n")
+            hook.chmod(0o755)
+
+            paths = db.bootstrap(root)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                lane_id = db.queue_worklane(conn, "Integrate feature", status="ready_for_integration")
+                conn.execute("UPDATE worklanes SET branch_name = ? WHERE id = ?", ("work/developer-1", lane_id))
+                result = integrate_once(conn, root)
+                lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+                attempt = conn.execute("SELECT * FROM integration_attempts WHERE worklane_id = ?", (lane_id,)).fetchone()
+
+            self.assertEqual(result["failed"], 1)
+            self.assertEqual((lane["stage"], lane["status"]), ("integration", "integration_failed"))
+            self.assertEqual(attempt["merge_result"], "push_failed")
+            self.assertEqual(attempt["remote_sha"], "")
+            self.assertIn("rejected", attempt["push_result"])
 
     def test_integrate_once_records_conflicts_without_running_full_tests(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
@@ -340,6 +398,7 @@ class HarnessTests(unittest.TestCase):
 
             self.assertEqual(result["failed"], 1)
             self.assertEqual(lane["status"], "integration_failed")
+            self.assertEqual(lane["stage"], "integration")
             self.assertEqual(attempt["merge_result"], "merge_conflicts")
             self.assertEqual(json.loads(attempt["tests_json"]), [])
 
@@ -424,6 +483,7 @@ class HarnessTests(unittest.TestCase):
                     row["name"]
                     for row in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
                 }
+                columns = {row["name"] for row in conn.execute("PRAGMA table_xinfo(worklanes)")}
             for name in {
                 "runs",
                 "agents",
@@ -440,8 +500,11 @@ class HarnessTests(unittest.TestCase):
                 "resource_samples",
                 "status_snapshots",
                 "settings",
+                "card_stage_transitions",
             }:
                 self.assertIn(name, names)
+            for column in {"card_type", "stage", "review_required", "integration_required", "planned_at", "review_ready_at", "reviewed_at", "done_at", "source_key"}:
+                self.assertIn(column, columns)
 
     def test_work_lanes_compat_view_creation_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -455,34 +518,75 @@ class HarnessTests(unittest.TestCase):
                 lane = conn.execute("SELECT * FROM worklanes WHERE title = 'lane'").fetchone()
             self.assertEqual(lane["status"], "queued")
 
-    def test_agent_report_updates_worklane_status(self):
+    def test_agent_report_moves_development_card_to_review_then_integration(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
                 lane_id = db.queue_worklane(conn, "Implement focused fix", acceptance_criteria="Focused test passes")
                 db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", cwd=tmp)
+                agent = conn.execute("SELECT * FROM agents WHERE name = 'developer-1'").fetchone()
+                db.assign_card(conn, lane_id, "developer-1")
             server = HarnessMCP(tmp, paths.db)
             result = server.call_tool(
                 "agent_report",
                 {
                     "agent_id": "developer-1",
+                    "card_id": str(lane_id),
                     "worklane_id": str(lane_id),
-                    "status": "ready_for_integration",
+                    "stage": "development",
+                    "status": "ready_for_review",
                     "summary": "Implemented and tested",
                     "files_changed": ["x.py"],
                     "commits": ["abc"],
                     "tests_run": ["python -m unittest"],
                     "test_result": "pass",
                     "blockers": [],
-                    "next_action": "integrate",
+                    "next_action": "review",
                 },
             )
             self.assertIn('"ok": true', result["content"][0]["text"])
             with db.connect(paths.db) as conn:
                 lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
-                self.assertEqual(lane["status"], "ready_for_integration")
+                self.assertEqual((lane["stage"], lane["status"]), ("review", "needs_verification"))
                 self.assertEqual(conn.execute("SELECT COUNT(*) AS count FROM agent_reports").fetchone()["count"], 1)
+                moved = db.review_ready_cards(conn)
+                lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+                self.assertEqual(moved, 1)
+                self.assertEqual((lane["stage"], lane["status"]), ("integration", "ready_for_integration"))
+
+    def test_non_code_card_moves_from_review_to_done_without_integration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                card_id = db.create_card(
+                    conn,
+                    "Reconsider integration backpressure",
+                    role_type="Architect",
+                    integration_required=False,
+                    acceptance_criteria="Report identifies follow-up cards.",
+                )
+                db.upsert_agent(conn, name="architect-1", role="Architect", current_status="running", cwd=tmp)
+                db.assign_card(conn, card_id, "architect-1")
+            server = HarnessMCP(tmp, paths.db)
+            server.call_tool(
+                "agent_report",
+                {
+                    "agent_id": "architect-1",
+                    "card_id": str(card_id),
+                    "worklane_id": str(card_id),
+                    "stage": "development",
+                    "status": "ready_for_review",
+                    "summary": "Advisory report complete",
+                    "next_action": "accept",
+                },
+            )
+            with db.connect(paths.db) as conn:
+                moved = db.review_ready_cards(conn)
+                card = conn.execute("SELECT * FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+            self.assertEqual(moved, 1)
+            self.assertEqual((card["stage"], card["status"], card["integration_required"]), ("done", "done", 0))
 
     def test_mcp_activity_status_keeps_agent_lifecycle_running(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -536,8 +640,7 @@ class HarnessTests(unittest.TestCase):
         specs = {spec.name: spec.min_count for spec in specs_for_team("building")}
         self.assertEqual(specs["Coordinator"], 1)
         self.assertEqual(specs["Developer"], 4)
-        self.assertEqual(specs["Integrator"], 1)
-        self.assertEqual(set(specs), {"Coordinator", "Developer", "Integrator"})
+        self.assertEqual(set(specs), {"Coordinator", "Developer"})
 
     def test_missing_development_md_is_created_before_agents_start(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -616,6 +719,14 @@ class HarnessTests(unittest.TestCase):
                 from llm_harness.testing_loop import queue_test_fix_lane, resolve_fixed_tests
 
                 queue_test_fix_lane(conn, fail_id, [{"nodeid": "tests/test_x.py::test_a", "status": "failed"}], "bad")
+                second_fail_id = db.record_test_run(
+                    conn,
+                    command="manual",
+                    status="failed",
+                    full_log="tests/test_x.py::test_a FAILED again",
+                    results=[{"nodeid": "tests/test_x.py::test_a", "status": "failed"}],
+                )
+                queue_test_fix_lane(conn, second_fail_id, [{"nodeid": "tests/test_x.py::test_a", "status": "failed"}], "bad")
                 self.assertEqual(conn.execute("SELECT COUNT(*) AS count FROM work_lanes").fetchone()["count"], 1)
                 resolve_fixed_tests(conn, [{"nodeid": "tests/test_x.py::test_a", "status": "passed"}], "good")
                 bug = conn.execute("SELECT * FROM bug_reports WHERE test_nodeid = 'tests/test_x.py::test_a'").fetchone()
@@ -650,7 +761,7 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("Default to supervisor/read-only mode", (root / ".harness" / "prompts" / "manhole.md").read_text())
             with db.connect(root / ".harness" / "harness.sqlite3") as conn:
                 agents = db.list_agents(conn)
-                self.assertGreaterEqual(len(agents), 2)
+                self.assertEqual([agent["role"] for agent in agents], ["Coordinator"])
                 self.assertEqual(db.get_meta(conn, "red_banner"), "")
                 self.assertEqual(db.get_meta(conn, "harness_stopped"), "0")
 
@@ -708,7 +819,7 @@ class HarnessTests(unittest.TestCase):
             spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
             self.assertEqual(spawned_developers, [])
 
-    def test_developer_spawn_requests_are_rejected_without_queued_lanes(self):
+    def test_developer_spawn_requests_create_a_card_before_starting_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
             fake = FakeTmux()
@@ -718,11 +829,11 @@ class HarnessTests(unittest.TestCase):
                 request_id = db.queue_spawn_request(conn, role="Developer", title="extra", prompt="do work")
                 scheduler.handle_spawn_requests(conn, "building")
                 request = conn.execute("SELECT * FROM spawn_requests WHERE id = ?", (request_id,)).fetchone()
-                event = conn.execute("SELECT * FROM events WHERE type = 'spawn_rejected' ORDER BY id DESC LIMIT 1").fetchone()
+                card = conn.execute("SELECT * FROM worklanes WHERE id = ?", (request["card_id"],)).fetchone()
             spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
-            self.assertEqual(spawned_developers, [])
-            self.assertEqual(request["status"], "rejected")
-            self.assertIn("no queued Developer worklane", event["message"])
+            self.assertEqual(spawned_developers, ["developer-1"])
+            self.assertEqual(request["status"], "started")
+            self.assertEqual((card["stage"], card["status"]), ("development", "assigned"))
 
     def test_developer_spawn_requests_respect_team_capacity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -981,7 +1092,10 @@ class HarnessTests(unittest.TestCase):
                 scheduler.prompt_auditor(conn, "check this")
                 stale = conn.execute("SELECT * FROM agents WHERE name = 'auditor-1'").fetchone()
             self.assertEqual(stale["current_status"], "crash")
-            self.assertEqual(fake.sent, [("%live", "check this")])
+            self.assertEqual(len(fake.sent), 1)
+            self.assertEqual(fake.sent[0][0], "%live")
+            self.assertIn("Assigned card #", fake.sent[0][1])
+            self.assertIn("check this", fake.sent[0][1])
 
     def test_prompt_coordinator_reuses_active_coordinator(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -994,7 +1108,10 @@ class HarnessTests(unittest.TestCase):
                 scheduler.prompt_coordinator(conn, "reorganize")
             coordinator_windows = [window for _, window, _ in fake.commands if window.startswith("coordinator-")]
             self.assertEqual(coordinator_windows, [])
-            self.assertEqual(fake.sent, [("%coordinator", "reorganize")])
+            self.assertEqual(len(fake.sent), 1)
+            self.assertEqual(fake.sent[0][0], "%coordinator")
+            self.assertIn("Assigned card #", fake.sent[0][1])
+            self.assertIn("reorganize", fake.sent[0][1])
 
     def test_architect_spawn_requests_reuse_one_active_architect(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1017,7 +1134,9 @@ class HarnessTests(unittest.TestCase):
             architect_windows = [window for _, window, _ in fake.commands if window.startswith("architect-")]
             self.assertEqual(architect_windows, [])
             self.assertEqual([request["agent_name"] for request in requests], ["architect-1", "architect-1", "architect-1"])
-            self.assertEqual(len(fake.sent), 3)
+            self.assertEqual(len(fake.sent), 1)
+            self.assertTrue(all(request["card_id"] for request in requests))
+            self.assertEqual([request["status"] for request in requests], ["started", "deferred", "deferred"])
 
 
 if __name__ == "__main__":
