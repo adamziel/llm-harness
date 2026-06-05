@@ -118,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "agents":
         with db.connect(paths.db) as conn:
             db.init_db(conn)
-            rows = [dict(row) for row in db.list_agents(conn)]
+            rows = [_agent_with_card(conn, row) for row in db.list_agents(conn)]
             print(json.dumps(rows, indent=2, sort_keys=True))
         return 0
     if args.command == "update-status":
@@ -174,6 +174,32 @@ def _hidden_command(subparsers: argparse._SubParsersAction, name: str) -> argpar
     parser = subparsers.add_parser(name, help=argparse.SUPPRESS)
     subparsers._choices_actions = [action for action in subparsers._choices_actions if action.dest != name]
     return parser
+
+
+def _agent_with_card(conn, agent) -> dict[str, object]:
+    """Render agent JSON with the current card attachment used by status."""
+
+    row = dict(agent)
+    card = conn.execute(
+        """
+        SELECT id, title, stage, status
+        FROM worklanes
+        WHERE stage = 'development'
+          AND (
+            owner_agent_id = ?
+            OR (? != '' AND branch_name = ?)
+            OR (? != '' AND worktree_path = ?)
+          )
+        ORDER BY id
+        LIMIT 1
+        """,
+        (agent["id"], agent["branch"], agent["branch"], agent["worktree"], agent["worktree"]),
+    ).fetchone()
+    row["card_id"] = card["id"] if card else None
+    row["card_title"] = card["title"] if card else ""
+    row["card_stage"] = card["stage"] if card else ""
+    row["card_status"] = card["status"] if card else ""
+    return row
 
 
 def _mcp_config(root: Path) -> dict[str, object]:

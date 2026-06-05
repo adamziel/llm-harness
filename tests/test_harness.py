@@ -622,6 +622,21 @@ class HarnessTests(unittest.TestCase):
         self.assertNotIn("integrate", completed.stdout)
         self.assertNotIn("mcp-config", completed.stdout)
 
+    def test_agents_command_includes_card_attachment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", cwd=tmp, branch="work/developer-1")
+                card_id = db.queue_worklane(conn, "Card-backed work")
+                db.assign_card(conn, card_id, "developer-1", branch="work/developer-1")
+            root = Path(__file__).resolve().parents[1]
+            completed = subprocess.run([sys.executable, str(root / "harness"), "--root", tmp, "agents"], text=True, capture_output=True, check=True)
+            agents = json.loads(completed.stdout)
+            self.assertEqual(agents[0]["card_id"], card_id)
+            self.assertEqual(agents[0]["card_stage"], "development")
+            self.assertEqual(agents[0]["card_title"], "Card-backed work")
+
     def test_version_flag_prints_package_version(self):
         root = Path(__file__).resolve().parents[1]
         completed = subprocess.run([sys.executable, str(root / "harness"), "-v"], text=True, capture_output=True, check=True)
