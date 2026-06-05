@@ -74,6 +74,11 @@ class Tmux:
         result = self.run(["capture-pane", "-p", "-t", target, "-S", f"-{lines}"], check=False)
         return result.stdout if result.returncode == 0 else ""
 
+    def target_exists(self, target: str) -> bool:
+        """Return whether a pane/window target still exists in tmux."""
+
+        return self.run(["display-message", "-p", "-t", target, "#{pane_id}"], check=False).returncode == 0
+
     def switch_to(self, session: str, window: str) -> None:
         """Show the status window when the user is already inside tmux."""
 

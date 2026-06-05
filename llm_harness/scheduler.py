@@ -20,7 +20,8 @@ from .roles import prompt_for_role, slug_role, specs_for_team
 from .status import refresh_reports
 from .tmux import Tmux, TmuxUnavailable, shell_command
 
-IDLE_SECONDS = 5 * 60
+IDLE_SECONDS = 30 * 60
+IDLE_PROMPT_SECONDS = 30 * 60
 JANITOR_SECONDS = 60 * 60
 LOW_RESOURCE_SECONDS = 60
 HIGH_RESOURCE_SECONDS = 30
@@ -274,6 +275,10 @@ class HarnessScheduler:
         now = time.time()
         for agent in agents:
             target = agent["tmux_pane"] or f"{agent['tmux_session']}:{agent['tmux_window']}"
+            if target and hasattr(self.tmux, "target_exists") and not self.tmux.target_exists(target):
+                db.update_agent_status(conn, agent["name"], "crash", "tmux pane no longer exists", ended=True)
+                db.log_event(conn, "agent_missing", f"{agent['name']} tmux pane no longer exists", agent_name=agent["name"])
+                continue
             pane_text = ""
             if target:
                 try:
@@ -284,7 +289,11 @@ class HarnessScheduler:
                 self.prompt_auditor(conn, f"Investigate suspicious sleep command in {agent['name']} and get it back to measurable work.")
             last_seen = _parse_epoch(agent["last_seen_at"])
             if last_seen and now - last_seen > IDLE_SECONDS:
-                self.prompt_auditor(conn, f"{agent['name']} appears idle for more than 5 minutes. Diagnose and force progress toward the metric.")
+                last_prompt = _parse_epoch(agent["last_prompt_at"])
+                if not last_prompt or now - last_prompt > IDLE_PROMPT_SECONDS:
+                    self.prompt_auditor(conn, f"{agent['name']} appears idle for more than {IDLE_SECONDS // 60} minutes. Diagnose and force progress toward the metric.")
+                    conn.execute("UPDATE agents SET last_prompt_at = ? WHERE name = ?", (db.utc_now(), agent["name"]))
+                    conn.commit()
 
     def check_progress_stall(self, conn: sqlite3.Connection) -> None:
         """Raise a visible alert if the progress metric has not increased in 30 minutes."""

@@ -7,13 +7,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from llm_harness import __version__, db
 from llm_harness.codex import CODEX_MODEL, CODEX_REASONING_EFFORT, build_codex_command
 from llm_harness.mcp_server import HarnessMCP, serve
 from llm_harness.roles import developer_count_for_building, specs_for_team
-from llm_harness.scheduler import HarnessScheduler
+from llm_harness.scheduler import IDLE_PROMPT_SECONDS, IDLE_SECONDS, HarnessScheduler
 from llm_harness.status import dashboard, refresh_reports
 from llm_harness.testing_loop import parse_test_output, run_tests_once
 from llm_harness.tmux import TmuxPane
@@ -36,6 +37,9 @@ class FakeTmux:
 
     def capture(self, target, lines=200):
         return "working"
+
+    def target_exists(self, target):
+        return True
 
     def send_prompt(self, target, message):
         self.sent.append((target, message))
@@ -201,6 +205,39 @@ class HarnessTests(unittest.TestCase):
             with db.connect(root / ".harness" / "harness.sqlite3") as conn:
                 agents = db.list_agents(conn)
                 self.assertGreaterEqual(len(agents), 3)
+
+    def test_liveness_marks_missing_tmux_panes_crashed(self):
+        class MissingTmux(FakeTmux):
+            def target_exists(self, target):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=MissingTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%missing", cwd=tmp)
+                scheduler.check_agent_liveness(conn)
+                agent = db.list_agents(conn)[0]
+                self.assertEqual(agent["current_status"], "crash")
+                self.assertIn("tmux pane no longer exists", agent["notes"])
+
+    def test_idle_liveness_prompts_are_throttled(self):
+        old = (datetime.now(timezone.utc) - timedelta(seconds=max(IDLE_SECONDS, IDLE_PROMPT_SECONDS) + 1)).isoformat(timespec="seconds")
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="auditor-1", role="Auditor", current_status="running", tmux_pane="%auditor", cwd=tmp)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer", cwd=tmp)
+                conn.execute("UPDATE agents SET last_seen_at = ?, last_prompt_at = ? WHERE name = 'developer-1'", (old, old))
+                conn.commit()
+                scheduler.check_agent_liveness(conn)
+                scheduler.check_agent_liveness(conn)
+            self.assertEqual(len(fake.sent), 1)
+            self.assertIn("30 minutes", fake.sent[0][1])
 
 
 if __name__ == "__main__":
