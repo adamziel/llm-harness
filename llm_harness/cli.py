@@ -10,6 +10,7 @@ from pathlib import Path
 from . import __version__
 from . import db
 from .indexer import refresh_index
+from .integration import integrate_once
 from .janitor import run_janitor
 from .mcp_server import main as mcp_main
 from .scheduler import HarnessScheduler, nixos_service, watchdog_loop, watchdog_service
@@ -49,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _hidden_command(sub, "update-status")
     _hidden_command(sub, "janitor")
+    _hidden_command(sub, "integrate")
 
     test_loop = _hidden_command(sub, "test-loop")
     test_loop.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
@@ -125,6 +127,12 @@ def main(argv: list[str] | None = None) -> int:
         with db.connect(paths.db) as conn:
             db.init_db(conn)
             result = run_janitor(conn, root)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "integrate":
+        with db.connect(paths.db) as conn:
+            db.init_db(conn)
+            result = integrate_once(conn, root)
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "test-loop":

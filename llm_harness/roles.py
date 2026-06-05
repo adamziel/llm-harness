@@ -124,7 +124,8 @@ Developers and Integrators flowing without blocking the whole harness.
     "Integrator": """
 You are the Integrator. Continuously scan ready_for_integration worklanes, favor low-conflict fast-path work, use bounded
 integration attempts, run targeted smoke checks, and requeue conflicted or failing lanes with actionable detail instead of
-blocking on one bad branch.
+blocking on one bad branch. The deterministic `./harness integrate` loop owns routine merges and pushes; do not run the
+full test suite as part of integration because `./harness test-loop` runs it continuously in a separate support window.
 """,
     "Lane Scout": """
 You are a short-lived Lane Scout. Find independently executable worklanes such as isolated modules, clear failing tests,

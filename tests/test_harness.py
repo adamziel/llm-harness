@@ -8,13 +8,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 from llm_harness import __version__, db
 from llm_harness.codex import CODEX_MODEL, CODEX_REASONING_EFFORT, build_codex_command
+from llm_harness.integration import integrate_once
 from llm_harness.mcp_server import HarnessMCP, serve
 from llm_harness.roles import developer_count_for_building, specs_for_team
 from llm_harness.scheduler import AUDITOR_SPAWN_SECONDS, IDLE_PROMPT_SECONDS, IDLE_SECONDS, HarnessScheduler
@@ -93,7 +93,14 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(row["tmux_pane"], "%1")
                 self.assertIn("worktrees", row["worktree"])
 
-    def test_db_connect_falls_back_when_wal_is_unavailable(self):
+    def test_db_connect_prefers_turso_mvcc_then_wal(self):
+        class FakeCursor:
+            def __init__(self, value):
+                self.value = value
+
+            def fetchone(self):
+                return (self.value,)
+
         class FakeConnection:
             def __init__(self):
                 self.executed = []
@@ -102,9 +109,11 @@ class HarnessTests(unittest.TestCase):
 
             def execute(self, sql):
                 self.executed.append(sql)
-                if sql == "PRAGMA journal_mode = WAL":
-                    raise sqlite3.OperationalError("disk I/O error")
-                return None
+                if sql == "PRAGMA journal_mode = mvcc":
+                    return FakeCursor("delete")
+                if sql == "PRAGMA journal_mode = wal":
+                    return FakeCursor("wal")
+                return FakeCursor("")
 
             def close(self):
                 self.closed = True
@@ -114,8 +123,61 @@ class HarnessTests(unittest.TestCase):
             with mock.patch("llm_harness.db.sqlite3.connect", return_value=fake):
                 with db.connect(Path(tmp) / "missing-parent" / "harness.sqlite3") as conn:
                     self.assertIs(conn, fake)
-            self.assertIn("PRAGMA journal_mode = DELETE", fake.executed)
+            self.assertIn("PRAGMA journal_mode = mvcc", fake.executed)
+            self.assertIn("PRAGMA journal_mode = wal", fake.executed)
             self.assertTrue(fake.closed)
+
+    def test_db_connect_keeps_turso_mvcc_when_available(self):
+        class FakeCursor:
+            def __init__(self, value):
+                self.value = value
+
+            def fetchone(self):
+                return (self.value,)
+
+        class FakeConnection:
+            def __init__(self):
+                self.executed = []
+                self.row_factory = None
+
+            def execute(self, sql):
+                self.executed.append(sql)
+                if sql == "PRAGMA journal_mode = mvcc":
+                    return FakeCursor("mvcc")
+                return FakeCursor("")
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeConnection()
+            with mock.patch("llm_harness.db.sqlite3.connect", return_value=fake):
+                with db.connect(Path(tmp) / "harness.sqlite3"):
+                    pass
+            self.assertIn("PRAGMA journal_mode = mvcc", fake.executed)
+            self.assertNotIn("PRAGMA journal_mode = wal", fake.executed)
+
+    def test_begin_concurrent_starts_turso_mvcc_transaction(self):
+        class FakeCursor:
+            def __init__(self, value):
+                self.value = value
+
+            def fetchone(self):
+                return (self.value,)
+
+        class FakeConnection:
+            def __init__(self):
+                self.executed = []
+
+            def execute(self, sql):
+                self.executed.append(sql)
+                if sql == "PRAGMA journal_mode":
+                    return FakeCursor("mvcc")
+                return FakeCursor("")
+
+        fake = FakeConnection()
+        self.assertTrue(db.begin_concurrent(fake))  # type: ignore[arg-type]
+        self.assertEqual(fake.executed, ["PRAGMA journal_mode", "BEGIN CONCURRENT"])
 
     def test_codex_command_is_pinned_to_yolo_and_model(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -191,6 +253,78 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("Publish status", remote_status)
             staged = subprocess.check_output(["git", "diff", "--cached", "--name-only"], cwd=root, text=True).strip()
             self.assertEqual(staged, "")
+
+    def test_integrate_once_merges_pushes_and_deletes_ready_branch(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=root, check=True)
+            (root / "compiler.rs").write_text("base\n")
+            subprocess.run(["git", "add", "compiler.rs"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "Initial"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "init", "--bare", remote], check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", remote], cwd=root, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "work/developer-1"], cwd=root, check=True, capture_output=True)
+            (root / "compiler.rs").write_text("base\nfeature\n")
+            subprocess.run(["git", "commit", "-am", "Add feature"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "push", "-u", "origin", "work/developer-1"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "master"], cwd=root, check=True, capture_output=True)
+
+            paths = db.bootstrap(root)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                lane_id = db.queue_worklane(conn, "Integrate feature", status="needs_verification")
+                conn.execute("UPDATE worklanes SET branch_name = ? WHERE id = ?", ("work/developer-1", lane_id))
+                result = integrate_once(conn, root)
+                lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+                attempt = conn.execute("SELECT * FROM integration_attempts WHERE worklane_id = ?", (lane_id,)).fetchone()
+
+            self.assertEqual(result["integrated"], 1)
+            self.assertEqual(lane["status"], "integrated")
+            self.assertEqual(attempt["status"], "integrated")
+            remote_file = subprocess.check_output(["git", f"--git-dir={remote}", "show", "master:compiler.rs"], text=True)
+            self.assertIn("feature", remote_file)
+            branch_exists = subprocess.run(["git", f"--git-dir={remote}", "show-ref", "--verify", "refs/heads/work/developer-1"], capture_output=True)
+            self.assertNotEqual(branch_exists.returncode, 0)
+
+    def test_integrate_once_records_conflicts_without_running_full_tests(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=root, check=True)
+            (root / "compiler.rs").write_text("base\n")
+            subprocess.run(["git", "add", "compiler.rs"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "Initial"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "init", "--bare", remote], check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", remote], cwd=root, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "work/developer-1"], cwd=root, check=True, capture_output=True)
+            (root / "compiler.rs").write_text("branch\n")
+            subprocess.run(["git", "commit", "-am", "Branch edit"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "push", "-u", "origin", "work/developer-1"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "master"], cwd=root, check=True, capture_output=True)
+            (root / "compiler.rs").write_text("master\n")
+            subprocess.run(["git", "commit", "-am", "Master edit"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "push", "origin", "master"], cwd=root, check=True, capture_output=True)
+
+            paths = db.bootstrap(root)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                lane_id = db.queue_worklane(conn, "Conflicting feature", status="ready_for_integration")
+                conn.execute("UPDATE worklanes SET branch_name = ? WHERE id = ?", ("work/developer-1", lane_id))
+                result = integrate_once(conn, root)
+                lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+                attempt = conn.execute("SELECT * FROM integration_attempts WHERE worklane_id = ?", (lane_id,)).fetchone()
+
+            self.assertEqual(result["failed"], 1)
+            self.assertEqual(lane["status"], "integration_failed")
+            self.assertEqual(attempt["merge_result"], "merge_conflicts")
+            self.assertEqual(json.loads(attempt["tests_json"]), [])
 
     def test_mcp_tools_record_query_spawn_and_search(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -352,6 +486,7 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("{init,run,status,stop,poke,doctor,logs,lanes,agents}", completed.stdout)
         self.assertNotIn("test-loop", completed.stdout)
         self.assertNotIn("update-status", completed.stdout)
+        self.assertNotIn("integrate", completed.stdout)
         self.assertNotIn("mcp-config", completed.stdout)
 
     def test_version_flag_prints_package_version(self):
@@ -409,33 +544,18 @@ class HarnessTests(unittest.TestCase):
                     raise sqlite3.OperationalError("database is locked")
                 return "ok"
 
-            with mock.patch("llm_harness.scheduler.time.sleep") as sleep:
-                self.assertEqual(scheduler.with_retrying_db("test", action), "ok")
+            self.assertEqual(scheduler.with_retrying_db("test", action), "ok")
             self.assertEqual(calls, 2)
-            sleep.assert_called_once_with(2)
 
-    def test_scheduler_retries_transient_sqlite_disk_io_errors(self):
+    def test_scheduler_does_not_retry_disk_io_errors_as_concurrency(self):
         with tempfile.TemporaryDirectory() as tmp:
             scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
-            real_connect = db.connect
-            attempts = 0
 
-            @contextmanager
-            def flaky_connect(path):
-                nonlocal attempts
-                attempts += 1
-                if attempts == 1:
-                    raise sqlite3.OperationalError("disk I/O error")
-                with real_connect(path) as conn:
-                    yield conn
+            def action(conn):
+                raise sqlite3.OperationalError("disk I/O error")
 
-            with (
-                mock.patch("llm_harness.db.connect", flaky_connect),
-                mock.patch("llm_harness.scheduler.time.sleep") as sleep,
-            ):
-                self.assertEqual(scheduler.with_retrying_db("test", lambda conn: "ok"), "ok")
-            self.assertEqual(attempts, 2)
-            sleep.assert_called_once_with(2)
+            with self.assertRaises(sqlite3.OperationalError):
+                scheduler.with_retrying_db("test", action)
 
     def test_testing_loop_records_run_and_parses_failures(self):
         parsed = parse_test_output("tests/test_x.py::test_a PASSED\ntests/test_x.py::test_b FAILED\n")
@@ -489,9 +609,12 @@ class HarnessTests(unittest.TestCase):
             window_names = {window for _, window, _ in fake.commands}
             self.assertIn("manhole", window_names)
             self.assertIn("status", window_names)
+            self.assertIn("integration", window_names)
             self.assertNotIn("switch:status", window_names)
             self.assertIn(("fake-session", "status", "watch -c -n 5 ./harness status"), fake.commands)
-            codex_commands = [command for _, window, command in fake.commands if window not in {"manhole", "status", "updater", "tests"} and not window.startswith("switch:")]
+            self.assertIn(("fake-session", "integration", "while true; do ./harness integrate; sleep 30; done"), fake.commands)
+            self.assertIn(("fake-session", "tests", "while true; do ./harness test-loop --once; sleep 5; done"), fake.commands)
+            codex_commands = [command for _, window, command in fake.commands if window not in {"manhole", "status", "updater", "integration", "tests"} and not window.startswith("switch:")]
             self.assertTrue(codex_commands)
             self.assertTrue(all("--yolo" in command and f"--model {CODEX_MODEL}" in command and f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"' in command for command in codex_commands))
             self.assertIn("Default to supervisor/read-only mode", (root / ".harness" / "prompts" / "manhole.md").read_text())

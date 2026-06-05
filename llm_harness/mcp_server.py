@@ -140,42 +140,53 @@ class HarnessMCP:
 
         with db.connect(self.db_path) as conn:
             db.init_db(conn)
-            if name == "memory_record_event":
-                event_id = db.log_event(conn, str(args["type"]), str(args["message"]), args.get("agent_name"), args.get("payload") or {})
-                return _text({"event_id": event_id})
-            if name == "memory_query":
-                rows = db.read_only_query(conn, str(args["sql"]), args.get("params") or [])
-                return _text(rows)
-            if name == "memory_update_agent":
-                if db.get_meta(conn, "red_banner") == "Harness stopped.":
-                    return _text({"ok": False, "status": "harness_stopped"})
-                requested_status = str(args["status"])
-                status = requested_status if requested_status in db.AGENT_LIFECYCLE_STATUSES else "running"
-                notes = args.get("notes")
-                if status != requested_status:
-                    notes = f"{requested_status}: {notes}" if notes else requested_status
-                db.update_agent_status(conn, str(args["name"]), status, notes, bool(args.get("ended", False)))
-                return _text({"ok": True})
-            if name == "agent_report":
-                report_id = db.record_agent_report(conn, args)
-                return _text({"report_id": report_id, "ok": True})
-            if name == "spawn_agent":
-                request_id = db.queue_spawn_request(
-                    conn,
-                    role=str(args["role"]),
-                    title=str(args["title"]),
-                    prompt=str(args["prompt"]),
-                    requester=str(args.get("requester", "")),
-                    notes=str(args.get("notes", "")),
-                )
-                return _text({"spawn_request_id": request_id, "status": "queued"})
-            if name == "code_search":
-                worktree = str(args.get("worktree") or "main")
-                if bool(args.get("refresh", False)):
-                    refresh_index(conn, self.root, worktree)
-                rows = code_search(conn, self.root, str(args["query"]), worktree, int(args.get("limit", 20)))
-                return _text(rows)
-        raise ValueError(f"Unknown tool: {name}")
+            concurrent = False if name == "memory_query" else db.begin_concurrent(conn)
+            try:
+                if name == "memory_record_event":
+                    event_id = db.log_event(conn, str(args["type"]), str(args["message"]), args.get("agent_name"), args.get("payload") or {})
+                    result = _text({"event_id": event_id})
+                elif name == "memory_query":
+                    rows = db.read_only_query(conn, str(args["sql"]), args.get("params") or [])
+                    result = _text(rows)
+                elif name == "memory_update_agent":
+                    if db.get_meta(conn, "red_banner") == "Harness stopped.":
+                        result = _text({"ok": False, "status": "harness_stopped"})
+                    else:
+                        requested_status = str(args["status"])
+                        status = requested_status if requested_status in db.AGENT_LIFECYCLE_STATUSES else "running"
+                        notes = args.get("notes")
+                        if status != requested_status:
+                            notes = f"{requested_status}: {notes}" if notes else requested_status
+                        db.update_agent_status(conn, str(args["name"]), status, notes, bool(args.get("ended", False)))
+                        result = _text({"ok": True})
+                elif name == "agent_report":
+                    report_id = db.record_agent_report(conn, args)
+                    result = _text({"report_id": report_id, "ok": True})
+                elif name == "spawn_agent":
+                    request_id = db.queue_spawn_request(
+                        conn,
+                        role=str(args["role"]),
+                        title=str(args["title"]),
+                        prompt=str(args["prompt"]),
+                        requester=str(args.get("requester", "")),
+                        notes=str(args.get("notes", "")),
+                    )
+                    result = _text({"spawn_request_id": request_id, "status": "queued"})
+                elif name == "code_search":
+                    worktree = str(args.get("worktree") or "main")
+                    if bool(args.get("refresh", False)):
+                        refresh_index(conn, self.root, worktree)
+                    rows = code_search(conn, self.root, str(args["query"]), worktree, int(args.get("limit", 20)))
+                    result = _text(rows)
+                else:
+                    raise ValueError(f"Unknown tool: {name}")
+                if concurrent and conn.in_transaction:
+                    conn.commit()
+                return result
+            except Exception:
+                if concurrent and conn.in_transaction:
+                    conn.rollback()
+                raise
 
     @staticmethod
     def _response(msg_id: Any, result: Any) -> dict[str, Any]:

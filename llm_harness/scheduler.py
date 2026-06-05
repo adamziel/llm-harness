@@ -160,18 +160,32 @@ class HarnessScheduler:
             return 130
 
     def with_retrying_db(self, label: str, action):
-        """Run scheduler database work without crashing on transient SQLite locks."""
+        """Run scheduler database work through SQLite/Turso's busy handler."""
 
-        while True:
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(8):
             try:
                 with db.connect(self.paths.db) as conn:
                     db.init_db(conn)
-                    return action(conn)
+                    concurrent = db.begin_concurrent(conn)
+                    try:
+                        result = action(conn)
+                        if concurrent and conn.in_transaction:
+                            conn.commit()
+                        return result
+                    except Exception:
+                        if concurrent and conn.in_transaction:
+                            conn.rollback()
+                        raise
             except sqlite3.OperationalError as exc:
                 if not db.is_retryable_error(exc):
                     raise
-                print(f"\033[33mSQLite database is temporarily unavailable during {label} ({exc}); waiting and retrying.\033[0m", file=sys.stderr)
-                time.sleep(2)
+                last_error = exc
+                if attempt == 0:
+                    print(f"\033[33mSQLite/Turso write conflict during {label} ({exc}); retrying immediately.\033[0m", file=sys.stderr)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"{label} did not run")
 
     def status_refresh_due(self, conn: sqlite3.Connection) -> bool:
         """Throttle deterministic status publishing to the renderer interval."""
@@ -359,7 +373,7 @@ class HarnessScheduler:
     def harness_windows(self, conn: sqlite3.Connection) -> set[str]:
         """Return tmux windows owned by this harness run."""
 
-        windows = {"manhole", "status", "updater", "tests"}
+        windows = {"manhole", "status", "updater", "tests", "integration"}
         for row in conn.execute("SELECT tmux_window FROM agents WHERE tmux_window != ''"):
             windows.add(str(row["tmux_window"]))
         return windows
@@ -568,7 +582,9 @@ class HarnessScheduler:
         self.tmux.ensure_window(session, "status", status_command)
         updater_command = "while true; do ./harness update-status; sleep 900; done"
         self.tmux.ensure_window(session, "updater", updater_command)
-        tests_command = "while true; do ./harness test-loop --once; sleep 900; done"
+        integration_command = "while true; do ./harness integrate; sleep 30; done"
+        self.tmux.ensure_window(session, "integration", integration_command)
+        tests_command = "while true; do ./harness test-loop --once; sleep 5; done"
         self.tmux.ensure_window(session, "tests", tests_command)
         db.log_event(conn, "tmux", "Support windows ready", payload={"session": session, "attach": attach})
 

@@ -50,6 +50,10 @@ capabilities invoked as short-lived jobs rather than standing sessions. All
 Codex worker commands are generated with `--yolo` and `--model gpt-5.5 -c model_reasoning_effort="xhigh"`.
 The Manhole starts in supervisor/read-only mode and should only take concrete
 actions when the user explicitly authorizes them.
+The deterministic integration support window runs `./harness integrate` on a
+short loop so ready branches are merged and pushed from a clean harness-owned
+worktree. The full test loop is separate and runs continuously; integration
+only runs bounded smoke checks.
 
 ## Persistent state
 
@@ -57,6 +61,8 @@ SQLite is the source of truth. It stores runs, goals, events, agents, tmux panes
 worktrees, worklanes, agent messages, structured agent reports, integration
 attempts, issues, resource samples, test runs, parsed test results, bug history,
 metric samples, code index rows, settings, and scheduler-routed spawn requests.
+Connections prefer Turso's MVCC journal mode when available and fall back to WAL
+on regular SQLite.
 
 The MCP server exposes that state through deterministic tools documented in
 `llm_harness/skills/sqlite_mcp/SKILL.md`.

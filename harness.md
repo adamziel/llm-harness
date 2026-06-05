@@ -543,6 +543,8 @@ Basic flow:
 
 The Integrator must never allow one bad branch to stall the whole system.
 
+Routine integration is deterministic. A harness-owned integration worktree continuously scans `needs_verification` and `ready_for_integration` lanes with branches, merges fast-path candidates, runs bounded smoke checks, pushes successful merges to the remote mainline branch, and deletes integrated harness work branches. Full test runs belong to the separate continuous test loop, not to the Integrator.
+
 ## Backpressure without global blocking
 
 The system should use backpressure, not global waiting.

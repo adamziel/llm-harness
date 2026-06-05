@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import sys
-import time
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -49,19 +47,13 @@ def is_active_agent_status(status: str) -> bool:
     return status not in AGENT_TERMINAL_STATUSES
 
 
-def is_locked_error(exc: BaseException) -> bool:
-    """Return whether SQLite is asking the harness to wait and retry."""
-
-    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
-
-
 def is_retryable_error(exc: BaseException) -> bool:
-    """Return whether SQLite hit a transient filesystem or lock condition."""
+    """Return whether Turso/SQLite reported a write-concurrency conflict."""
 
     if not isinstance(exc, sqlite3.OperationalError):
         return False
     message = str(exc).lower()
-    return "locked" in message or "disk i/o error" in message
+    return "locked" in message or "busy" in message or "conflict" in message
 
 
 @dataclass(frozen=True)
@@ -106,7 +98,7 @@ def ensure_dirs(paths: HarnessPaths) -> None:
 
 @contextmanager
 def connect(db_path: str | Path):
-    """Open SQLite with row dictionaries and foreign key enforcement enabled."""
+    """Open SQLite/Turso with row dictionaries and concurrent-writer pragmas."""
 
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,12 +107,8 @@ def connect(db_path: str | Path):
     try:
         conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA foreign_keys = ON")
-        try:
-            conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.OperationalError as exc:
-            if "disk i/o error" not in str(exc).lower():
-                raise
-            conn.execute("PRAGMA journal_mode = DELETE")
+        if _set_journal_mode(conn, "mvcc") != "mvcc":
+            _set_journal_mode(conn, "wal")
     except Exception:
         conn.close()
         raise
@@ -128,6 +116,40 @@ def connect(db_path: str | Path):
         yield conn
     finally:
         conn.close()
+
+
+def _set_journal_mode(conn: sqlite3.Connection, mode: str) -> str:
+    """Set a journal mode when supported and return the mode SQLite selected."""
+
+    try:
+        row = conn.execute(f"PRAGMA journal_mode = {mode}").fetchone()
+    except sqlite3.OperationalError as exc:
+        if mode == "wal" and "disk i/o error" in str(exc).lower():
+            return ""
+        raise
+    if row is None:
+        return ""
+    value = row[0] if not isinstance(row, sqlite3.Row) else row[0]
+    return str(value).lower()
+
+
+def journal_mode(conn: sqlite3.Connection) -> str:
+    """Return the active SQLite/Turso journal mode."""
+
+    row = conn.execute("PRAGMA journal_mode").fetchone()
+    if row is None:
+        return ""
+    value = row[0] if not isinstance(row, sqlite3.Row) else row[0]
+    return str(value).lower()
+
+
+def begin_concurrent(conn: sqlite3.Connection) -> bool:
+    """Start a Turso concurrent write transaction when MVCC is active."""
+
+    if journal_mode(conn) != "mvcc":
+        return False
+    conn.execute("BEGIN CONCURRENT")
+    return True
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -529,16 +551,9 @@ def bootstrap(root: str | Path) -> HarnessPaths:
 
     paths = paths_for(root)
     ensure_dirs(paths)
-    while True:
-        try:
-            with connect(paths.db) as conn:
-                init_db(conn)
-            return paths
-        except sqlite3.OperationalError as exc:
-            if not is_locked_error(exc):
-                raise
-            print("\033[33mSQLite database is locked during bootstrap; waiting and retrying.\033[0m", file=sys.stderr)
-            time.sleep(2)
+    with connect(paths.db) as conn:
+        init_db(conn)
+    return paths
 
 
 def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
