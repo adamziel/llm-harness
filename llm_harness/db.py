@@ -23,6 +23,24 @@ SCHEMA_VERSION = 1
 SQLITE_BUSY_TIMEOUT_MS = 60_000
 AGENT_TERMINAL_STATUSES = ("crash", "success", "stopped")
 AGENT_LIFECYCLE_STATUSES = ("running", *AGENT_TERMINAL_STATUSES)
+MCP_COMPAT_COLUMNS = {
+    "events": [
+        ("created_at", "TEXT GENERATED ALWAYS AS (ts) VIRTUAL"),
+    ],
+    "test_runs": [
+        ("summary", "TEXT GENERATED ALWAYS AS (summary_json) VIRTUAL"),
+        ("created_at", "TEXT GENERATED ALWAYS AS (started_at) VIRTUAL"),
+        ("updated_at", "TEXT GENERATED ALWAYS AS (COALESCE(ended_at, started_at)) VIRTUAL"),
+    ],
+    "bug_reports": [
+        ("severity", "INTEGER GENERATED ALWAYS AS (occurrences) VIRTUAL"),
+        ("title", "TEXT GENERATED ALWAYS AS (test_nodeid) VIRTUAL"),
+        (
+            "notes",
+            "TEXT GENERATED ALWAYS AS (trim(root_cause || CASE WHEN root_cause != '' AND resolution != '' THEN char(10) ELSE '' END || resolution)) VIRTUAL",
+        ),
+    ],
+}
 
 
 def is_active_agent_status(status: str) -> bool:
@@ -259,9 +277,23 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_code_index_worktree_path ON code_index(worktree, path);
         """
     )
+    ensure_mcp_compat_columns(conn)
     if get_meta(conn, "schema_version") != str(SCHEMA_VERSION):
         set_meta(conn, "schema_version", str(SCHEMA_VERSION))
     conn.commit()
+
+
+def ensure_mcp_compat_columns(conn: sqlite3.Connection) -> None:
+    """Add generated aliases for common agent memory queries without duplicating data."""
+
+    for table, columns in MCP_COMPAT_COLUMNS.items():
+        existing = {
+            row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            for row in conn.execute(f"PRAGMA table_xinfo({table})")
+        }
+        for name, definition in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def bootstrap(root: str | Path) -> HarnessPaths:

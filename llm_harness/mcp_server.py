@@ -30,7 +30,7 @@ TOOLS = [
     },
     {
         "name": "memory_query",
-        "description": "Run a read-only SELECT/WITH/PRAGMA query against harness SQLite memory.",
+        "description": "Run a read-only SELECT/WITH/PRAGMA query against harness SQLite memory. Use PRAGMA table_xinfo(table) to inspect columns.",
         "inputSchema": {
             "type": "object",
             "properties": {"sql": {"type": "string"}, "params": {"type": "array"}},

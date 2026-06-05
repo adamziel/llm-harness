@@ -158,6 +158,36 @@ class HarnessTests(unittest.TestCase):
             search = server.call_tool("code_search", {"query": "answer", "refresh": True})
             self.assertIn("example.py", search["content"][0]["text"])
 
+    def test_mcp_memory_query_supports_common_schema_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            server = HarnessMCP(tmp, paths.db)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.log_event(conn, "decision", "inspect aliases", agent_name="developer-1")
+                run_id = db.record_test_run(
+                    conn,
+                    "python -m unittest",
+                    "failed",
+                    "failure log",
+                    summary={"failed": 1},
+                    commit_sha="abc123",
+                    results=[{"nodeid": "tests/test_x.py::test_a", "status": "failed"}],
+                )
+                db.note_failing_tests(conn, run_id, "abc123")
+                conn.execute("UPDATE bug_reports SET root_cause = 'assertion failed' WHERE test_nodeid = ?", ("tests/test_x.py::test_a",))
+                conn.commit()
+
+            queries = [
+                "SELECT id, status, command, summary, created_at, updated_at FROM test_runs ORDER BY updated_at DESC LIMIT 20",
+                "SELECT id, status, severity, title, notes, created_at, updated_at FROM bug_reports ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, severity DESC, updated_at DESC LIMIT 30",
+                "SELECT id, type, agent_name, message, created_at FROM events ORDER BY id DESC LIMIT 30",
+            ]
+            for sql in queries:
+                result = server.call_tool("memory_query", {"sql": sql})
+                text = result["content"][0]["text"]
+                self.assertIn("created_at", text)
+
     def test_mcp_activity_status_keeps_agent_lifecycle_running(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)

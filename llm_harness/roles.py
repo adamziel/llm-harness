@@ -108,7 +108,7 @@ files. Never remove unintegrated branches or worktrees.
 MCP_SKILL = """
 Use the harness SQLite MCP tools for shared memory:
 - memory_record_event: append important events and decisions.
-- memory_query: inspect goals, agents, work_lanes, test_runs, bug_reports, and recent events with SELECT statements.
+- memory_query: inspect goals, agents, work_lanes, test_runs, bug_reports, and recent events with SELECT statements; use PRAGMA table_xinfo(table) before assuming column names.
 - memory_update_agent: update your own current_status and notes.
 - spawn_agent: request a new agent through the central scheduler; never start Codex directly yourself.
 - code_search: search the current repository/worktree before falling back to grep.

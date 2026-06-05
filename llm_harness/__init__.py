@@ -1,4 +1,4 @@
 """Deterministic LLM agent harness."""
 
 __all__ = ["__version__"]
-__version__ = "0.1.17"
+__version__ = "0.1.18"
