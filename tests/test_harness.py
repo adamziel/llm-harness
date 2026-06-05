@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -91,6 +92,30 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(row["current_status"], "running")
                 self.assertEqual(row["tmux_pane"], "%1")
                 self.assertIn("worktrees", row["worktree"])
+
+    def test_db_connect_falls_back_when_wal_is_unavailable(self):
+        class FakeConnection:
+            def __init__(self):
+                self.executed = []
+                self.row_factory = None
+                self.closed = False
+
+            def execute(self, sql):
+                self.executed.append(sql)
+                if sql == "PRAGMA journal_mode = WAL":
+                    raise sqlite3.OperationalError("disk I/O error")
+                return None
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeConnection()
+            with mock.patch("llm_harness.db.sqlite3.connect", return_value=fake):
+                with db.connect(Path(tmp) / "missing-parent" / "harness.sqlite3") as conn:
+                    self.assertIs(conn, fake)
+            self.assertIn("PRAGMA journal_mode = DELETE", fake.executed)
+            self.assertTrue(fake.closed)
 
     def test_codex_command_is_pinned_to_yolo_and_model(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -387,6 +412,29 @@ class HarnessTests(unittest.TestCase):
             with mock.patch("llm_harness.scheduler.time.sleep") as sleep:
                 self.assertEqual(scheduler.with_retrying_db("test", action), "ok")
             self.assertEqual(calls, 2)
+            sleep.assert_called_once_with(2)
+
+    def test_scheduler_retries_transient_sqlite_disk_io_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            real_connect = db.connect
+            attempts = 0
+
+            @contextmanager
+            def flaky_connect(path):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise sqlite3.OperationalError("disk I/O error")
+                with real_connect(path) as conn:
+                    yield conn
+
+            with (
+                mock.patch("llm_harness.db.connect", flaky_connect),
+                mock.patch("llm_harness.scheduler.time.sleep") as sleep,
+            ):
+                self.assertEqual(scheduler.with_retrying_db("test", lambda conn: "ok"), "ok")
+            self.assertEqual(attempts, 2)
             sleep.assert_called_once_with(2)
 
     def test_testing_loop_records_run_and_parses_failures(self):

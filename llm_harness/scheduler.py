@@ -168,9 +168,9 @@ class HarnessScheduler:
                     db.init_db(conn)
                     return action(conn)
             except sqlite3.OperationalError as exc:
-                if not db.is_locked_error(exc):
+                if not db.is_retryable_error(exc):
                     raise
-                print(f"\033[33mSQLite database is locked during {label}; waiting and retrying.\033[0m", file=sys.stderr)
+                print(f"\033[33mSQLite database is temporarily unavailable during {label} ({exc}); waiting and retrying.\033[0m", file=sys.stderr)
                 time.sleep(2)
 
     def status_refresh_due(self, conn: sqlite3.Connection) -> bool:

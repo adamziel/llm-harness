@@ -55,6 +55,15 @@ def is_locked_error(exc: BaseException) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
 
 
+def is_retryable_error(exc: BaseException) -> bool:
+    """Return whether SQLite hit a transient filesystem or lock condition."""
+
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return "locked" in message or "disk i/o error" in message
+
+
 @dataclass(frozen=True)
 class HarnessPaths:
     """Canonical filesystem locations for one repository's harness state."""
@@ -99,11 +108,22 @@ def ensure_dirs(paths: HarnessPaths) -> None:
 def connect(db_path: str | Path):
     """Open SQLite with row dictionaries and foreign key enforcement enabled."""
 
-    conn = sqlite3.connect(str(db_path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
-    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError as exc:
+            if "disk i/o error" not in str(exc).lower():
+                raise
+            conn.execute("PRAGMA journal_mode = DELETE")
+    except Exception:
+        conn.close()
+        raise
     try:
         yield conn
     finally:
