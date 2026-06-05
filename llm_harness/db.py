@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
+import time
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+SQLITE_BUSY_TIMEOUT_MS = 60_000
 AGENT_TERMINAL_STATUSES = ("crash", "success", "stopped")
 AGENT_LIFECYCLE_STATUSES = ("running", *AGENT_TERMINAL_STATUSES)
 
@@ -26,6 +29,12 @@ def is_active_agent_status(status: str) -> bool:
     """Return whether an agent status still represents a live harness worker."""
 
     return status not in AGENT_TERMINAL_STATUSES
+
+
+def is_locked_error(exc: BaseException) -> bool:
+    """Return whether SQLite is asking the harness to wait and retry."""
+
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
 
 
 @dataclass(frozen=True)
@@ -72,8 +81,9 @@ def ensure_dirs(paths: HarnessPaths) -> None:
 def connect(db_path: str | Path):
     """Open SQLite with row dictionaries and foreign key enforcement enabled."""
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     try:
@@ -249,7 +259,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_code_index_worktree_path ON code_index(worktree, path);
         """
     )
-    set_meta(conn, "schema_version", str(SCHEMA_VERSION))
+    if get_meta(conn, "schema_version") != str(SCHEMA_VERSION):
+        set_meta(conn, "schema_version", str(SCHEMA_VERSION))
     conn.commit()
 
 
@@ -258,9 +269,16 @@ def bootstrap(root: str | Path) -> HarnessPaths:
 
     paths = paths_for(root)
     ensure_dirs(paths)
-    with connect(paths.db) as conn:
-        init_db(conn)
-    return paths
+    while True:
+        try:
+            with connect(paths.db) as conn:
+                init_db(conn)
+            return paths
+        except sqlite3.OperationalError as exc:
+            if not is_locked_error(exc):
+                raise
+            print("\033[33mSQLite database is locked during bootstrap; waiting and retrying.\033[0m", file=sys.stderr)
+            time.sleep(2)
 
 
 def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:

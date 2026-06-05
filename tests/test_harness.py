@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -231,6 +232,23 @@ class HarnessTests(unittest.TestCase):
                 with mock.patch.object(scheduler, "harness_executable", return_value=Path(tmp) / "missing-harness"):
                     self.assertFalse(scheduler.check_codex_mcp(conn))
                 self.assertEqual(db.get_meta(conn, "red_banner"), "Harness MCP unavailable; refusing to start agents.")
+
+    def test_scheduler_retries_transient_sqlite_locks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            calls = 0
+
+            def action(conn):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return "ok"
+
+            with mock.patch("llm_harness.scheduler.time.sleep") as sleep:
+                self.assertEqual(scheduler.with_retrying_db("test", action), "ok")
+            self.assertEqual(calls, 2)
+            sleep.assert_called_once_with(2)
 
     def test_testing_loop_records_run_and_parses_failures(self):
         parsed = parse_test_output("tests/test_x.py::test_a PASSED\ntests/test_x.py::test_b FAILED\n")

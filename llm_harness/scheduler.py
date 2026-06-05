@@ -61,8 +61,7 @@ class HarnessScheduler:
     def run(self, goal: str | None = None, team: str = "auto", once: bool = False) -> int:
         """Start or resume the harness, then keep monitoring worker state."""
 
-        with db.connect(self.paths.db) as conn:
-            db.init_db(conn)
+        def start(conn: sqlite3.Connection) -> int:
             db.set_meta(conn, "scheduler_pid", str(os.getpid()))
             self.ensure_git_repo(conn)
             self.check_gh(conn)
@@ -77,29 +76,53 @@ class HarnessScheduler:
             refresh_reports(conn, self.root)
             effective_team = self.effective_team(conn, team)
             db.log_event(conn, "scheduler", f"Harness run started with team preset {effective_team}")
+            return 0
+
+        start_code = self.with_retrying_db("startup", start)
+        if start_code:
+            return start_code
 
         if once:
-            with db.connect(self.paths.db) as conn:
-                db.init_db(conn)
+            def tick(conn: sqlite3.Connection) -> None:
                 self.tick_once(conn, self.effective_team(conn, team))
                 refresh_reports(conn, self.root)
                 db.set_meta(conn, "scheduler_pid", "")
+
+            self.with_retrying_db("one-shot tick", tick)
             return 0
 
         print("Harness scheduler running. Press Ctrl-C to stop; workers remain inspectable in tmux.", flush=True)
         try:
             while True:
-                with db.connect(self.paths.db) as conn:
-                    db.init_db(conn)
+                def tick(conn: sqlite3.Connection) -> None:
                     self.tick_once(conn, self.effective_team(conn, team))
                     refresh_reports(conn, self.root)
+
+                self.with_retrying_db("scheduler tick", tick)
                 time.sleep(5)
         except KeyboardInterrupt:
             print("Harness scheduler stopped by user; agent tmux windows remain available.", flush=True)
-            with db.connect(self.paths.db) as conn:
+
+            def mark_stopped(conn: sqlite3.Connection) -> None:
                 db.log_event(conn, "scheduler", "Harness scheduler stopped by user")
                 db.set_meta(conn, "scheduler_pid", "")
+
+            self.with_retrying_db("shutdown", mark_stopped)
             return 130
+
+    def with_retrying_db(self, label: str, action):
+        """Run scheduler database work without crashing on transient SQLite locks."""
+
+        while True:
+            try:
+                with db.connect(self.paths.db) as conn:
+                    db.init_db(conn)
+                    return action(conn)
+            except sqlite3.OperationalError as exc:
+                if not db.is_locked_error(exc):
+                    raise
+                print(f"\033[33mSQLite database is locked during {label}; waiting and retrying.\033[0m", file=sys.stderr)
+                time.sleep(2)
 
     def stop(self) -> dict[str, int]:
         """Stop harness-owned runtime processes and mark durable state inactive."""
