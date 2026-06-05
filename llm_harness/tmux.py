@@ -86,7 +86,7 @@ class Tmux:
         session_target = f"{session}:"
         windows = self.run(["list-windows", "-t", session_target, "-F", "#{window_name}"]).stdout.splitlines()
         if window not in windows:
-            self.run(["new-window", "-t", session_target, "-n", window, shell_command("bash", "-lc", command)])
+            self.run(["new-window", "-d", "-t", session_target, "-n", window, shell_command("bash", "-lc", command)])
         pane = self.run(["display-message", "-p", "-t", f"{session}:{window}", "#{pane_id}"]).stdout.strip()
         return TmuxPane(session=session, window=window, pane=pane)
 
@@ -102,9 +102,13 @@ class Tmux:
         return result.stdout if result.returncode == 0 else ""
 
     def target_exists(self, target: str) -> bool:
-        """Return whether a pane/window target still exists in tmux."""
+        """Return whether a pane/window target still exists and is not dead."""
 
-        return self.run(["display-message", "-p", "-t", target, "#{pane_id}"], check=False).returncode == 0
+        result = self.run(["display-message", "-p", "-t", target, "#{pane_id}\t#{pane_dead}"], check=False)
+        if result.returncode != 0:
+            return False
+        fields = result.stdout.strip().split("\t")
+        return len(fields) < 2 or fields[1] != "1"
 
     def kill_window(self, session: str, window: str) -> bool:
         """Kill one tmux window if it still exists."""

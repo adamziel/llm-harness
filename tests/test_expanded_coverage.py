@@ -539,9 +539,18 @@ def _tmux_new_window_case(self: unittest.TestCase, command: str) -> None:
 
     Tmux(runner=runner).ensure_window("0", "manhole", command)
     new_window = [args for args in calls if args[1] == "new-window"][0]
-    self.assertEqual(new_window[:6], ["tmux", "new-window", "-t", "0:", "-n", "manhole"])
-    self.assertEqual(len(new_window), 7)
-    self.assertEqual(shlex.split(new_window[6]), ["bash", "-lc", command])
+    self.assertEqual(new_window[:7], ["tmux", "new-window", "-d", "-t", "0:", "-n", "manhole"])
+    self.assertEqual(len(new_window), 8)
+    self.assertEqual(shlex.split(new_window[7]), ["bash", "-lc", command])
+
+
+def _tmux_target_exists_case(self: unittest.TestCase, case: tuple[str, bool]) -> None:
+    pane_dead, expected = case
+
+    def runner(args, check=True, text=True, capture_output=True):
+        return subprocess.CompletedProcess(args, 0, stdout=f"%1\t{pane_dead}\n", stderr="")
+
+    self.assertEqual(Tmux(runner=runner).target_exists("%1"), expected)
 
 
 def _spawn_spec_case(self: unittest.TestCase, team: str) -> None:
@@ -559,4 +568,5 @@ add_cases(
     ["echo hello", "cd /repo && codex --yolo", 'codex -c \'model_reasoning_effort="xhigh"\' "$(cat prompt.md)"'],
     _tmux_new_window_case,
 )
+add_cases(SchedulerAndTmuxTests, "target_exists", [("0", True), ("1", False)], _tmux_target_exists_case)
 add_cases(SchedulerAndTmuxTests, "spec", ["planning", "unknown"], _spawn_spec_case)

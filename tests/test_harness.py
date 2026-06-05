@@ -237,6 +237,7 @@ class HarnessTests(unittest.TestCase):
             window_names = {window for _, window, _ in fake.commands}
             self.assertIn("manhole", window_names)
             self.assertIn("status", window_names)
+            self.assertNotIn("switch:status", window_names)
             codex_commands = [command for _, window, command in fake.commands if window not in {"manhole", "status", "updater", "tests"} and not window.startswith("switch:")]
             self.assertTrue(codex_commands)
             self.assertTrue(all("--yolo" in command and f"--model {CODEX_MODEL}" in command and f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"' in command for command in codex_commands))

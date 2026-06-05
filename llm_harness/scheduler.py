@@ -309,7 +309,6 @@ class HarnessScheduler:
         self.tmux.ensure_window(session, "updater", updater_command)
         tests_command = "while true; do ./harness test-loop --once; sleep 900; done"
         self.tmux.ensure_window(session, "tests", tests_command)
-        self.tmux.switch_to(session, "status")
         db.log_event(conn, "tmux", "Support windows ready", payload={"session": session, "attach": attach})
 
     def ensure_team(self, conn: sqlite3.Connection, team: str) -> None:
