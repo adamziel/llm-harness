@@ -99,7 +99,7 @@ class HarnessScheduler:
             refresh_reports(conn, self.root)
             db.set_meta(conn, "initialized_at", db.utc_now())
             db.set_meta(conn, "initialized_version", "refined")
-            db.set_meta(conn, "resident_team_default", "small")
+            db.set_meta(conn, "resident_team_default", "building")
             db.log_event(conn, "init", "Harness initialized or repaired")
             return 0
 
@@ -506,7 +506,7 @@ class HarnessScheduler:
             return requested
         if db.get_meta(conn, "integration_backpressure_active") == "1":
             return "small"
-        return db.get_meta(conn, "resident_team_default", "small") or "small"
+        return "building"
 
     def ensure_git_repo(self, conn: sqlite3.Connection) -> None:
         """Initialize git when needed because work lanes rely on branches/worktrees."""

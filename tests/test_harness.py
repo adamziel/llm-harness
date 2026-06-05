@@ -708,13 +708,13 @@ class HarnessTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(__version__, match.group(1))
 
-    def test_building_team_uses_conservative_medium_developer_cap(self):
-        self.assertEqual(developer_count_for_building(8), 4)
-        self.assertEqual(developer_count_for_building(6), 4)
+    def test_building_team_uses_six_developer_cap(self):
+        self.assertEqual(developer_count_for_building(8), 6)
+        self.assertEqual(developer_count_for_building(6), 6)
         self.assertEqual(developer_count_for_building(1), 1)
         specs = {spec.name: spec.min_count for spec in specs_for_team("building")}
         self.assertEqual(specs["Coordinator"], 1)
-        self.assertEqual(specs["Developer"], 4)
+        self.assertEqual(specs["Developer"], min(6, __import__("os").cpu_count() or 1))
         self.assertEqual(set(specs), {"Coordinator", "Developer"})
 
     def test_missing_development_md_is_created_before_agents_start(self):
@@ -940,7 +940,7 @@ class HarnessTests(unittest.TestCase):
             scheduler = HarnessScheduler(tmp, tmux=fake)
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
-                for index in range(1, 5):
+                for index in range(1, 7):
                     db.upsert_agent(conn, name=f"developer-{index}", role="Developer", current_status="running", tmux_pane=f"%developer-{index}", cwd=tmp)
                 db.queue_worklane(conn, "Queued lane")
                 request_id = db.queue_spawn_request(conn, role="Developer", title="extra", prompt="do work")

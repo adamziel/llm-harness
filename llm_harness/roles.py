@@ -54,10 +54,10 @@ TEAM_PRESETS: dict[str, list[RoleSpec]] = {
 
 
 def developer_count_for_building(cpu_count: int | None = None) -> int:
-    """Return the conservative medium-pool developer count from the revised spec."""
+    """Return the default building-pool developer count for a real compile effort."""
 
     cores = max(1, int(cpu_count or os.cpu_count() or 1))
-    return min(4, cores)
+    return min(6, cores)
 
 
 def specs_for_team(team: str) -> list[RoleSpec]:
@@ -69,8 +69,13 @@ def specs_for_team(team: str) -> list[RoleSpec]:
             RoleSpec("Coordinator", 1),
             RoleSpec("Developer", min(8, max(6, int(cores * 0.5)))),
         ]
-    if team in {"auto", "building", "planning"}:
-        team = "small" if team != "building" else "medium"
+    if team in {"auto", "building"}:
+        return [
+            RoleSpec("Coordinator", 1),
+            RoleSpec("Developer", developer_count_for_building()),
+        ]
+    if team == "planning":
+        team = "small"
     if team in TEAM_PRESETS:
         return TEAM_PRESETS[team]
     return specs_for_team("small")

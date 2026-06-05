@@ -71,7 +71,7 @@ def _role_sizing_case(self: unittest.TestCase, case: tuple[int, int]) -> None:
 add_cases(
     RoleSizingTests,
     "developer_count",
-    [(cores, min(4, cores)) for cores in range(1, 21)],
+    [(cores, min(6, cores)) for cores in range(1, 21)],
     _role_sizing_case,
 )
 
@@ -560,7 +560,7 @@ def _spawn_spec_case(self: unittest.TestCase, team: str) -> None:
     self.assertTrue(all(spec.min_count >= 1 for spec in specs))
 
 
-add_cases(SchedulerAndTmuxTests, "effective", [("planning", "small"), ("building", "small"), ("complete", "small")], _effective_team_case)
+add_cases(SchedulerAndTmuxTests, "effective", [("planning", "building"), ("building", "building"), ("complete", "building")], _effective_team_case)
 add_cases(SchedulerAndTmuxTests, "session_name", [("repo name", "repo-name"), ("repo.name", "repo.name"), ("repo_name", "repo_name")], _session_name_case)
 add_cases(SchedulerAndTmuxTests, "shell_quote", [("watch", "-n", "5"), ("./harness", "status"), ("echo", "hello world")], _shell_quote_case)
 add_cases(
