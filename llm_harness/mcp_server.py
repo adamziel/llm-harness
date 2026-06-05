@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from . import db
 from .indexer import code_search, refresh_index
 
@@ -100,7 +101,7 @@ class HarnessMCP:
         msg_id = message.get("id")
         try:
             if method == "initialize":
-                return self._response(msg_id, {"protocolVersion": "2024-11-05", "serverInfo": {"name": "llm-harness", "version": "0.1.3"}, "capabilities": {"tools": {}}})
+                return self._response(msg_id, {"protocolVersion": "2024-11-05", "serverInfo": {"name": "llm-harness", "version": __version__}, "capabilities": {"tools": {}}})
             if method == "tools/list":
                 return self._response(msg_id, {"tools": TOOLS})
             if method == "tools/call":

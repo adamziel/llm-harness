@@ -56,9 +56,10 @@ class Tmux:
     def ensure_window(self, session: str, window: str, command: str) -> TmuxPane:
         """Start a named tmux window unless it already exists."""
 
-        windows = self.run(["list-windows", "-t", session, "-F", "#{window_name}"]).stdout.splitlines()
+        session_target = f"{session}:"
+        windows = self.run(["list-windows", "-t", session_target, "-F", "#{window_name}"]).stdout.splitlines()
         if window not in windows:
-            self.run(["new-window", "-t", session, "-n", window, shell_command("bash", "-lc", command)])
+            self.run(["new-window", "-t", session_target, "-n", window, shell_command("bash", "-lc", command)])
         pane = self.run(["display-message", "-p", "-t", f"{session}:{window}", "#{pane_id}"]).stdout.strip()
         return TmuxPane(session=session, window=window, pane=pane)
 

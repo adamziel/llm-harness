@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 
+from . import __version__
 from . import db
 from .indexer import refresh_index
 from .janitor import run_janitor
@@ -20,6 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     """Dispatch harness subcommands while keeping the top-level script tiny."""
 
     parser = argparse.ArgumentParser(prog="harness", description="Deterministic Codex agent harness")
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--root", default=os.getcwd(), help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True, metavar="{run,status,poke}")
 

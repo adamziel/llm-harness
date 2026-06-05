@@ -537,9 +537,9 @@ def _tmux_new_window_case(self: unittest.TestCase, command: str) -> None:
             return subprocess.CompletedProcess(args, 0, stdout="%1\n", stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
-    Tmux(runner=runner).ensure_window("session", "manhole", command)
+    Tmux(runner=runner).ensure_window("0", "manhole", command)
     new_window = [args for args in calls if args[1] == "new-window"][0]
-    self.assertEqual(new_window[:6], ["tmux", "new-window", "-t", "session", "-n", "manhole"])
+    self.assertEqual(new_window[:6], ["tmux", "new-window", "-t", "0:", "-n", "manhole"])
     self.assertEqual(len(new_window), 7)
     self.assertEqual(shlex.split(new_window[6]), ["bash", "-lc", command])
 

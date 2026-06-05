@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from llm_harness import db
+from llm_harness import __version__, db
 from llm_harness.codex import CODEX_MODEL, CODEX_REASONING_EFFORT, build_codex_command
 from llm_harness.mcp_server import HarnessMCP, serve
 from llm_harness.roles import developer_count_for_building, specs_for_team
@@ -117,6 +118,7 @@ class HarnessTests(unittest.TestCase):
             serve(tmp, paths.db, stdin=stdin, stdout=stdout)
             output = stdout.getvalue()
             self.assertIn("protocolVersion", output)
+            self.assertIn(__version__, output)
             self.assertIn("memory_query", output)
 
     def test_public_help_only_lists_requested_commands(self):
@@ -126,6 +128,17 @@ class HarnessTests(unittest.TestCase):
         self.assertNotIn("test-loop", completed.stdout)
         self.assertNotIn("update-status", completed.stdout)
         self.assertNotIn("mcp-config", completed.stdout)
+
+    def test_version_flag_prints_package_version(self):
+        root = Path(__file__).resolve().parents[1]
+        completed = subprocess.run([sys.executable, str(root / "harness"), "-v"], text=True, capture_output=True, check=True)
+        self.assertEqual(completed.stdout.strip(), f"harness {__version__}")
+
+    def test_package_version_matches_pyproject(self):
+        root = Path(__file__).resolve().parents[1]
+        match = re.search(r'^version = "([^"]+)"$', (root / "pyproject.toml").read_text(), re.MULTILINE)
+        self.assertIsNotNone(match)
+        self.assertEqual(__version__, match.group(1))
 
     def test_building_team_uses_seventy_five_percent_of_cpu_cores_for_developers(self):
         self.assertEqual(developer_count_for_building(8), 6)
