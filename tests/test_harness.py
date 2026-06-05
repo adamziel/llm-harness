@@ -210,15 +210,17 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(specs["Integrator"], 1)
         self.assertEqual(set(specs), {"Manager", "Developer", "Integrator"})
 
-    def test_missing_development_md_is_reported_before_agents_start(self):
+    def test_missing_development_md_is_created_before_agents_start(self):
         with tempfile.TemporaryDirectory() as tmp:
-            paths = db.bootstrap(tmp)
-            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            root = Path(tmp)
+            paths = db.bootstrap(root)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
             with db.connect(paths.db) as conn:
                 db.init_db(conn)
                 scheduler.check_project_context(conn)
-                event = conn.execute("SELECT * FROM events WHERE type = 'warning' ORDER BY id DESC LIMIT 1").fetchone()
-            self.assertIn("DEVELOPMENT.md is absent", event["message"])
+                event = conn.execute("SELECT * FROM events WHERE type = 'project_context' ORDER BY id DESC LIMIT 1").fetchone()
+            self.assertIn("created a starter one", event["message"])
+            self.assertIn("# Development Guide", (root / "DEVELOPMENT.md").read_text())
 
     def test_mcp_preflight_fails_when_harness_executable_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:

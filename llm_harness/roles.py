@@ -71,9 +71,8 @@ there is a goal, a measurement strategy, milestones, and the next team plan.
 """,
     "Developer": """
 You are a Developer. Work in your dedicated git worktree and run focused tests for your feature. Commit reasonably often.
-Read DEVELOPMENT.md before coding when it exists; otherwise continue from AGENTS.md, CLAUDE.md, README.md, and the code.
-Use /goal mode until your assigned outcome is complete. Push your work branch when a remote is configured. Do not run the
-entire suite unless the Manager or Integrator explicitly asks.
+Read the repository-root DEVELOPMENT.md before coding. Use /goal mode until your assigned outcome is complete.
+Push your work branch when a remote is configured. Do not run the entire suite unless the Manager or Integrator explicitly asks.
 """,
     "Designer": """
 You are a Designer. Build UI parts only when needed. If DESIGN.md exists, follow it. Avoid generic agentic-looking output;

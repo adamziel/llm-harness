@@ -27,6 +27,27 @@ SINGLETON_SPAWN_ROLES = {"Architect"}
 JANITOR_SECONDS = 60 * 60
 LOW_RESOURCE_SECONDS = 60
 HIGH_RESOURCE_SECONDS = 30
+DEFAULT_DEVELOPMENT_MD = """# Development Guide
+
+This starter file was created by `./harness run` because DEVELOPMENT.md was missing.
+Edit it with project-specific commands and conventions for future agents.
+
+## Build
+
+- Inspect the repository before choosing commands.
+- Prefer the smallest command that verifies the current change.
+
+## Test
+
+- Run focused tests for the files or behavior you changed.
+- Run broader suites only when the change requires it or an integrator asks.
+
+## Agent workflow
+
+- Keep edits narrow and preserve existing style.
+- Record meaningful status through the harness MCP tools.
+- Leave unrelated files untouched.
+"""
 
 
 class HarnessScheduler:
@@ -260,16 +281,14 @@ class HarnessScheduler:
         print("\033[31mGitHub CLI is missing or unauthorized; continuing locally.\033[0m", file=sys.stderr)
 
     def check_project_context(self, conn: sqlite3.Connection) -> None:
-        """Tell the user about optional project context files before agents start."""
+        """Create the project context file agents expect before they start."""
 
-        if (self.root / "DEVELOPMENT.md").exists():
+        development_md = self.root / "DEVELOPMENT.md"
+        if development_md.exists():
             return
-        message = (
-            "DEVELOPMENT.md is absent; developers will fall back to "
-            "AGENTS.md, CLAUDE.md, README.md, and source inspection. "
-            "Create DEVELOPMENT.md to provide project-specific build/test guidance."
-        )
-        db.log_event(conn, "warning", message)
+        development_md.write_text(DEFAULT_DEVELOPMENT_MD)
+        message = "DEVELOPMENT.md was absent, so the harness created a starter one. Edit it with project-specific build/test guidance."
+        db.log_event(conn, "project_context", message)
         print(f"\033[33m{message}\033[0m", file=sys.stderr)
 
     def check_codex_mcp(self, conn: sqlite3.Connection) -> bool:
