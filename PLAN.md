@@ -34,6 +34,11 @@ The refined spec now requires these behavior changes:
    - Active agents should correlate to cards, not just legacy worklanes.
    - Uncarded active non-support work should be visible as a red control-plane error.
 
+6. **Integration ends at the remote, not the local worktree**
+   - Successful integration must push the promoted commit to the configured remote target branch.
+   - Record the remote ref, commit SHA, and push result before moving the card to `done`.
+   - A failed push leaves the card in `integration` or moves it to `integration_failed`; it is not complete.
+
 ## Implementation plan
 
 ### 1. Schema and migration
@@ -97,7 +102,11 @@ The refined spec now requires these behavior changes:
 - Move code-producing cards to `integration` only after review passes.
 - Move non-code advisory cards directly from `review` to `done` after acceptance.
 - Keep deterministic `./harness integrate` processing `integration` cards continuously.
-- Convert integration failures into conflict-resolution cards when needed.
+- After merge and smoke-test success, push the promoted commit to the configured remote target branch with `git push`.
+- Do not rely on `gh` for integration completion; missing GitHub CLI support must not silently turn a local merge into done work.
+- Record the remote ref, commit SHA, and push result before moving a card to `done`.
+- Keep cards in `integration` or move them to `integration_failed` when the push fails or no authenticated remote exists.
+- Convert merge, test, or push integration failures into conflict-resolution cards when needed.
 
 ### 7. Test-loop integration
 
@@ -123,6 +132,8 @@ Add focused tests for:
 - planned card moves to development when assigned,
 - development card moves to review only after accepted `agent_report`,
 - reviewed code card moves to integration,
+- successful integration pushes to the configured remote target branch before moving to done,
+- failed integration push does not move the card to done,
 - reviewed non-code card moves to done,
 - active non-support Codex work cannot exist without a card,
 - Developer without a card is stopped, reused, or assigned by Python,

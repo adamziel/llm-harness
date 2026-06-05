@@ -647,10 +647,13 @@ The deterministic integration loop should favor fast-path work to keep throughpu
 
 Suggested branch model:
 
-* `main`
+* configured remote target branch, such as `origin/main` or `origin/trunk`
+* local tracking branch for that target
 * `harness/integration`
 * `worklane/<id>-<slug>`
 * `integration-attempt/<timestamp>-<lane>`
+
+Integration is not complete while the result exists only in a local worktree. A successful integration must push the promoted commit to the configured remote target branch and record the remote ref and commit SHA. If the push fails, the card remains in `integration` or moves to `integration_failed`; it must not be marked `done`.
 
 Basic flow:
 
@@ -661,9 +664,12 @@ Basic flow:
 5. Lane enters an integration queue.
 6. Deterministic integration loop attempts merge into a temporary integration branch.
 7. Targeted smoke tests run.
-8. Successful lane is promoted.
-9. Failed lane is requeued or converted into conflict-resolution work.
-10. Developer pool continues working throughout.
+8. Successful lane is promoted onto the configured local target branch.
+9. The promoted commit is pushed to the configured remote target branch.
+10. Python records the pushed remote ref, commit SHA, and push result.
+11. Only after the push succeeds does the card move to `done`.
+12. Failed merge, test, or push requeues the lane or converts it into conflict-resolution work.
+13. Developer pool continues working throughout.
 
 The integration loop must never allow one bad branch to stall the whole system. The LLM Integrator may be asked to inspect ambiguous failures, but Python owns the queue, bounded attempts, status transitions, and promotion/requeue decisions.
 
@@ -804,11 +810,14 @@ The harness works with Git.
 
 If run in a non-Git repository, initialize one.
 
+Integration completion uses `git push`, not GitHub-specific API calls. If the configured remote is missing or unauthenticated, integration cannot complete and the card must stay out of `done`.
+
 If `gh` is unavailable or unauthorized, print a red warning but continue.
 
 If `gh` is available and authorized:
 
 * push progress to remote branches,
+* push successful integration results to the configured remote target branch before marking cards done,
 * optionally publish `STATUS.html` as a GitHub Page.
 
 Developers work in separate Git worktrees to avoid collisions.
@@ -1090,6 +1099,8 @@ The harness should include tests for at least:
 * active non-support Codex work cannot exist without a card,
 * ready worklane enters integration queue,
 * deterministic integration loop handles fast-path lane,
+* deterministic integration loop pushes successful integration to the configured remote target branch before marking the card done,
+* deterministic integration loop treats a failed push as an integration failure instead of local completion,
 * deterministic integration loop requeues conflicted lane without blocking others,
 * failed full test creates issue record,
 * fixed test updates issue record,
