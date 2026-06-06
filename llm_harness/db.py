@@ -9,6 +9,7 @@ remember what happened before a crash.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 SQLITE_BUSY_TIMEOUT_MS = 60_000
+DB_DRIVER_ENV = "HARNESS_DB_DRIVER"
 AGENT_TERMINAL_STATUSES = ("crash", "success", "stopped")
 AGENT_LIFECYCLE_STATUSES = ("running", *AGENT_TERMINAL_STATUSES)
 CARD_STAGES = ("planned", "development", "review", "integration", "done")
@@ -71,7 +73,8 @@ def is_active_agent_status(status: str) -> bool:
 def is_retryable_error(exc: BaseException) -> bool:
     """Return whether Turso/SQLite reported a write-concurrency conflict."""
 
-    if not isinstance(exc, sqlite3.OperationalError):
+    module = exc.__class__.__module__.split(".", 1)[0]
+    if not isinstance(exc, sqlite3.OperationalError) and module != "turso":
         return False
     message = str(exc).lower()
     return "locked" in message or "busy" in message or "conflict" in message
@@ -119,16 +122,19 @@ def ensure_dirs(paths: HarnessPaths) -> None:
 
 @contextmanager
 def connect(db_path: str | Path):
-    """Open SQLite/Turso with row dictionaries and concurrent-writer pragmas."""
+    """Open Turso when available, otherwise SQLite with conservative pragmas."""
 
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
-    conn.row_factory = sqlite3.Row
+    conn = open_connection(path)
+    if connection_driver(conn) == "sqlite":
+        conn.row_factory = sqlite3.Row
     try:
         conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA foreign_keys = ON")
-        if _set_journal_mode(conn, "mvcc") != "mvcc":
+        if connection_driver(conn) == "turso":
+            remove_autoincrement_tables(conn)
+        if _set_journal_mode(conn, "mvcc") != "mvcc" and connection_driver(conn) == "sqlite":
             _set_journal_mode(conn, "wal")
     except Exception:
         conn.close()
@@ -139,13 +145,95 @@ def connect(db_path: str | Path):
         conn.close()
 
 
+def open_connection(path: Path):
+    """Open the configured database driver, preferring Turso's local MVCC engine."""
+
+    requested = os.environ.get(DB_DRIVER_ENV, "auto").strip().lower() or "auto"
+    if requested in {"auto", "turso", "pyturso"}:
+        try:
+            turso = _import_turso()
+        except ModuleNotFoundError:
+            if requested in {"turso", "pyturso"}:
+                raise RuntimeError(
+                    f"{DB_DRIVER_ENV}=turso requires the pyturso package; install it with `pip install pyturso`."
+                ) from None
+        else:
+            conn = turso.connect(str(path), experimental_features="views,triggers,generated_columns")
+            conn.row_factory = turso.Row
+            return conn
+    if requested in {"auto", "sqlite", "sqlite3"}:
+        return sqlite3.connect(str(path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
+    raise RuntimeError(f"Unsupported {DB_DRIVER_ENV}={requested!r}; use auto, turso, or sqlite.")
+
+
+def _import_turso():
+    """Import pyturso lazily so the single-file harness can still run without it."""
+
+    import turso
+
+    return turso
+
+
+def connection_driver(conn: object) -> str:
+    """Return the effective database driver name for diagnostics and branching."""
+
+    module = conn.__class__.__module__.split(".", 1)[0]
+    return "turso" if module == "turso" else "sqlite"
+
+
+def remove_autoincrement_tables(conn: sqlite3.Connection) -> None:
+    """Rewrite legacy SQLite AUTOINCREMENT tables so Turso MVCC can write them."""
+
+    rows = conn.execute(
+        """
+        SELECT name, sql
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND sql LIKE '%AUTOINCREMENT%'
+        ORDER BY name
+        """
+    ).fetchall()
+    for row in rows:
+        table = row["name"] if isinstance(row, sqlite3.Row) else row[0]
+        sql = row["sql"] if isinstance(row, sqlite3.Row) else row[1]
+        if not table or not sql:
+            continue
+        replacement = f"CREATE TABLE {table}"
+        if replacement not in sql:
+            continue
+        temp_table = f"__harness_no_autoincrement_{table}"
+        columns = [
+            column["name"] if isinstance(column, sqlite3.Row) else column[1]
+            for column in conn.execute(f"PRAGMA table_info({_quote_identifier(table)})").fetchall()
+        ]
+        quoted_columns = ", ".join(_quote_identifier(column) for column in columns)
+        conn.execute(f"DROP TABLE IF EXISTS {_quote_identifier(temp_table)}")
+        conn.execute(sql.replace(replacement, f"CREATE TABLE {temp_table}", 1).replace("AUTOINCREMENT", ""))
+        conn.execute(
+            f"""
+            INSERT INTO {_quote_identifier(temp_table)}({quoted_columns})
+            SELECT {quoted_columns} FROM {_quote_identifier(table)}
+            """
+        )
+        conn.execute(f"DROP TABLE {_quote_identifier(table)}")
+        conn.execute(f"ALTER TABLE {_quote_identifier(temp_table)} RENAME TO {_quote_identifier(table)}")
+    if rows:
+        conn.commit()
+
+
+def _quote_identifier(identifier: str) -> str:
+    """Quote a SQLite identifier produced by this harness, not user input SQL."""
+
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 def _set_journal_mode(conn: sqlite3.Connection, mode: str) -> str:
     """Set a journal mode when supported and return the mode SQLite selected."""
 
     try:
         row = conn.execute(f"PRAGMA journal_mode = {mode}").fetchone()
-    except sqlite3.OperationalError as exc:
-        if mode == "wal" and "disk i/o error" in str(exc).lower():
+    except Exception as exc:
+        if "disk i/o error" in str(exc).lower():
             return ""
         raise
     if row is None:
@@ -196,7 +284,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS insights (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             ts TEXT NOT NULL,
             source_agent TEXT NOT NULL DEFAULT '',
             round INTEGER NOT NULL DEFAULT 0,
@@ -205,7 +293,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             ts TEXT NOT NULL,
             type TEXT NOT NULL,
             message TEXT NOT NULL,
@@ -214,7 +302,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS agents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
             role TEXT NOT NULL,
             current_status TEXT NOT NULL,
@@ -234,7 +322,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             started_at TEXT NOT NULL,
             ended_at TEXT,
             status TEXT NOT NULL DEFAULT 'running',
@@ -242,7 +330,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS worklanes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             title TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
             goal TEXT NOT NULL DEFAULT '',
@@ -278,7 +366,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             ts TEXT NOT NULL,
             target TEXT NOT NULL DEFAULT 'broadcast',
             message TEXT NOT NULL,
@@ -286,7 +374,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS agent_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             created_at TEXT NOT NULL,
             target TEXT NOT NULL DEFAULT 'broadcast',
             message TEXT NOT NULL,
@@ -295,7 +383,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS agent_reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             created_at TEXT NOT NULL,
             agent_name TEXT NOT NULL DEFAULT '',
             card_id INTEGER,
@@ -307,7 +395,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS worktrees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             path TEXT NOT NULL UNIQUE,
             branch TEXT NOT NULL DEFAULT '',
             owner_agent TEXT NOT NULL DEFAULT '',
@@ -318,7 +406,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS commits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             sha TEXT NOT NULL UNIQUE,
             branch TEXT NOT NULL DEFAULT '',
             worklane_id INTEGER,
@@ -328,7 +416,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS integration_attempts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             worklane_id INTEGER NOT NULL,
             attempt_branch TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'integrating',
@@ -343,7 +431,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS spawn_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             ts TEXT NOT NULL,
             requester TEXT NOT NULL DEFAULT '',
             role TEXT NOT NULL,
@@ -356,7 +444,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS card_stage_transitions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             card_id INTEGER NOT NULL,
             from_stage TEXT NOT NULL DEFAULT '',
             to_stage TEXT NOT NULL,
@@ -366,7 +454,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS resource_samples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             ts TEXT NOT NULL,
             cpu_percent REAL NOT NULL,
             ram_percent REAL NOT NULL,
@@ -376,7 +464,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS metric_samples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             ts TEXT NOT NULL,
             metric_name TEXT NOT NULL,
             value REAL NOT NULL,
@@ -385,7 +473,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS test_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             started_at TEXT NOT NULL,
             ended_at TEXT,
             command TEXT NOT NULL,
@@ -396,7 +484,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS test_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             run_id INTEGER NOT NULL REFERENCES test_runs(id) ON DELETE CASCADE,
             nodeid TEXT NOT NULL,
             file TEXT NOT NULL DEFAULT '',
@@ -406,7 +494,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS bug_reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             test_nodeid TEXT NOT NULL,
             first_failed_commit TEXT NOT NULL DEFAULT '',
             fixed_commit TEXT NOT NULL DEFAULT '',
@@ -419,7 +507,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS issues (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             issue_key TEXT NOT NULL UNIQUE,
             title TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'open',
@@ -435,7 +523,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS status_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             created_at TEXT NOT NULL,
             summary_json TEXT NOT NULL DEFAULT '{}'
         );
@@ -447,7 +535,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS code_index (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             worktree TEXT NOT NULL,
             path TEXT NOT NULL,
             mtime REAL NOT NULL,
@@ -478,6 +566,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     ensure_mcp_compat_columns(conn)
     if get_meta(conn, "schema_version") != str(SCHEMA_VERSION):
         set_meta(conn, "schema_version", str(SCHEMA_VERSION))
+    set_meta(conn, "db_driver", connection_driver(conn))
     conn.commit()
 
 
@@ -536,7 +625,7 @@ def ensure_card_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS card_stage_transitions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             card_id INTEGER NOT NULL,
             from_stage TEXT NOT NULL DEFAULT '',
             to_stage TEXT NOT NULL,
@@ -629,21 +718,29 @@ def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
                 ),
             )
         conn.execute("DROP TABLE work_lanes")
+        object_type = ""
+    if object_type != "view":
+        create_view = "CREATE VIEW" if connection_driver(conn) == "turso" else "CREATE VIEW IF NOT EXISTS"
+        conn.execute(
+            f"""
+            {create_view} work_lanes AS
+            SELECT
+                id,
+                created_at AS ts,
+                title,
+                role_type AS role,
+                status,
+                branch_name AS branch,
+                worktree_path AS worktree,
+                expected_metric_impact AS expected_metric_delta,
+                notes
+            FROM worklanes
+            """
+        )
+    if connection_driver(conn) == "turso":
+        return
     conn.executescript(
         """
-        CREATE VIEW IF NOT EXISTS work_lanes AS
-        SELECT
-            id,
-            created_at AS ts,
-            title,
-            role_type AS role,
-            status,
-            branch_name AS branch,
-            worktree_path AS worktree,
-            expected_metric_impact AS expected_metric_delta,
-            notes
-        FROM worklanes;
-
         CREATE TRIGGER IF NOT EXISTS work_lanes_insert INSTEAD OF INSERT ON work_lanes
         BEGIN
             INSERT INTO worklanes(

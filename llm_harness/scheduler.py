@@ -164,7 +164,7 @@ class HarnessScheduler:
     def with_retrying_db(self, label: str, action):
         """Run scheduler database work through SQLite/Turso's busy handler."""
 
-        last_error: sqlite3.OperationalError | None = None
+        last_error: Exception | None = None
         for attempt in range(8):
             try:
                 with db.connect(self.paths.db) as conn:
@@ -179,7 +179,7 @@ class HarnessScheduler:
                         if concurrent and conn.in_transaction:
                             conn.rollback()
                         raise
-            except sqlite3.OperationalError as exc:
+            except Exception as exc:
                 if not db.is_retryable_error(exc):
                     raise
                 last_error = exc

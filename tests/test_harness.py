@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from llm_harness import __version__, db
+from llm_harness.cli import main
 from llm_harness.codex import CODEX_MODEL, CODEX_REASONING_EFFORT, build_codex_command
 from llm_harness.integration import integrate_once
 from llm_harness.mcp_server import HarnessMCP, serve
@@ -120,12 +121,151 @@ class HarnessTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             fake = FakeConnection()
-            with mock.patch("llm_harness.db.sqlite3.connect", return_value=fake):
+            with mock.patch.dict("os.environ", {"HARNESS_DB_DRIVER": "sqlite"}), mock.patch("llm_harness.db.sqlite3.connect", return_value=fake):
                 with db.connect(Path(tmp) / "missing-parent" / "harness.sqlite3") as conn:
                     self.assertIs(conn, fake)
             self.assertIn("PRAGMA journal_mode = mvcc", fake.executed)
             self.assertIn("PRAGMA journal_mode = wal", fake.executed)
             self.assertTrue(fake.closed)
+
+    def test_db_connect_prefers_pyturso_when_available(self):
+        class FakeCursor:
+            def __init__(self, value=""):
+                self.value = value
+
+            def fetchone(self):
+                return (self.value,)
+
+            def fetchall(self):
+                return []
+
+        class FakeTursoConnection:
+            def __init__(self):
+                self.executed = []
+                self.row_factory = None
+                self.closed = False
+
+            def execute(self, sql):
+                self.executed.append(sql)
+                if sql == "PRAGMA journal_mode = mvcc":
+                    return FakeCursor("mvcc")
+                return FakeCursor("")
+
+            def close(self):
+                self.closed = True
+
+        FakeTursoConnection.__module__ = "turso"
+
+        class FakeTurso:
+            Row = object
+
+            def __init__(self, conn):
+                self.conn = conn
+                self.paths = []
+                self.kwargs = {}
+
+            def connect(self, path, **kwargs):
+                self.paths.append(path)
+                self.kwargs = kwargs
+                return self.conn
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_conn = FakeTursoConnection()
+            fake_turso = FakeTurso(fake_conn)
+            with mock.patch.dict("os.environ", {"HARNESS_DB_DRIVER": "auto"}), mock.patch("llm_harness.db._import_turso", return_value=fake_turso), mock.patch("llm_harness.db.sqlite3.connect") as sqlite_connect:
+                with db.connect(Path(tmp) / "harness.sqlite3") as conn:
+                    self.assertIs(conn, fake_conn)
+            sqlite_connect.assert_not_called()
+            self.assertEqual(db.connection_driver(fake_conn), "turso")
+            self.assertEqual(fake_turso.kwargs["experimental_features"], "views,triggers,generated_columns")
+            self.assertEqual(fake_conn.row_factory, FakeTurso.Row)
+            self.assertIn("PRAGMA journal_mode = mvcc", fake_conn.executed)
+            self.assertNotIn("PRAGMA journal_mode = wal", fake_conn.executed)
+            self.assertTrue(fake_conn.closed)
+
+    def test_db_connect_forced_turso_requires_pyturso(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict("os.environ", {"HARNESS_DB_DRIVER": "turso"}), mock.patch("llm_harness.db._import_turso", side_effect=ModuleNotFoundError("turso")):
+                with self.assertRaisesRegex(RuntimeError, "pyturso"):
+                    with db.connect(Path(tmp) / "harness.sqlite3"):
+                        pass
+
+    def test_db_connect_ignores_sqlite_journal_disk_io(self):
+        class FakeCursor:
+            def __init__(self, value=""):
+                self.value = value
+
+            def fetchone(self):
+                return (self.value,)
+
+        class FakeConnection:
+            def __init__(self):
+                self.executed = []
+                self.row_factory = None
+                self.closed = False
+
+            def execute(self, sql):
+                self.executed.append(sql)
+                if sql.startswith("PRAGMA journal_mode"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return FakeCursor("")
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeConnection()
+            with mock.patch.dict("os.environ", {"HARNESS_DB_DRIVER": "sqlite"}), mock.patch("llm_harness.db.sqlite3.connect", return_value=fake):
+                with db.connect(Path(tmp) / "harness.sqlite3") as conn:
+                    self.assertIs(conn, fake)
+            self.assertIn("PRAGMA journal_mode = mvcc", fake.executed)
+            self.assertIn("PRAGMA journal_mode = wal", fake.executed)
+            self.assertTrue(fake.closed)
+
+    def test_remove_autoincrement_tables_preserves_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "harness.sqlite3"
+            with sqlite3.connect(path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.executescript(
+                    """
+                    CREATE TABLE events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        agent_name TEXT,
+                        payload_json TEXT NOT NULL DEFAULT '{}'
+                    );
+                    INSERT INTO events(ts, type, message, payload_json)
+                    VALUES ('now', 'old', 'old', '{}');
+                    """
+                )
+                db.remove_autoincrement_tables(conn)
+                conn.execute("INSERT INTO events(ts, type, message, payload_json) VALUES ('now', 'new', 'new', '{}')")
+                rows = conn.execute("SELECT id, type FROM events ORDER BY id").fetchall()
+                schema = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").fetchone()
+
+            self.assertEqual([(row["id"], row["type"]) for row in rows], [(1, "old"), (2, "new")])
+            self.assertNotIn("AUTOINCREMENT", schema["sql"])
+
+    def test_turso_conflicts_are_retryable(self):
+        class DatabaseError(Exception):
+            pass
+
+        DatabaseError.__module__ = "turso.lib"
+
+        self.assertTrue(db.is_retryable_error(DatabaseError("Transaction conflict")))
+        self.assertFalse(db.is_retryable_error(DatabaseError("Parse error")))
+
+    def test_forced_turso_missing_prints_clear_cli_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with mock.patch.dict("os.environ", {"HARNESS_DB_DRIVER": "turso"}), mock.patch("llm_harness.db._import_turso", side_effect=ModuleNotFoundError("turso")), mock.patch("sys.stderr", stderr):
+                self.assertEqual(main(["--root", tmp, "doctor"]), 1)
+
+            self.assertIn("requires the pyturso package", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_db_connect_keeps_turso_mvcc_when_available(self):
         class FakeCursor:
@@ -151,7 +291,7 @@ class HarnessTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             fake = FakeConnection()
-            with mock.patch("llm_harness.db.sqlite3.connect", return_value=fake):
+            with mock.patch.dict("os.environ", {"HARNESS_DB_DRIVER": "sqlite"}), mock.patch("llm_harness.db.sqlite3.connect", return_value=fake):
                 with db.connect(Path(tmp) / "harness.sqlite3"):
                     pass
             self.assertIn("PRAGMA journal_mode = mvcc", fake.executed)
@@ -520,7 +660,7 @@ class HarnessTests(unittest.TestCase):
             raw.executescript(
                 """
                 CREATE TABLE worklanes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id INTEGER PRIMARY KEY,
                     title TEXT NOT NULL,
                     role_type TEXT NOT NULL DEFAULT 'Developer',
                     priority INTEGER NOT NULL DEFAULT 100,
@@ -534,7 +674,7 @@ class HarnessTests(unittest.TestCase):
                 VALUES ('legacy lane', 'queued', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
 
                 CREATE TABLE agent_reports (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id INTEGER PRIMARY KEY,
                     created_at TEXT NOT NULL,
                     agent_name TEXT NOT NULL DEFAULT '',
                     role TEXT NOT NULL DEFAULT '',
@@ -543,7 +683,7 @@ class HarnessTests(unittest.TestCase):
                 );
 
                 CREATE TABLE spawn_requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id INTEGER PRIMARY KEY,
                     ts TEXT NOT NULL,
                     requester TEXT NOT NULL DEFAULT '',
                     role TEXT NOT NULL,

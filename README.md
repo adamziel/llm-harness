@@ -1,7 +1,7 @@
 # LLM Harness
 
 `llm-harness` is a deterministic scheduler around Codex CLI worker agents. It
-uses Python, tmux, git worktrees, SQLite, and small MCP tools to keep agentic work
+uses Python, tmux, git worktrees, Turso/SQLite, and small MCP tools to keep agentic work
 inspectable and restartable instead of trusting a single long-running chat.
 
 ## Run it without cloning
@@ -57,12 +57,15 @@ only runs bounded smoke checks.
 
 ## Persistent state
 
-SQLite is the source of truth. It stores runs, goals, events, agents, tmux panes,
+Turso is the preferred source of truth when the `pyturso` package is installed;
+the single-file harness falls back to Python's built-in SQLite driver when it is
+not. The database stores runs, goals, events, agents, tmux panes,
 worktrees, worklanes, agent messages, structured agent reports, integration
 attempts, issues, resource samples, test runs, parsed test results, bug history,
 metric samples, code index rows, settings, and scheduler-routed spawn requests.
-Connections prefer Turso's MVCC journal mode when available and fall back to WAL
-on regular SQLite.
+Set `HARNESS_DB_DRIVER=turso` to require the Turso driver and fail clearly when
+`pyturso` is missing. Connections enable Turso MVCC for concurrent writes and
+fall back to WAL on regular SQLite.
 
 The MCP server exposes that state through deterministic tools documented in
 `llm_harness/skills/sqlite_mcp/SKILL.md`.

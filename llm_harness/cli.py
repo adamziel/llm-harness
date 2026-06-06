@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 from . import __version__
@@ -69,7 +70,13 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     root = Path(args.root).resolve()
-    paths = db.bootstrap(root)
+    try:
+        paths = db.bootstrap(root)
+    except RuntimeError as exc:
+        if str(exc).startswith(f"{db.DB_DRIVER_ENV}="):
+            print(f"\033[31m{exc}\033[0m", file=sys.stderr)
+            return 1
+        raise
 
     if args.command == "init":
         return HarnessScheduler(root).init_project(goal=args.goal)
