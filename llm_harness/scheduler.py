@@ -493,6 +493,7 @@ class HarnessScheduler:
         reviewed = db.review_ready_cards(conn)
         if reviewed:
             db.log_event(conn, "review", f"Accepted {reviewed} review cards")
+        self.repair_control_plane_cards(conn)
         self.ensure_team(conn, team)
         self.requeue_developers_without_cards(conn)
         self.check_agent_liveness(conn)
@@ -672,7 +673,7 @@ class HarnessScheduler:
         for spec in specs:
             active = self.active_agent_count(conn, spec.name)
             target = spec.min_count
-            if spec.name == "Developer" and self.integration_backpressure(conn):
+            if spec.name == "Developer" and self.integration_backpressure(conn) and self.stabilization_planned_worklanes(conn) <= 0:
                 target = min(target, max(1, active))
             if spec.name == "Developer":
                 queued = self.queued_developer_worklanes(conn)
@@ -692,6 +693,126 @@ class HarnessScheduler:
                 """
             ).fetchone()["count"]
         )
+
+    def stabilization_planned_worklanes(self, conn: sqlite3.Connection) -> int:
+        """Count planned repair cards that should still get Developers under backpressure."""
+
+        return int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM worklanes
+                WHERE stage = 'planned'
+                  AND role_type IN ('Developer', 'Designer', 'Conflict Resolver', 'Reproducer')
+                  AND (
+                    source_key LIKE 'test-failure:%'
+                    OR source_key LIKE 'integration-failure:%'
+                    OR title LIKE 'Fix failing tests from run %'
+                    OR title = 'Fix global test suite failures'
+                    OR role_type = 'Conflict Resolver'
+                  )
+                """
+            ).fetchone()["count"]
+        )
+
+    def repair_control_plane_cards(self, conn: sqlite3.Connection) -> None:
+        """Repair card state left behind by older harness control-plane bugs."""
+
+        self.retire_capacity_cards(conn)
+        self.requeue_cards_from_terminal_agents(conn)
+        self.dedupe_global_test_failure_cards(conn)
+
+    def retire_capacity_cards(self, conn: sqlite3.Connection) -> int:
+        """Retire fake Developer capacity cards created by older scheduler versions."""
+
+        now = db.utc_now()
+        retired = conn.execute(
+            """
+            UPDATE worklanes
+            SET stage = 'done',
+                status = 'stale',
+                owner_agent_id = NULL,
+                done_at = COALESCE(done_at, ?),
+                last_activity_at = ?,
+                notes = trim(notes || char(10) || 'Retired obsolete capacity-maintenance card after scheduler repair.')
+            WHERE stage != 'done'
+              AND role_type = 'Developer'
+              AND title = 'Maintain Developer capacity'
+            """,
+            (now, now),
+        ).rowcount
+        if retired:
+            db.log_event(conn, "card_repair", f"Retired {retired} obsolete Developer capacity cards")
+        return int(retired)
+
+    def requeue_cards_from_terminal_agents(self, conn: sqlite3.Connection) -> int:
+        """Return development cards owned by terminal workers to planned."""
+
+        placeholders = ",".join("?" for _ in db.AGENT_TERMINAL_STATUSES)
+        rows = conn.execute(
+            f"""
+            SELECT w.id, a.name
+            FROM worklanes w
+            JOIN agents a ON w.owner_agent_id = a.id
+            WHERE w.stage = 'development'
+              AND a.current_status IN ({placeholders})
+            """,
+            db.AGENT_TERMINAL_STATUSES,
+        ).fetchall()
+        for row in rows:
+            db.requeue_card(conn, int(row["id"]), f"Requeued after terminal worker {row['name']} was found during scheduler repair.")
+        if rows:
+            db.log_event(conn, "card_repair", f"Requeued {len(rows)} cards owned by terminal workers")
+        return len(rows)
+
+    def dedupe_global_test_failure_cards(self, conn: sqlite3.Connection) -> int:
+        """Keep one global full-suite stabilization card and retire older duplicates."""
+
+        rows = conn.execute(
+            """
+            SELECT
+                w.id,
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM agents a
+                    WHERE a.current_status NOT IN ('crash', 'success', 'stopped')
+                      AND (
+                        w.owner_agent_id = a.id
+                        OR (a.branch != '' AND w.branch_name = a.branch)
+                        OR (a.worktree != '' AND w.worktree_path = a.worktree)
+                      )
+                ) THEN 1 ELSE 0 END AS active_owner
+            FROM worklanes w
+            WHERE w.stage != 'done'
+              AND w.role_type = 'Developer'
+              AND (
+                w.source_key LIKE 'test-failure:%:global-suite'
+                OR w.title LIKE 'Fix failing tests from run %'
+                OR w.title = 'Fix global test suite failures'
+              )
+            ORDER BY active_owner DESC,
+                     CASE w.stage WHEN 'development' THEN 0 WHEN 'planned' THEN 1 ELSE 2 END,
+                     w.id DESC
+            """
+        ).fetchall()
+        if len(rows) <= 1:
+            return 0
+        keep = int(rows[0]["id"])
+        stale_ids = [int(row["id"]) for row in rows[1:]]
+        now = db.utc_now()
+        conn.executemany(
+            """
+            UPDATE worklanes
+            SET stage = 'done',
+                status = 'stale',
+                owner_agent_id = NULL,
+                done_at = COALESCE(done_at, ?),
+                last_activity_at = ?,
+                notes = trim(notes || char(10) || ?)
+            WHERE id = ?
+            """,
+            [(now, now, f"Superseded by global full-suite stabilization card#{keep}.", card_id) for card_id in stale_ids],
+        )
+        db.log_event(conn, "card_repair", f"Retired {len(stale_ids)} duplicate global test-failure cards", payload={"kept_card_id": keep, "retired_card_ids": stale_ids[:50]})
+        return len(stale_ids)
 
     def requeue_developers_without_cards(self, conn: sqlite3.Connection) -> None:
         """Stop live Developer panes that are not attached to exactly one card."""

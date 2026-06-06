@@ -117,8 +117,9 @@ def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dic
     failures = [result["nodeid"] for result in results if result.get("status") in {"failed", "error"}]
     run = conn.execute("SELECT command FROM test_runs WHERE id = ?", (run_id,)).fetchone()
     command = run["command"] if run else ""
-    failure_key = ",".join(sorted(failures)) if failures else "command-level-failure"
-    title = f"Fix failing tests from run {run_id}"
+    global_command = is_global_test_command(command)
+    failure_key = "global-suite" if global_command else ",".join(sorted(failures)) if failures else "command-level-failure"
+    title = "Fix global test suite failures" if global_command else f"Fix failing tests from run {run_id}"
     notes = "Failed tests: " + (", ".join(failures) if failures else "see full test log") + f"\nFirst failing commit: {commit}"
     source_key = f"test-failure:{command}:{failure_key}"
     existing = conn.execute(
@@ -151,6 +152,17 @@ def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dic
         goal="Restore the main-branch full test suite.",
         acceptance_criteria="The failing tests pass in the deterministic test loop.",
         source_key=source_key,
+    )
+
+
+def is_global_test_command(command: str) -> bool:
+    """Return whether a failing command represents the main full-suite loop."""
+
+    normalized = " ".join(command.split())
+    return (
+        "tools/run-tests.sh" in normalized
+        or ("unittest discover" in normalized and "-s tests" in normalized)
+        or ("pytest" in normalized and " tests" in f" {normalized}")
     )
 
 

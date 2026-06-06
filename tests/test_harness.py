@@ -807,6 +807,54 @@ class HarnessTests(unittest.TestCase):
                 bug = conn.execute("SELECT * FROM bug_reports WHERE test_nodeid = 'tests/test_x.py::test_a'").fetchone()
                 self.assertEqual(bug["status"], "fixed")
 
+    def test_global_test_loop_uses_one_stabilization_card_for_different_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                from llm_harness.testing_loop import queue_test_fix_lane
+
+                first = db.record_test_run(
+                    conn,
+                    command="python -m unittest discover -s tests -v",
+                    status="failed",
+                    full_log="tests/test_a.py::test_one FAILED",
+                    results=[{"nodeid": "tests/test_a.py::test_one", "status": "failed"}],
+                )
+                queue_test_fix_lane(conn, first, [{"nodeid": "tests/test_a.py::test_one", "status": "failed"}], "bad")
+                second = db.record_test_run(
+                    conn,
+                    command="python -m unittest discover -s tests -v",
+                    status="failed",
+                    full_log="tests/test_b.py::test_two FAILED",
+                    results=[{"nodeid": "tests/test_b.py::test_two", "status": "failed"}],
+                )
+                queue_test_fix_lane(conn, second, [{"nodeid": "tests/test_b.py::test_two", "status": "failed"}], "bad")
+                cards = conn.execute("SELECT * FROM worklanes WHERE status != 'stale'").fetchall()
+            self.assertEqual(len(cards), 1)
+            self.assertEqual(cards[0]["title"], "Fix global test suite failures")
+
+    def test_scheduler_repair_retires_bad_capacity_and_duplicate_global_cards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                capacity_id = db.create_card(conn, "Maintain Developer capacity", role_type="Developer", status="integration_failed", stage="integration")
+                stale_owner_card = db.queue_worklane(conn, "Requeue terminal owner")
+                duplicate_one = db.create_card(conn, "Fix failing tests from run 1", role_type="Developer", source_key="test-failure:python -m unittest discover -s tests -v:old-a")
+                duplicate_two = db.create_card(conn, "Fix failing tests from run 2", role_type="Developer", source_key="test-failure:python -m unittest discover -s tests -v:old-b")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="crash", cwd=tmp)
+                db.assign_card(conn, stale_owner_card, "developer-1")
+                scheduler.repair_control_plane_cards(conn)
+                capacity = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (capacity_id,)).fetchone()
+                stale_owner = conn.execute("SELECT stage, status, owner_agent_id FROM worklanes WHERE id = ?", (stale_owner_card,)).fetchone()
+                duplicate_states = [dict(row) for row in conn.execute("SELECT id, stage, status FROM worklanes WHERE id IN (?, ?) ORDER BY id", (duplicate_one, duplicate_two))]
+
+            self.assertEqual((capacity["stage"], capacity["status"]), ("done", "stale"))
+            self.assertEqual((stale_owner["stage"], stale_owner["status"], stale_owner["owner_agent_id"]), ("planned", "queued", None))
+            self.assertEqual(sum(1 for row in duplicate_states if row["status"] != "stale"), 1)
+
     def test_scheduler_once_starts_support_windows_and_minimal_team(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -970,6 +1018,26 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(db.get_meta(conn, "integration_backpressure_active"), "1")
             spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
             self.assertEqual(spawned_developers, [])
+
+    def test_integration_backpressure_allows_stabilization_developers(self):
+        old = str(__import__("time").time() - 21 * 60)
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="coordinator-1", role="Coordinator", current_status="running", tmux_pane="%coordinator", cwd=tmp)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                for index in range(3):
+                    db.queue_worklane(conn, f"Ready lane {index}", status="ready_for_integration")
+                for index in range(5):
+                    db.create_card(conn, f"Stabilize failure {index}", role_type="Developer", source_key=f"test-failure:focused:{index}")
+                db.set_meta(conn, "integration_backlog_since", old)
+                scheduler.ensure_team(conn, "building")
+                self.assertEqual(db.get_meta(conn, "integration_backpressure_active"), "1")
+            spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
+            self.assertEqual(spawned_developers, ["developer-2", "developer-3", "developer-4", "developer-5", "developer-6"])
 
     def test_stop_cleans_harness_runtime_state(self):
         with tempfile.TemporaryDirectory() as tmp:
