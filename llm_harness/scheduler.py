@@ -45,7 +45,7 @@ LOW_RESOURCE_SECONDS = 60
 HIGH_RESOURCE_SECONDS = 30
 INTEGRATION_BACKPRESSURE_SECONDS = 20 * 60
 INTEGRATION_READY_STATUSES = ("ready_for_integration",)
-INTEGRATION_RECOVERY_ACTIVE_LIMIT = 3
+INTEGRATION_RECOVERY_ACTIVE_LIMIT = 4
 REPORT_ONLY_DEVELOPER_ACTIVE_LIMIT = 1
 REPORT_ONLY_CARD_MARKERS = ("read-only", "read only", "no source edits", "no_source_edits", ".harness/reports", "focused replay")
 INTEGRATION_RESOLUTION_CARD_RE = re.compile(r"card #(\d+)")
@@ -803,7 +803,7 @@ class HarnessScheduler:
 
         roles = tuple(sorted(db.CODE_PRODUCING_ROLES))
         placeholders = ",".join("?" for _ in roles)
-        allow_recovery = self.integration_recovery_slots(conn) > 0
+        recovery_slots = self.integration_recovery_slots(conn)
         rows = list(
             conn.execute(
                 f"""
@@ -816,11 +816,13 @@ class HarnessScheduler:
                 roles,
             ).fetchall()
         )
+        recovery_rows = [row for row in rows if self.is_integration_recovery_card(row)]
+        non_recovery_rows = [row for row in rows if not self.is_integration_recovery_card(row)]
+        recovery_candidates = recovery_rows[:recovery_slots]
         if db.get_meta(conn, "test_gate_mode") == "hard_blocker":
-            return [row for row in rows if self.is_gate_repair_card(row)]
-        if allow_recovery:
-            return sorted(rows, key=lambda row: (0 if self.is_integration_recovery_card(row) else 1, int(row["priority"]), int(row["id"])))
-        return [row for row in rows if not self.is_integration_recovery_card(row)]
+            gate_rows = [row for row in non_recovery_rows if self.is_gate_repair_card(row)]
+            return sorted(gate_rows, key=lambda row: (int(row["priority"]), int(row["id"]))) + recovery_candidates
+        return recovery_candidates + non_recovery_rows
 
     def is_gate_repair_card(self, row: sqlite3.Row) -> bool:
         """Return whether a card directly repairs the metric-producing test gate."""

@@ -1381,6 +1381,31 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual([row["id"] for row in ready_lanes], [gate_card])
             self.assertIn("Gate: HARD BLOCKER", rendered)
 
+    def test_hard_blocker_allows_bounded_integration_resolution_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "test_gate_mode", "hard_blocker")
+                db.create_card(conn, "Continue product work", role_type="Developer", source_key="feature:next")
+                gate_id = db.create_card(conn, "Fix global test suite failures", role_type="Developer", source_key="test-failure:global-suite")
+                recovery_ids = [
+                    db.create_card(
+                        conn,
+                        f"Resolve integration failure for card #{index}",
+                        role_type="Conflict Resolver",
+                        source_key=f"integration-failure:{index}:merge_conflicts:branch-{index}",
+                    )
+                    for index in range(6)
+                ]
+                candidates = scheduler.planned_developer_candidates(conn)
+
+            candidate_ids = [row["id"] for row in candidates]
+            self.assertIn(gate_id, candidate_ids)
+            self.assertEqual([card_id for card_id in recovery_ids if card_id in candidate_ids], recovery_ids[:4])
+            self.assertNotIn("feature:next", [row["source_key"] for row in candidates])
+
     def test_failed_global_gate_with_small_parsed_failures_is_quarantined_known_red(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1800,8 +1825,8 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(db.get_meta(conn, "integration_backpressure_active"), "1")
                 assigned = conn.execute("SELECT COUNT(*) AS count FROM worklanes WHERE stage = 'development'").fetchone()["count"]
             spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
-            self.assertEqual(spawned_developers, ["developer-2", "developer-3", "developer-4"])
-            self.assertEqual(assigned, 3)
+            self.assertEqual(spawned_developers, ["developer-2", "developer-3", "developer-4", "developer-5"])
+            self.assertEqual(assigned, 4)
 
     def test_ready_report_releases_current_card_lease_for_reassignment(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2131,8 +2156,38 @@ class HarnessTests(unittest.TestCase):
                     """
                 ).fetchone()["count"]
 
-            self.assertEqual(active_recovery, 3)
-            self.assertEqual(active_fresh, 3)
+            self.assertEqual(active_recovery, 4)
+            self.assertEqual(active_fresh, 2)
+
+    def test_scheduler_does_not_spawn_past_integration_recovery_slots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                for index in range(8):
+                    db.create_card(
+                        conn,
+                        f"Resolve integration failure for card #{index}",
+                        role_type="Conflict Resolver",
+                        source_key=f"integration-failure:{index}:merge_conflicts:branch-{index}",
+                    )
+
+                scheduler.ensure_team(conn, "building")
+                active_recovery = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM worklanes
+                    WHERE stage = 'development'
+                      AND (source_key LIKE 'integration-failure:%' OR title LIKE 'Resolve integration failure for card #%')
+                    """
+                ).fetchone()["count"]
+                stopped = conn.execute("SELECT COUNT(*) AS count FROM agents WHERE current_status = 'stopped'").fetchone()["count"]
+
+            spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
+            self.assertEqual(len(spawned_developers), 4)
+            self.assertEqual(active_recovery, 4)
+            self.assertEqual(stopped, 0)
 
     def test_repair_retires_old_non_actionable_development_cards(self):
         with tempfile.TemporaryDirectory() as tmp:
