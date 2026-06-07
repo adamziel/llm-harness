@@ -77,6 +77,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\033[31m{exc}\033[0m", file=sys.stderr)
             return 1
         raise
+    except Exception as exc:
+        if db.is_disk_io_error(exc):
+            print(
+                "\033[31mHarness database disk I/O error. Free disk space, repair the filesystem/database, "
+                "or run with HARNESS_DB_DRIVER=turso.\033[0m",
+                file=sys.stderr,
+            )
+            return 1
+        raise
 
     if args.command == "init":
         return HarnessScheduler(root).init_project(goal=args.goal)

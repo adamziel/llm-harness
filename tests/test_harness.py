@@ -267,6 +267,14 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("requires the pyturso package", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
 
+    def test_db_disk_io_prints_clear_cli_error(self):
+        stderr = io.StringIO()
+        with mock.patch("llm_harness.db.bootstrap", side_effect=sqlite3.OperationalError("disk I/O error")), mock.patch("sys.stderr", stderr):
+            self.assertEqual(main(["doctor"]), 1)
+
+        self.assertIn("Harness database disk I/O error", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_db_connect_keeps_turso_mvcc_when_available(self):
         class FakeCursor:
             def __init__(self, value):
@@ -904,6 +912,16 @@ class HarnessTests(unittest.TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 scheduler.with_retrying_db("test", action)
 
+    def test_run_startup_disk_io_prints_clear_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            stderr = io.StringIO()
+            with mock.patch.object(scheduler, "with_retrying_db", side_effect=sqlite3.OperationalError("disk I/O error")), mock.patch("sys.stderr", stderr):
+                self.assertEqual(scheduler.run(team="minimal"), 1)
+
+            self.assertIn("Harness database disk I/O error during startup", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_testing_loop_records_run_and_parses_failures(self):
         parsed = parse_test_output("tests/test_x.py::test_a PASSED\ntests/test_x.py::test_b FAILED\n")
         self.assertEqual(parsed[1]["status"], "failed")
@@ -1178,6 +1196,72 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(db.get_meta(conn, "integration_backpressure_active"), "1")
             spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
             self.assertEqual(spawned_developers, ["developer-2", "developer-3", "developer-4", "developer-5", "developer-6"])
+
+    def test_integration_backpressure_uses_developers_for_conflict_cards(self):
+        old = str(__import__("time").time() - 21 * 60)
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                db.queue_worklane(conn, "Failed integration", status="integration_failed")
+                for index in range(5):
+                    db.create_card(conn, f"Resolve integration failure {index}", role_type="Conflict Resolver", source_key=f"integration-failure:{index}:merge")
+                db.set_meta(conn, "integration_backlog_since", old)
+                scheduler.ensure_team(conn, "building")
+                self.assertEqual(db.get_meta(conn, "integration_backpressure_active"), "1")
+                assigned = conn.execute("SELECT COUNT(*) AS count FROM worklanes WHERE stage = 'development'").fetchone()["count"]
+            spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
+            self.assertEqual(spawned_developers, ["developer-2", "developer-3", "developer-4", "developer-5", "developer-6"])
+            self.assertEqual(assigned, 5)
+
+    def test_non_actionable_developer_report_retires_card_and_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                card_id = db.queue_worklane(conn, "Empty stale card")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                db.assign_card(conn, card_id, "developer-1")
+                db.record_agent_report(
+                    conn,
+                    {
+                        "agent_id": "developer-1",
+                        "card_id": card_id,
+                        "worklane_id": card_id,
+                        "stage": "development",
+                        "status": "reserve_no_source_edits",
+                        "summary": "No concrete work was available.",
+                    },
+                )
+                card = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+                agent = conn.execute("SELECT current_status FROM agents WHERE name = 'developer-1'").fetchone()
+            self.assertEqual((card["stage"], card["status"]), ("done", "stale"))
+            self.assertEqual(agent["current_status"], "success")
+
+    def test_repair_retires_old_non_actionable_development_cards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                card_id = db.queue_worklane(conn, "Old empty card")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                db.assign_card(conn, card_id, "developer-1")
+                conn.execute(
+                    """
+                    INSERT INTO agent_reports(created_at, agent_name, card_id, worklane_id, role, stage, status, report_json)
+                    VALUES (?, 'developer-1', ?, ?, 'Developer', 'development', 'reserve_no_source_edits', '{}')
+                    """,
+                    (db.utc_now(), card_id, card_id),
+                )
+                scheduler.repair_control_plane_cards(conn)
+                card = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+                agent = conn.execute("SELECT current_status FROM agents WHERE name = 'developer-1'").fetchone()
+            self.assertEqual((card["stage"], card["status"]), ("done", "stale"))
+            self.assertEqual(agent["current_status"], "success")
 
     def test_stop_cleans_harness_runtime_state(self):
         with tempfile.TemporaryDirectory() as tmp:

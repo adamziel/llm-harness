@@ -128,7 +128,17 @@ class HarnessScheduler:
             db.log_event(conn, "scheduler", f"Harness run started with team preset {effective_team}")
             return 0
 
-        start_code = self.with_retrying_db("startup", start)
+        try:
+            start_code = self.with_retrying_db("startup", start)
+        except Exception as exc:
+            if not db.is_disk_io_error(exc):
+                raise
+            print(
+                "\033[31mHarness database disk I/O error during startup. Free disk space, repair the filesystem/database, "
+                "or run with HARNESS_DB_DRIVER=turso.\033[0m",
+                file=sys.stderr,
+            )
+            return 1
         if start_code:
             return start_code
 
@@ -142,6 +152,7 @@ class HarnessScheduler:
             return 0
 
         print("Harness scheduler running. Press Ctrl-C to stop; workers remain inspectable in tmux.", flush=True)
+        last_db_warning = ""
         try:
             while True:
                 def tick(conn: sqlite3.Connection) -> None:
@@ -149,7 +160,19 @@ class HarnessScheduler:
                     if self.status_refresh_due(conn):
                         refresh_reports(conn, self.root)
 
-                self.with_retrying_db("scheduler tick", tick)
+                try:
+                    self.with_retrying_db("scheduler tick", tick)
+                    last_db_warning = ""
+                except Exception as exc:
+                    if not db.is_disk_io_error(exc):
+                        raise
+                    warning = (
+                        "Harness database disk I/O error during scheduler tick; keeping the scheduler alive. "
+                        "Free disk space, repair the filesystem/database, or run with HARNESS_DB_DRIVER=turso."
+                    )
+                    if warning != last_db_warning:
+                        print(f"\033[31m{warning}\033[0m", file=sys.stderr)
+                        last_db_warning = warning
                 time.sleep(5)
         except KeyboardInterrupt:
             print("Harness scheduler stopped by user; agent tmux windows remain available.", flush=True)
@@ -494,8 +517,8 @@ class HarnessScheduler:
         if reviewed:
             db.log_event(conn, "review", f"Accepted {reviewed} review cards")
         self.repair_control_plane_cards(conn)
-        self.ensure_team(conn, team)
         self.requeue_developers_without_cards(conn)
+        self.ensure_team(conn, team)
         self.check_agent_liveness(conn)
         self.check_progress_stall(conn)
         self.maybe_run_janitor(conn)
@@ -505,8 +528,6 @@ class HarnessScheduler:
 
         if requested != "auto":
             return requested
-        if db.get_meta(conn, "integration_backpressure_active") == "1":
-            return "small"
         return "building"
 
     def ensure_git_repo(self, conn: sqlite3.Connection) -> None:
@@ -683,14 +704,17 @@ class HarnessScheduler:
                 self.spawn_agent(conn, spec.name, title=f"Maintain {spec.name} capacity")
 
     def queued_developer_worklanes(self, conn: sqlite3.Connection) -> int:
-        """Count planned implementation cards; capacity should not create no-op workers."""
+        """Count planned code-producing cards; capacity should not create no-op workers."""
 
+        roles = tuple(sorted(db.CODE_PRODUCING_ROLES))
+        placeholders = ",".join("?" for _ in roles)
         return int(
             conn.execute(
-                """
+                f"""
                 SELECT COUNT(*) AS count FROM worklanes
-                WHERE stage = 'planned' AND role_type IN ('Developer', 'Designer')
-                """
+                WHERE stage = 'planned' AND role_type IN ({placeholders})
+                """,
+                roles,
             ).fetchone()["count"]
         )
 
@@ -718,6 +742,7 @@ class HarnessScheduler:
         """Repair card state left behind by older harness control-plane bugs."""
 
         self.retire_capacity_cards(conn)
+        self.retire_non_actionable_development_cards(conn)
         self.requeue_cards_from_terminal_agents(conn)
         self.dedupe_global_test_failure_cards(conn)
 
@@ -743,6 +768,39 @@ class HarnessScheduler:
         if retired:
             db.log_event(conn, "card_repair", f"Retired {retired} obsolete Developer capacity cards")
         return int(retired)
+
+    def retire_non_actionable_development_cards(self, conn: sqlite3.Connection) -> int:
+        """Retire cards that older releases left assigned after no-op reports."""
+
+        placeholders = ",".join("?" for _ in db.NON_ACTIONABLE_REPORT_STATUSES)
+        rows = conn.execute(
+            f"""
+            SELECT w.id, w.owner_agent_id, a.name AS agent_name, r.status, r.report_json
+            FROM worklanes w
+            JOIN agent_reports r ON r.id = (
+                SELECT r2.id
+                FROM agent_reports r2
+                WHERE r2.card_id = w.id OR r2.worklane_id = w.id
+                ORDER BY r2.id DESC
+                LIMIT 1
+            )
+            LEFT JOIN agents a ON a.id = w.owner_agent_id
+            WHERE w.stage = 'development'
+              AND r.status IN ({placeholders})
+            """,
+            tuple(sorted(db.NON_ACTIONABLE_REPORT_STATUSES)),
+        ).fetchall()
+        now = db.utc_now()
+        for row in rows:
+            db.retire_card(conn, int(row["id"]), f"Retired after non-actionable report: {row['status']}", reason=str(row["status"]), agent_name=str(row["agent_name"] or ""))
+            if row["agent_name"]:
+                conn.execute(
+                    "UPDATE agents SET current_status = 'success', ended_at = ?, last_seen_at = ?, notes = ? WHERE name = ?",
+                    (now, now, f"Completed non-actionable card#{row['id']}: {row['status']}", row["agent_name"]),
+                )
+        if rows:
+            db.log_event(conn, "card_repair", f"Retired {len(rows)} non-actionable development cards")
+        return len(rows)
 
     def requeue_cards_from_terminal_agents(self, conn: sqlite3.Connection) -> int:
         """Return development cards owned by terminal workers to planned."""

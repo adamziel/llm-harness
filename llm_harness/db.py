@@ -44,6 +44,7 @@ STAGE_STATUS = {
     "done": "done",
 }
 CODE_PRODUCING_ROLES = {"Developer", "Designer", "Conflict Resolver", "Reproducer"}
+NON_ACTIONABLE_REPORT_STATUSES = {"reserve_no_source_edits", "no_source_edits", "not_actionable", "superseded"}
 MCP_COMPAT_COLUMNS = {
     "events": [
         ("created_at", "TEXT GENERATED ALWAYS AS (ts) VIRTUAL"),
@@ -78,6 +79,12 @@ def is_retryable_error(exc: BaseException) -> bool:
         return False
     message = str(exc).lower()
     return "locked" in message or "busy" in message or "conflict" in message
+
+
+def is_disk_io_error(exc: BaseException) -> bool:
+    """Return whether the database driver reported a local disk I/O failure."""
+
+    return "disk i/o error" in str(exc).lower()
 
 
 @dataclass(frozen=True)
@@ -1167,13 +1174,16 @@ def record_card_transition(
 def claim_next_worklane(conn: sqlite3.Connection, agent_name: str, worktree: str, branch: str) -> sqlite3.Row | None:
     """Assign the highest-priority planned implementation card to a developer."""
 
+    roles = tuple(sorted(CODE_PRODUCING_ROLES))
+    placeholders = ",".join("?" for _ in roles)
     lane = conn.execute(
-        """
+        f"""
         SELECT * FROM worklanes
-        WHERE stage = 'planned' AND role_type IN ('Developer', 'Designer')
+        WHERE stage = 'planned' AND role_type IN ({placeholders})
         ORDER BY priority ASC, id ASC
         LIMIT 1
-        """
+        """,
+        roles,
     ).fetchone()
     if lane is None:
         return None
@@ -1305,6 +1315,30 @@ def complete_card(conn: sqlite3.Connection, card_id: int, notes: str | None = No
     move_card_stage(conn, card_id, "done", status, notes, reason="completed")
 
 
+def retire_card(conn: sqlite3.Connection, card_id: int, notes: str | None = None, reason: str = "retired", agent_name: str = "") -> None:
+    """Mark a non-actionable card stale without pretending it was integrated."""
+
+    row = conn.execute("SELECT stage FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+    old_stage = str(row["stage"] if row else "")
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE worklanes
+        SET stage = 'done',
+            status = 'stale',
+            owner_agent_id = NULL,
+            done_at = COALESCE(done_at, ?),
+            last_activity_at = ?,
+            notes = COALESCE(?, notes)
+        WHERE id = ?
+        """,
+        (now, now, notes, card_id),
+    )
+    if old_stage != "done":
+        record_card_transition(conn, card_id, old_stage, "done", reason, agent_name)
+    log_event(conn, "card_retired", f"card#{card_id} retired as stale", agent_name=agent_name or None, payload={"card_id": card_id, "reason": reason})
+
+
 def review_ready_cards(conn: sqlite3.Connection, limit: int = 10) -> int:
     """Accept structured reports in review and route cards to integration or done."""
 
@@ -1357,6 +1391,13 @@ def record_agent_report(conn: sqlite3.Connection, report: Mapping[str, Any]) -> 
             accepted = False
         elif lane["stage"] == "development" and status in {"ready_for_review", "needs_verification", "ready_for_integration", "completed", "complete"}:
             move_card_stage(conn, lane_id, "review", "needs_verification", str(report.get("summary") or ""), reason="agent_report", agent_name=agent_name)
+        elif lane["stage"] == "development" and status in NON_ACTIONABLE_REPORT_STATUSES:
+            retire_card(conn, lane_id, str(report.get("summary") or status), reason=status, agent_name=agent_name)
+            if agent_name:
+                conn.execute(
+                    "UPDATE agents SET current_status = 'success', ended_at = ?, last_seen_at = ?, notes = ? WHERE name = ?",
+                    (now, now, f"Completed non-actionable card#{lane_id}: {status}", agent_name),
+                )
         elif lane["stage"] == "review" and status in {"review_passed", "accepted", "ready_for_integration", "done"}:
             if lane["integration_required"]:
                 move_card_stage(conn, lane_id, "integration", "ready_for_integration", str(report.get("summary") or ""), reason="review_report", agent_name=agent_name)
