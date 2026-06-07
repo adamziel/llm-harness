@@ -1166,6 +1166,9 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(parsed[1]["status"], "failed")
         unittest_rows = parse_test_output("test_a (tests.test_x.Case.test_a) ... ok\n")
         self.assertEqual(unittest_rows[0]["status"], "passed")
+        cargo_rows = parse_test_output("test native_invocation_cleanup::frees_magic_args ... \x1b[31mFAILED\x1b[0m\n")
+        self.assertEqual(cargo_rows[0]["nodeid"], "native_invocation_cleanup::frees_magic_args")
+        self.assertEqual(cargo_rows[0]["status"], "failed")
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
             subprocess.run(["git", "init"], cwd=tmp, check=True, capture_output=True)
@@ -1410,6 +1413,33 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("feature:planned", [row["source_key"] for row in candidates])
             self.assertIn(feature_card, [row["id"] for row in ready_lanes])
             self.assertIn("Gate: KNOWN-RED QUARANTINE", rendered)
+
+    def test_failed_global_gate_with_cargo_failures_is_quarantined_known_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tools").mkdir()
+            script = root / "tools" / "run-tests.sh"
+            script.write_text(
+                "#!/bin/sh\n"
+                "echo 'test cleanup::method_invocation ... FAILED'\n"
+                "echo 'test cleanup::static_invocation ... FAILED'\n"
+                "echo 'test result: FAILED. 432 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out'\n"
+                "exit 1\n"
+            )
+            script.chmod(0o755)
+            paths = db.bootstrap(root)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                run_tests_once(conn, root)
+                db.create_card(conn, "Continue compatibility work", role_type="Developer", source_key="feature:next")
+                candidates = scheduler.planned_developer_candidates(conn)
+                gate_mode = db.get_meta(conn, "test_gate_mode")
+                known_failures = json.loads(db.get_meta(conn, "test_gate_failures_json"))
+
+            self.assertEqual(gate_mode, "quarantined_known_red")
+            self.assertEqual(known_failures, ["cleanup::method_invocation", "cleanup::static_invocation"])
+            self.assertIn("feature:next", [row["source_key"] for row in candidates])
 
     def test_quarantined_gate_becomes_hard_when_new_failure_appears(self):
         with tempfile.TemporaryDirectory() as tmp:

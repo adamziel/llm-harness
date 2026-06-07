@@ -14,8 +14,10 @@ from typing import Any
 
 from . import db
 
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 PYTEST_RESULT_RE = re.compile(r"^(?P<node>\S+?)\s+(?P<status>PASSED|FAILED|SKIPPED|ERROR)\b")
 UNITTEST_RESULT_RE = re.compile(r"^(?P<test>\S+)\s+\((?P<case>[^)]+)\)\s+\.\.\.\s+(?P<status>ok|FAIL|ERROR|skipped\b.*)$")
+CARGO_RESULT_RE = re.compile(r"^test\s+(?P<node>.+?)\s+\.\.\.\s+(?P<status>ok|FAILED|ignored)\b")
 STATUS_EVENT_THROTTLE_SECONDS = 5 * 60
 PUBLIC_PHPT_METRIC_RE = re.compile(r"accepted_public_phpt_passes\s*[:=]\s*(?P<value>[0-9_,]+)\s*/\s*(?P<target>[0-9_,]+)")
 SOFT_KNOWN_RED_LIMIT = 5
@@ -76,11 +78,11 @@ def run_tests_once(conn: sqlite3.Connection, root: str | Path, command: list[str
 
 
 def parse_test_output(output: str) -> list[dict[str, Any]]:
-    """Extract pytest-style per-test rows when the runner prints them."""
+    """Extract per-test rows from common deterministic runners."""
 
     results = []
     for line in output.splitlines():
-        stripped = line.strip()
+        stripped = ANSI_ESCAPE_RE.sub("", line).strip()
         pytest_match = PYTEST_RESULT_RE.match(stripped)
         if pytest_match:
             node = pytest_match.group("node")
@@ -93,6 +95,12 @@ def parse_test_output(output: str) -> list[dict[str, Any]]:
             case = unittest_match.group("case")
             node = case
             results.append({"nodeid": node, "file": case.rsplit(".", 1)[0].replace(".", "/") + ".py", "status": status})
+            continue
+        cargo_match = CARGO_RESULT_RE.match(stripped)
+        if cargo_match:
+            node = cargo_match.group("node")
+            status = _normalize_cargo_status(cargo_match.group("status"))
+            results.append({"nodeid": node, "file": "cargo", "status": status})
     return results
 
 
@@ -105,6 +113,16 @@ def _normalize_unittest_status(status: str) -> str:
         return "skipped"
     if status == "ERROR":
         return "error"
+    return "failed"
+
+
+def _normalize_cargo_status(status: str) -> str:
+    """Map Cargo test words to the status vocabulary stored in SQLite."""
+
+    if status == "ok":
+        return "passed"
+    if status == "ignored":
+        return "skipped"
     return "failed"
 
 
