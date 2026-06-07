@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import sqlite3
 import subprocess
 import time
@@ -35,6 +36,9 @@ MAINLINE_BRANCH_FALLBACKS = ("main", "master", "trunk")
 MD_TEMPLATE = """# Harness Status
 
 Last generated: {{generated_at}}
+
+## Runtime alerts
+{{runtime_alerts}}
 
 ## Goal
 {{goal}}
@@ -82,6 +86,7 @@ pre { white-space: pre-wrap; }
 <body>
 <h1>Harness Status</h1>
 <p><strong>Last generated:</strong> {{generated_at}}</p>
+{{runtime_alerts_html}}
 <div class=\"card\"><h2>Goal</h2><p>{{goal_html}}</p></div>
 <div class=\"grid\">
   <div class=\"card\"><h2>Metric</h2><div class=\"bar\"><div class=\"fill\"></div></div><p>{{metric_html}}</p>{{metric_chart_html}}</div>
@@ -320,6 +325,7 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         "SELECT COUNT(*) AS count FROM worklanes WHERE status = 'integration_failed'"
     ).fetchone()
     metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM metadata").fetchall()}
+    runtime_alerts = _runtime_alerts(metadata, agents, active_work, pending_lanes)
     return {
         "goal": dict(goal) if goal else None,
         "agents": [dict(row) for row in agents],
@@ -336,6 +342,7 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         "queued_integration": dict(queued_integration) if queued_integration else {"count": 0, "delta": 0},
         "failed_integration": dict(failed_integration) if failed_integration else {"count": 0},
         "metadata": metadata,
+        "runtime_alerts": runtime_alerts,
     }
 
 
@@ -351,6 +358,9 @@ def dashboard(conn: sqlite3.Connection) -> str:
     goal_text = goal.get("text", "No goal recorded yet") if isinstance(goal, dict) else "No goal recorded yet"
     percent = float(metric.get("percent_ready", 0) if isinstance(metric, dict) else 0)
     metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    runtime_alerts = data.get("runtime_alerts") if isinstance(data.get("runtime_alerts"), list) else []
+    for alert in runtime_alerts:
+        lines.append(_box_line(width, f"!!! {alert} !!!", ANSI["red"] + ANSI["bold"]))
     red_banner = metadata.get("red_banner", "")
     if red_banner:
         lines.append(_box_line(width, red_banner, ANSI["red"]))
@@ -473,6 +483,7 @@ def _markdown_context(data: dict[str, object]) -> dict[str, str]:
     metric = data.get("metric") or {}
     return {
         "generated_at": str(data["generated_at"]),
+        "runtime_alerts": "\n".join(f"- **{alert}**" for alert in data.get("runtime_alerts", [])) or "None.",
         "goal": str(goal.get("text", "No goal recorded yet") if isinstance(goal, dict) else "No goal recorded yet"),
         "metric": _metric_text(metric),
         "agents": _markdown_table(data.get("agents", []), ["name", "role", "current_status", "tmux_window", "worktree"]),
@@ -492,6 +503,7 @@ def _html_context(data: dict[str, object]) -> dict[str, str]:
     goal = data.get("goal") or {}
     return {
         "generated_at": html.escape(str(data["generated_at"])),
+        "runtime_alerts_html": _html_runtime_alerts(data.get("runtime_alerts", [])),
         "metric_percent": f"{percent:.1f}",
         "goal_html": html.escape(str(goal.get("text", "No goal recorded yet") if isinstance(goal, dict) else "No goal recorded yet")),
         "metric_html": html.escape(_metric_text(metric)),
@@ -550,6 +562,70 @@ def _html_resource(resources: object) -> str:
         )
     rows.append("</table>")
     return "".join(rows)
+
+
+def _html_runtime_alerts(alerts: object) -> str:
+    """Render runtime alerts prominently in the HTML status page."""
+
+    if not isinstance(alerts, list) or not alerts:
+        return ""
+    items = "".join(f"<li>{html.escape(str(alert))}</li>" for alert in alerts)
+    return f"<div class=\"card bad\"><h2>Runtime alerts</h2><ul>{items}</ul></div>"
+
+
+def _runtime_alerts(metadata: dict[str, str], agents: list[sqlite3.Row], active_work: list[sqlite3.Row], pending_lanes: list[sqlite3.Row]) -> list[str]:
+    """Return visible status alerts for dead harness control-plane processes."""
+
+    alerts: list[str] = []
+    if metadata.get("harness_stopped") == "1" or metadata.get("red_banner") == "Harness stopped.":
+        return alerts
+    active_agents = sum(1 for agent in agents if is_active_agent_status(str(agent["current_status"])))
+    scheduler_pid = str(metadata.get("scheduler_pid", "")).strip()
+    if scheduler_pid and scheduler_pid != "0":
+        try:
+            pid = int(scheduler_pid)
+        except ValueError:
+            alerts.append(f"HARNESS SCHEDULER STATUS UNKNOWN: invalid scheduler pid {scheduler_pid!r}")
+        else:
+            command = _process_command(pid)
+            if command is None:
+                alerts.append(f"HARNESS SCHEDULER DEAD: recorded ./harness run pid {pid} is not running")
+            elif command and not _looks_like_scheduler_command(command):
+                alerts.append(f"HARNESS SCHEDULER PID STALE: pid {pid} now runs {shorten(command, width=48, placeholder='…')}")
+    elif active_agents:
+        alerts.append(f"HARNESS SCHEDULER NOT RECORDED: {active_agents} active agents exist but no ./harness run pid is recorded")
+
+    active_lane_ids = {int(row["lane_id"]) for row in active_work if row["lane_id"] is not None}
+    pending_lane_ids = {int(row["id"]) for row in pending_lanes if row["id"] is not None}
+    overlap = sorted(active_lane_ids & pending_lane_ids)
+    if overlap:
+        shown = ", ".join(f"card#{card_id}" for card_id in overlap[:5])
+        suffix = f", and {len(overlap) - 5} more" if len(overlap) > 5 else ""
+        alerts.append(f"CARD BOARD INCONSISTENT: {shown}{suffix} appear both active and unassigned")
+    return alerts
+
+
+def _process_command(pid: int) -> str | None:
+    """Return a process command, an empty string if hidden, or None if absent."""
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    try:
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], text=True, capture_output=True, check=False, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _looks_like_scheduler_command(command: str) -> bool:
+    """Return whether a process command still looks like harness run/watchdog."""
+
+    normalized = " ".join(command.lower().split())
+    return "harness" in normalized and (" run" in normalized or " watchdog" in normalized)
 
 
 def _sparkline(rows: object, value_key: str) -> str:

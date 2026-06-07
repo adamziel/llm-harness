@@ -394,6 +394,39 @@ class HarnessTests(unittest.TestCase):
                 self.assertIn(f"card#{ready_lane_id} integration/ready_for_integration/Developer: Merge finished runtime lane", text)
                 self.assertIn("status is alive", text)
 
+    def test_dashboard_warns_when_recorded_scheduler_pid_is_dead(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "scheduler_pid", "99999999")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%1", cwd=tmp)
+                text = dashboard(conn)
+
+            self.assertIn("HARNESS SCHEDULER DEAD", text)
+
+    def test_dashboard_warns_when_active_agents_have_no_scheduler_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%1", cwd=tmp)
+                text = dashboard(conn)
+
+            self.assertIn("HARNESS SCHEDULER NOT RECORDED", text)
+
+    def test_dashboard_does_not_warn_for_intentionally_stopped_harness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "harness_stopped", "1")
+                db.set_meta(conn, "scheduler_pid", "99999999")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%1", cwd=tmp)
+                text = dashboard(conn)
+
+            self.assertNotIn("HARNESS SCHEDULER DEAD", text)
+
     def test_status_update_commits_and_pushes_status_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
             root = Path(tmp) / "repo"
