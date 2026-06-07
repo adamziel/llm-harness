@@ -1320,7 +1320,7 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual((stale_owner["stage"], stale_owner["status"], stale_owner["owner_agent_id"]), ("planned", "queued", None))
             self.assertEqual(sum(1 for row in duplicate_states if row["status"] != "stale"), 1)
 
-    def test_scheduler_once_starts_support_windows_and_minimal_team(self):
+    def test_scheduler_once_starts_interactive_windows_and_supervised_loops(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
@@ -1333,25 +1333,56 @@ class HarnessTests(unittest.TestCase):
                 conn.commit()
             fake = FakeTmux()
             scheduler = HarnessScheduler(root, tmux=fake)
-            code = scheduler.run(goal="Build something", team="minimal", once=True)
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                code = scheduler.run(goal="Build something", team="minimal", once=True)
             self.assertEqual(code, 0)
             window_names = {window for _, window, _ in fake.commands}
             self.assertIn("manhole", window_names)
-            self.assertIn("status", window_names)
-            self.assertIn("integration", window_names)
+            self.assertNotIn("status", window_names)
+            self.assertNotIn("updater", window_names)
+            self.assertNotIn("integration", window_names)
+            self.assertNotIn("tests", window_names)
             self.assertNotIn("switch:status", window_names)
-            self.assertIn(("fake-session", "status", "watch -c -n 5 ./harness status"), fake.commands)
-            self.assertIn(("fake-session", "integration", "while true; do ./harness integrate; sleep 30; done"), fake.commands)
-            self.assertIn(("fake-session", "tests", "while true; do ./harness test-loop --once; sleep 5; done"), fake.commands)
-            codex_commands = [command for _, window, command in fake.commands if window not in {"manhole", "status", "updater", "integration", "tests"} and not window.startswith("switch:")]
+            codex_commands = [command for _, window, command in fake.commands if window != "manhole" and not window.startswith("switch:")]
             self.assertTrue(codex_commands)
             self.assertTrue(all("--yolo" in command and f"--model {CODEX_MODEL}" in command and f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"' in command for command in codex_commands))
             self.assertIn("Default to supervisor/read-only mode", (root / ".harness" / "prompts" / "manhole.md").read_text())
+            output = stdout.getvalue()
+            self.assertIn("[scheduler]", output)
+            self.assertIn("[status]", output)
+            self.assertIn("[integration]", output)
+            self.assertIn("[tests]", output)
             with db.connect(root / ".harness" / "harness.sqlite3") as conn:
                 agents = db.list_agents(conn)
                 self.assertEqual([agent["role"] for agent in agents], ["Coordinator"])
                 self.assertEqual(db.get_meta(conn, "red_banner"), "")
                 self.assertEqual(db.get_meta(conn, "harness_stopped"), "0")
+
+    def test_supervisor_once_isolates_loop_failures_and_continues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(scheduler, "scheduler_tick_action", return_value="tick ok") as scheduler_tick,
+                mock.patch.object(scheduler, "status_refresh_action", return_value="status ok") as status_refresh,
+                mock.patch.object(scheduler, "integration_action", side_effect=RuntimeError("boom")) as integration_action,
+                mock.patch.object(scheduler, "test_loop_action", return_value="tests ok") as test_loop,
+                mock.patch("sys.stdout", stdout),
+            ):
+                result = scheduler.run_deterministic_once("minimal")
+
+            self.assertTrue(scheduler_tick.called)
+            self.assertTrue(status_refresh.called)
+            self.assertTrue(integration_action.called)
+            self.assertTrue(test_loop.called)
+            self.assertEqual(result["scheduler"], "ok")
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["tests"], "ok")
+            self.assertEqual(result["integration"], "error")
+            output = stdout.getvalue()
+            self.assertIn("[integration] ERROR boom", output)
+            self.assertIn("[tests] tests ok", output)
 
     def test_team_capacity_counts_live_non_terminal_developers(self):
         with tempfile.TemporaryDirectory() as tmp:

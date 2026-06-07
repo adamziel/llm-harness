@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import signal
@@ -16,11 +17,12 @@ from typing import Any
 from . import db
 from .codex import MCP_SERVER_NAME, build_codex_command, codex_mcp_config_args
 from .indexer import refresh_index
-from .integration import branch_integration_state
+from .integration import branch_integration_state, integrate_once
 from .janitor import run_janitor
 from .resources import sample_resources
 from .roles import prompt_for_role, slug_role, specs_for_team
 from .status import STATUS_REFRESH_SECONDS, ensure_templates, refresh_reports
+from .testing_loop import run_tests_once
 from .tmux import Tmux, TmuxUnavailable, _session_name, shell_command
 
 IDLE_SECONDS = 30 * 60
@@ -150,46 +152,27 @@ class HarnessScheduler:
             return start_code
 
         if once:
-            def tick(conn: sqlite3.Connection) -> None:
-                self.tick_once(conn, self.effective_team(conn, team))
-                refresh_reports(conn, self.root)
+            self.run_deterministic_once(team)
+
+            def clear_pid(conn: sqlite3.Connection) -> None:
                 db.set_meta(conn, "scheduler_pid", "")
 
-            self.with_retrying_db("one-shot tick", tick)
+            self.with_retrying_db("one-shot shutdown", clear_pid)
             return 0
 
-        print("Harness scheduler running. Press Ctrl-C to stop; workers remain inspectable in tmux.", flush=True)
-        last_db_warning = ""
+        print("Harness supervisor running. Press Ctrl-C to stop; workers remain inspectable in tmux.", flush=True)
         try:
-            while True:
-                def tick(conn: sqlite3.Connection) -> None:
-                    self.tick_once(conn, self.effective_team(conn, team))
-                    if self.status_refresh_due(conn):
-                        refresh_reports(conn, self.root)
-
-                try:
-                    self.with_retrying_db("scheduler tick", tick)
-                    last_db_warning = ""
-                except Exception as exc:
-                    if not db.is_disk_io_error(exc):
-                        raise
-                    warning = (
-                        "Harness database disk I/O error during scheduler tick; keeping the scheduler alive. "
-                        "Free disk space, repair the filesystem/database, or run with HARNESS_DB_DRIVER=turso."
-                    )
-                    if warning != last_db_warning:
-                        print(f"\033[31m{warning}\033[0m", file=sys.stderr)
-                        last_db_warning = warning
-                time.sleep(5)
+            asyncio.run(self.supervisor_loop(team))
         except KeyboardInterrupt:
-            print("Harness scheduler stopped by user; agent tmux windows remain available.", flush=True)
+            print("Harness supervisor stopped by user; agent tmux windows remain available.", flush=True)
 
             def mark_stopped(conn: sqlite3.Connection) -> None:
-                db.log_event(conn, "scheduler", "Harness scheduler stopped by user")
+                db.log_event(conn, "scheduler", "Harness supervisor stopped by user")
                 db.set_meta(conn, "scheduler_pid", "")
 
             self.with_retrying_db("shutdown", mark_stopped)
-            return 130
+            return 0
+        return 0
 
     def with_retrying_db(self, label: str, action):
         """Run scheduler database work through SQLite/Turso's busy handler."""
@@ -219,11 +202,110 @@ class HarnessScheduler:
             raise last_error
         raise RuntimeError(f"{label} did not run")
 
-    def status_refresh_due(self, conn: sqlite3.Connection) -> bool:
-        """Throttle deterministic status publishing to the renderer interval."""
+    def run_deterministic_once(self, team: str) -> dict[str, str]:
+        """Run every deterministic loop once and return per-loop health."""
 
-        last = float(db.get_meta(conn, "last_status_refresh_epoch", "0") or 0)
-        return time.time() - last >= STATUS_REFRESH_SECONDS
+        return asyncio.run(self.supervisor_once(team))
+
+    async def supervisor_once(self, team: str) -> dict[str, str]:
+        """Execute one isolated pass of each deterministic loop."""
+
+        results: dict[str, str] = {}
+        for name, action in (
+            ("scheduler", lambda: self.scheduler_tick_action(team)),
+            ("status", self.status_refresh_action),
+            ("integration", self.integration_action),
+            ("tests", self.test_loop_action),
+        ):
+            results[name] = await self.supervised_once(name, action)
+        return results
+
+    async def supervisor_loop(self, team: str) -> None:
+        """Run deterministic harness loops in one process with isolated failures."""
+
+        tasks = [
+            asyncio.create_task(self.supervised_loop("scheduler", 5, lambda: self.scheduler_tick_action(team))),
+            asyncio.create_task(self.supervised_loop("integration", 30, self.integration_action)),
+            asyncio.create_task(self.supervised_loop("tests", 5, self.test_loop_action)),
+            asyncio.create_task(self.supervised_loop("status", STATUS_REFRESH_SECONDS, self.status_refresh_action, initial_delay=STATUS_REFRESH_SECONDS)),
+        ]
+        await asyncio.gather(*tasks)
+
+    async def supervised_loop(self, name: str, interval: int, action, initial_delay: int = 0) -> None:
+        """Run one deterministic loop forever without letting failures escape."""
+
+        if initial_delay > 0:
+            await asyncio.sleep(initial_delay)
+        while True:
+            started = time.monotonic()
+            await self.supervised_once(name, action)
+            elapsed = time.monotonic() - started
+            await asyncio.sleep(max(0, interval - elapsed))
+
+    async def supervised_once(self, name: str, action) -> str:
+        """Run one loop pass in a worker thread and print a prefixed summary."""
+
+        try:
+            result = await asyncio.to_thread(action)
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            self.supervisor_log(name, f"ERROR {message}")
+            self.record_supervisor_error(name, message)
+            return "error"
+        self.supervisor_log(name, str(result or "ok"))
+        return "ok"
+
+    def supervisor_log(self, name: str, message: str) -> None:
+        """Print one structured supervisor line to the single run stream."""
+
+        print(f"{db.utc_now()} [{name}] {message}", flush=True)
+
+    def record_supervisor_error(self, name: str, message: str) -> None:
+        """Persist loop failures when the database is reachable."""
+
+        try:
+            with db.connect(self.paths.db) as conn:
+                db.init_db(conn)
+                db.log_event(conn, "supervisor_error", f"{name}: {message}", payload={"loop": name})
+        except Exception:
+            return
+
+    def scheduler_tick_action(self, team: str) -> str:
+        """Run one scheduler tick using its own database connection."""
+
+        def tick(conn: sqlite3.Connection) -> None:
+            self.tick_once(conn, self.effective_team(conn, team))
+
+        self.with_retrying_db("scheduler tick", tick)
+        return "tick complete"
+
+    def status_refresh_action(self) -> str:
+        """Refresh generated status artifacts using its own database connection."""
+
+        def update(conn: sqlite3.Connection) -> tuple[Path, Path]:
+            return refresh_reports(conn, self.root)
+
+        md, html = self.with_retrying_db("status refresh", update)
+        return f"updated {md.name} and {html.name}"
+
+    def integration_action(self) -> str:
+        """Run one deterministic integration pass using its own database connection."""
+
+        def integrate(conn: sqlite3.Connection) -> dict[str, int]:
+            db.review_ready_cards(conn)
+            return integrate_once(conn, self.root)
+
+        result = self.with_retrying_db("integration loop", integrate)
+        return "integrated={integrated} failed={failed} skipped={skipped}".format(**result)
+
+    def test_loop_action(self) -> str:
+        """Run one deterministic full-suite test pass using its own database connection."""
+
+        def tests(conn: sqlite3.Connection) -> int:
+            return run_tests_once(conn, self.root)
+
+        run_id = self.with_retrying_db("test loop", tests)
+        return f"recorded test run {run_id}"
 
     def validate_initialized(self, conn: sqlite3.Connection) -> bool:
         """Require explicit initialization before resident sessions are started."""
@@ -656,7 +738,7 @@ class HarnessScheduler:
         )
 
     def start_support_windows(self, conn: sqlite3.Connection) -> None:
-        """Start manhole, status, updater, and test-loop tmux windows when tmux exists."""
+        """Start only interactive support windows; deterministic loops run in-process."""
 
         try:
             session = self.tmux.current_or_create_session(self.root)
@@ -685,15 +767,7 @@ class HarnessScheduler:
         )
         manhole_command = build_codex_command(manhole_prompt, self.root, self.root, self.paths.db, self.harness_executable())
         self.tmux.ensure_window(session, "manhole", manhole_command)
-        status_command = "watch -c -n 5 ./harness status"
-        self.tmux.ensure_window(session, "status", status_command)
-        updater_command = "while true; do ./harness update-status; sleep 900; done"
-        self.tmux.ensure_window(session, "updater", updater_command)
-        integration_command = "while true; do ./harness integrate; sleep 30; done"
-        self.tmux.ensure_window(session, "integration", integration_command)
-        tests_command = "while true; do ./harness test-loop --once; sleep 5; done"
-        self.tmux.ensure_window(session, "tests", tests_command)
-        db.log_event(conn, "tmux", "Support windows ready", payload={"session": session, "attach": attach})
+        db.log_event(conn, "tmux", "Interactive support windows ready", payload={"session": session, "attach": attach})
 
     def ensure_team(self, conn: sqlite3.Connection, team: str) -> None:
         """Keep the small resident team alive while respecting integration backpressure."""

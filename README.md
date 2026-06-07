@@ -36,24 +36,25 @@ The main user-facing CLI is:
 ./harness logs                            # inspect recent events
 ```
 
-`run` starts the internal updater, test loop, janitor, MCP, watchdog/service
-helpers, status page generation, and tmux windows as needed. Those internal
-entrypoints are intentionally hidden from help because users should not run them
+`run` starts one in-process deterministic supervisor. That supervisor owns the
+scheduler tick, status page generation, integration, and continuous test loop,
+and prints their prefixed logs to the single `./harness run` stream. Those
+internal entrypoints remain hidden from help because users should not run them
 directly.
 
 `init` records the goal in `.harness/harness.sqlite3`, initializes Git if needed,
 creates `DEVELOPMENT.md`, `PLAN.md`, status templates, role prompt files, and
 validates the harness MCP. `run` then starts a small resident control plane:
-Coordinator, Integrator, queued Developer capacity, and Manhole/support windows. Conceptual
+Coordinator, Integrator, queued Developer capacity, and a Manhole window. Conceptual
 roles such as Architect, Conflict Resolver, Lane Scout, and Goal Planner are
 capabilities invoked as short-lived jobs rather than standing sessions. All
 Codex worker commands are generated with `--yolo` and `--model gpt-5.5 -c model_reasoning_effort="xhigh"`.
 The Manhole starts in supervisor/read-only mode and should only take concrete
-actions when the user explicitly authorizes them.
-The deterministic integration support window runs `./harness integrate` on a
-short loop so ready branches are merged and pushed from a clean harness-owned
-worktree. The full test loop is separate and runs continuously; integration
-only runs bounded smoke checks.
+actions when the user explicitly authorizes them. Deterministic integration runs
+inside the supervisor, merges and pushes ready branches from a clean
+harness-owned worktree, and uses bounded smoke checks. The full test loop also
+runs inside the supervisor so one failing loop is logged and recorded without
+stopping the others.
 
 ## Persistent state
 
@@ -73,8 +74,9 @@ The MCP server exposes that state through deterministic tools documented in
 ## Status reports
 
 `./harness status` prints a compact TUI dashboard with Unicode borders and ANSI
-colors. The updater writes `STATUS.md` and `STATUS.html` from templates created
-on first run at `.harness/STATUS_TEMPLATE.md` and `.harness/STATUS_TEMPLATE.html`.
+colors. The supervisor writes `STATUS.md` and `STATUS.html` from templates
+created on first run at `.harness/STATUS_TEMPLATE.md` and
+`.harness/STATUS_TEMPLATE.html`.
 Each deterministic status update stages only the status artifacts, commits them,
 and pushes that commit to the repository's `origin` mainline branch when a safe
 remote is configured.
