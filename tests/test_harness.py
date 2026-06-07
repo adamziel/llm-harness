@@ -1250,7 +1250,7 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(spawned_developers, ["developer-2", "developer-3", "developer-4", "developer-5", "developer-6"])
             self.assertEqual(assigned, 5)
 
-    def test_non_actionable_developer_report_retires_card_and_worker(self):
+    def test_non_actionable_developer_report_retires_card_and_keeps_worker_reassignable(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
             with db.connect(paths.db) as conn:
@@ -1272,7 +1272,112 @@ class HarnessTests(unittest.TestCase):
                 card = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (card_id,)).fetchone()
                 agent = conn.execute("SELECT current_status FROM agents WHERE name = 'developer-1'").fetchone()
             self.assertEqual((card["stage"], card["status"]), ("done", "stale"))
-            self.assertEqual(agent["current_status"], "success")
+            self.assertEqual(agent["current_status"], "running")
+
+    def test_non_actionable_status_variant_releases_developer_for_new_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                stale_card_id = db.queue_worklane(conn, "Superseded conflict card")
+                fresh_card_id = db.queue_worklane(conn, "Fresh non-overlapping card")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                db.assign_card(conn, stale_card_id, "developer-1")
+                db.record_agent_report(
+                    conn,
+                    {
+                        "agent_id": "developer-1",
+                        "card_id": stale_card_id,
+                        "worklane_id": stale_card_id,
+                        "stage": "development",
+                        "status": "superseded_by_active_resolver_no_source_edits",
+                        "summary": "Another resolver owns this work now.",
+                    },
+                )
+                scheduler.requeue_developers_without_cards(conn)
+                stale_card = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (stale_card_id,)).fetchone()
+                fresh_card = conn.execute("SELECT stage, status, owner_agent_id FROM worklanes WHERE id = ?", (fresh_card_id,)).fetchone()
+                agent = conn.execute("SELECT id, current_status FROM agents WHERE name = 'developer-1'").fetchone()
+
+            self.assertEqual((stale_card["stage"], stale_card["status"]), ("done", "stale"))
+            self.assertEqual((fresh_card["stage"], fresh_card["status"], fresh_card["owner_agent_id"]), ("development", "assigned", agent["id"]))
+            self.assertEqual(agent["current_status"], "running")
+            self.assertEqual(len(fake.sent), 1)
+            self.assertIn(f"Assigned card #{fresh_card_id}", fake.sent[0][1])
+
+    def test_scheduler_retires_overlapping_integration_resolver_cards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                original_id = db.queue_worklane(conn, "Original branch needing conflict resolution", status="integration_failed")
+                competing_id = db.create_card(
+                    conn,
+                    f"Resolve integration failure for card #{original_id}: stale duplicate",
+                    role_type="Developer",
+                    source_key=f"integration-failure:{original_id}:merge_conflicts:developer",
+                    description="Branch: work/same-conflict\nOld duplicate.",
+                )
+                active_id = db.create_card(
+                    conn,
+                    f"Resolve integration failure for card #{original_id}: active resolver",
+                    role_type="Conflict Resolver",
+                    source_key=f"integration-failure:{original_id}:merge_conflicts:resolver",
+                    description="Branch: work/same-conflict\nActive resolver.",
+                )
+                fresh_id = db.queue_worklane(conn, "Fresh non-overlapping implementation")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                db.upsert_agent(conn, name="conflict-resolver-1", role="Conflict Resolver", current_status="running", tmux_pane="%resolver-1", cwd=tmp)
+                db.assign_card(conn, competing_id, "developer-1")
+                db.assign_card(conn, active_id, "conflict-resolver-1")
+
+                scheduler.repair_control_plane_cards(conn)
+                scheduler.requeue_developers_without_cards(conn)
+
+                competing = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (competing_id,)).fetchone()
+                active = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (active_id,)).fetchone()
+                fresh = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (fresh_id,)).fetchone()
+
+            self.assertEqual((competing["stage"], competing["status"]), ("done", "stale"))
+            self.assertEqual((active["stage"], active["status"]), ("development", "assigned"))
+            self.assertEqual((fresh["stage"], fresh["status"]), ("development", "assigned"))
+            self.assertEqual(len(fake.sent), 1)
+            self.assertIn(f"Assigned card #{fresh_id}", fake.sent[0][1])
+
+    def test_scheduler_retires_resolver_card_for_done_original_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                original_id = db.queue_worklane(conn, "Already integrated branch", status="ready_for_integration")
+                db.complete_card(conn, original_id, "Already integrated by a newer card.")
+                stale_resolver_id = db.create_card(
+                    conn,
+                    f"Resolve integration failure for card #{original_id}: stale resolver",
+                    role_type="Developer",
+                    source_key=f"integration-failure:{original_id}:merge_conflicts",
+                    description="Branch: work/already-merged\nThis branch is stale.",
+                )
+                fresh_id = db.queue_worklane(conn, "Fresh independent implementation")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                db.assign_card(conn, stale_resolver_id, "developer-1")
+
+                scheduler.repair_control_plane_cards(conn)
+                scheduler.requeue_developers_without_cards(conn)
+
+                stale_resolver = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (stale_resolver_id,)).fetchone()
+                fresh = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (fresh_id,)).fetchone()
+
+            self.assertEqual((stale_resolver["stage"], stale_resolver["status"]), ("done", "stale"))
+            self.assertEqual((fresh["stage"], fresh["status"]), ("development", "assigned"))
+            self.assertEqual(len(fake.sent), 1)
+            self.assertIn(f"Assigned card #{fresh_id}", fake.sent[0][1])
 
     def test_repair_retires_old_non_actionable_development_cards(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1294,7 +1399,7 @@ class HarnessTests(unittest.TestCase):
                 card = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (card_id,)).fetchone()
                 agent = conn.execute("SELECT current_status FROM agents WHERE name = 'developer-1'").fetchone()
             self.assertEqual((card["stage"], card["status"]), ("done", "stale"))
-            self.assertEqual(agent["current_status"], "success")
+            self.assertEqual(agent["current_status"], "running")
 
     def test_stop_cleans_harness_runtime_state(self):
         with tempfile.TemporaryDirectory() as tmp:

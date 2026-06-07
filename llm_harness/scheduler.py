@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import shlex
 import sqlite3
@@ -41,6 +42,8 @@ LOW_RESOURCE_SECONDS = 60
 HIGH_RESOURCE_SECONDS = 30
 INTEGRATION_BACKPRESSURE_SECONDS = 20 * 60
 INTEGRATION_READY_STATUSES = ("ready_for_integration",)
+INTEGRATION_RESOLUTION_CARD_RE = re.compile(r"card #(\d+)")
+INTEGRATION_BRANCH_RE = re.compile(r"(?m)^Branch:\s*(\S+)")
 SUPPORT_ROLES = {"Manhole", "Status reporter", "Janitor"}
 DEFAULT_DEVELOPMENT_MD = """# Development Guide
 
@@ -745,6 +748,7 @@ class HarnessScheduler:
         self.retire_non_actionable_development_cards(conn)
         self.requeue_cards_from_terminal_agents(conn)
         self.dedupe_global_test_failure_cards(conn)
+        self.dedupe_integration_resolution_cards(conn)
 
     def retire_capacity_cards(self, conn: sqlite3.Connection) -> int:
         """Retire fake Developer capacity cards created by older scheduler versions."""
@@ -772,9 +776,8 @@ class HarnessScheduler:
     def retire_non_actionable_development_cards(self, conn: sqlite3.Connection) -> int:
         """Retire cards that older releases left assigned after no-op reports."""
 
-        placeholders = ",".join("?" for _ in db.NON_ACTIONABLE_REPORT_STATUSES)
         rows = conn.execute(
-            f"""
+            """
             SELECT w.id, w.owner_agent_id, a.name AS agent_name, r.status, r.report_json
             FROM worklanes w
             JOIN agent_reports r ON r.id = (
@@ -786,21 +789,22 @@ class HarnessScheduler:
             )
             LEFT JOIN agents a ON a.id = w.owner_agent_id
             WHERE w.stage = 'development'
-              AND r.status IN ({placeholders})
-            """,
-            tuple(sorted(db.NON_ACTIONABLE_REPORT_STATUSES)),
+            """
         ).fetchall()
         now = db.utc_now()
         for row in rows:
+            if not db.is_non_actionable_report_status(str(row["status"])):
+                continue
             db.retire_card(conn, int(row["id"]), f"Retired after non-actionable report: {row['status']}", reason=str(row["status"]), agent_name=str(row["agent_name"] or ""))
             if row["agent_name"]:
                 conn.execute(
-                    "UPDATE agents SET current_status = 'success', ended_at = ?, last_seen_at = ?, notes = ? WHERE name = ?",
-                    (now, now, f"Completed non-actionable card#{row['id']}: {row['status']}", row["agent_name"]),
+                    "UPDATE agents SET current_status = 'running', ended_at = NULL, last_seen_at = ?, notes = ? WHERE name = ?",
+                    (now, f"Awaiting reassignment after non-actionable card#{row['id']}: {row['status']}", row["agent_name"]),
                 )
-        if rows:
-            db.log_event(conn, "card_repair", f"Retired {len(rows)} non-actionable development cards")
-        return len(rows)
+        retired = len([row for row in rows if db.is_non_actionable_report_status(str(row["status"]))])
+        if retired:
+            db.log_event(conn, "card_repair", f"Retired {retired} non-actionable development cards")
+        return retired
 
     def requeue_cards_from_terminal_agents(self, conn: sqlite3.Connection) -> int:
         """Return development cards owned by terminal workers to planned."""
@@ -872,8 +876,96 @@ class HarnessScheduler:
         db.log_event(conn, "card_repair", f"Retired {len(stale_ids)} duplicate global test-failure cards", payload={"kept_card_id": keep, "retired_card_ids": stale_ids[:50]})
         return len(stale_ids)
 
+    def dedupe_integration_resolution_cards(self, conn: sqlite3.Connection) -> int:
+        """Keep one active resolver per integration failure and retire competing cards."""
+
+        rows = conn.execute(
+            """
+            SELECT
+                w.*,
+                a.name AS agent_name,
+                a.role AS agent_role,
+                a.current_status AS agent_status
+            FROM worklanes w
+            LEFT JOIN agents a ON a.id = w.owner_agent_id
+            WHERE w.stage != 'done'
+              AND (
+                w.source_key LIKE 'integration-failure:%'
+                OR w.title LIKE 'Resolve integration failure for card #%'
+              )
+            ORDER BY w.id
+            """
+        ).fetchall()
+        groups: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            key = _integration_resolution_key(row)
+            if key:
+                groups.setdefault(key, []).append(row)
+
+        retired = 0
+        for key, cards in groups.items():
+            keep_id: int | None = self.integration_resolution_card_to_keep(cards)
+            target_ids = {target_id for row in cards for target_id in [_integration_resolution_target_id(row)] if target_id is not None}
+            if len(target_ids) == 1:
+                original = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (next(iter(target_ids)),)).fetchone()
+                if original and (original["stage"] == "done" or original["status"] in {"integrated", "stale", "abandoned", "cancelled"}):
+                    keep_id = None
+            for row in cards:
+                if int(row["id"]) == keep_id:
+                    continue
+                note = (
+                    f"Superseded by integration-resolution card#{keep_id} for {key}."
+                    if keep_id is not None
+                    else f"Superseded because the original integration target for {key} is already done."
+                )
+                self.retire_card_and_release_agent(
+                    conn,
+                    row,
+                    note,
+                )
+                retired += 1
+        if retired:
+            db.log_event(conn, "card_repair", f"Retired {retired} overlapping integration-resolution cards")
+        return retired
+
+    def integration_resolution_card_to_keep(self, cards: list[sqlite3.Row]) -> int | None:
+        """Choose the one card that should continue for an integration failure."""
+
+        if not cards:
+            return None
+
+        def score(row: sqlite3.Row) -> tuple[int, int, int, int, int]:
+            active = 1 if row["agent_status"] and db.is_active_agent_status(str(row["agent_status"])) else 0
+            active_resolver = 1 if active and row["agent_role"] == "Conflict Resolver" else 0
+            resolver_card = 1 if row["role_type"] == "Conflict Resolver" else 0
+            development = 1 if row["stage"] == "development" else 0
+            return (active_resolver, active, resolver_card, development, int(row["id"]))
+
+        return int(max(cards, key=score)["id"])
+
+    def retire_card_and_release_agent(self, conn: sqlite3.Connection, row: sqlite3.Row, note: str) -> None:
+        """Retire a duplicate card and leave Developers available for new work."""
+
+        agent_name = str(row["agent_name"] or "")
+        agent_role = str(row["agent_role"] or "")
+        active_agent = bool(row["agent_status"] and db.is_active_agent_status(str(row["agent_status"])))
+        db.retire_card(conn, int(row["id"]), note, reason="superseded", agent_name=agent_name)
+        if not agent_name or not active_agent:
+            return
+        now = db.utc_now()
+        if agent_role == "Developer":
+            conn.execute(
+                "UPDATE agents SET current_status = 'running', ended_at = NULL, last_seen_at = ?, notes = ? WHERE name = ?",
+                (now, f"Awaiting reassignment after duplicate card#{row['id']} was retired", agent_name),
+            )
+        else:
+            conn.execute(
+                "UPDATE agents SET current_status = 'success', ended_at = ?, last_seen_at = ?, notes = ? WHERE name = ?",
+                (now, now, f"Completed duplicate card#{row['id']}: superseded", agent_name),
+            )
+
     def requeue_developers_without_cards(self, conn: sqlite3.Connection) -> None:
-        """Stop live Developer panes that are not attached to exactly one card."""
+        """Reassign idle Developers, and stop panes with ambiguous card ownership."""
 
         developers = conn.execute(
             "SELECT * FROM agents WHERE role = 'Developer' AND current_status NOT IN ('crash', 'success', 'stopped')"
@@ -893,6 +985,27 @@ class HarnessScheduler:
             ).fetchall()
             if len(rows) == 1:
                 continue
+            if len(rows) == 0:
+                lane = db.claim_next_worklane(conn, agent["name"], agent["worktree"], agent["branch"])
+                if lane is not None:
+                    target = _tmux_target(agent)
+                    try:
+                        if not target:
+                            raise RuntimeError("tmux target was not recorded")
+                        self.tmux.send_prompt(target, self.card_prompt(conn, int(lane["id"]), lane["title"], ""))
+                        db.log_event(
+                            conn,
+                            "developer_reassigned",
+                            f"Reassigned {agent['name']} to card#{lane['id']}",
+                            agent_name=agent["name"],
+                            payload={"card_id": int(lane["id"]), "worklane_id": int(lane["id"])},
+                        )
+                        continue
+                    except Exception:
+                        db.requeue_card(conn, int(lane["id"]), f"Requeued after prompt failed while reassigning {agent['name']}.")
+                        db.update_agent_status(conn, agent["name"], "crash", "tmux prompt failed during reassignment", ended=True)
+                        db.log_event(conn, "agent_missing", f"{agent['name']} tmux prompt failed during reassignment", agent_name=agent["name"])
+                        continue
             db.update_agent_status(conn, agent["name"], "stopped", "Stopped because no assigned development card was found", ended=True)
             target = _tmux_target(agent)
             if target:
@@ -1462,6 +1575,40 @@ def _agent_list(names: list[str], limit: int = 10) -> str:
     shown = names[:limit]
     suffix = f", and {len(names) - limit} more" if len(names) > limit else ""
     return ", ".join(shown) + suffix
+
+
+def _integration_resolution_key(row: sqlite3.Row) -> str:
+    """Return the deterministic overlap key for an integration-resolution card."""
+
+    description = str(row["description"] or "")
+    branch = INTEGRATION_BRANCH_RE.search(description)
+    if branch:
+        return f"branch:{branch.group(1)}"
+    source_key = str(row["source_key"] or "")
+    if source_key.startswith("integration-failure:"):
+        parts = source_key.split(":", 2)
+        if len(parts) >= 2 and parts[1]:
+            return f"card:{parts[1]}"
+    for value in (row["title"], description, row["notes"]):
+        match = INTEGRATION_RESOLUTION_CARD_RE.search(str(value or ""))
+        if match:
+            return f"card:{match.group(1)}"
+    return ""
+
+
+def _integration_resolution_target_id(row: sqlite3.Row) -> int | None:
+    """Extract the original card id an integration-resolution card is about."""
+
+    source_key = str(row["source_key"] or "")
+    if source_key.startswith("integration-failure:"):
+        parts = source_key.split(":", 2)
+        if len(parts) >= 2 and parts[1].isdigit():
+            return int(parts[1])
+    for value in (row["title"], row["description"], row["notes"]):
+        match = INTEGRATION_RESOLUTION_CARD_RE.search(str(value or ""))
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def _tmux_target(agent: sqlite3.Row) -> str:

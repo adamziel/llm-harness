@@ -71,6 +71,13 @@ def is_active_agent_status(status: str) -> bool:
     return status not in AGENT_TERMINAL_STATUSES
 
 
+def is_non_actionable_report_status(status: str) -> bool:
+    """Return whether an agent report says this card should be retired, not retried."""
+
+    normalized = status.strip().lower()
+    return normalized in NON_ACTIONABLE_REPORT_STATUSES or normalized.startswith("superseded") or "no_source_edits" in normalized
+
+
 def is_retryable_error(exc: BaseException) -> bool:
     """Return whether Turso/SQLite reported a write-concurrency conflict."""
 
@@ -1391,12 +1398,12 @@ def record_agent_report(conn: sqlite3.Connection, report: Mapping[str, Any]) -> 
             accepted = False
         elif lane["stage"] == "development" and status in {"ready_for_review", "needs_verification", "ready_for_integration", "completed", "complete"}:
             move_card_stage(conn, lane_id, "review", "needs_verification", str(report.get("summary") or ""), reason="agent_report", agent_name=agent_name)
-        elif lane["stage"] == "development" and status in NON_ACTIONABLE_REPORT_STATUSES:
+        elif lane["stage"] == "development" and is_non_actionable_report_status(status):
             retire_card(conn, lane_id, str(report.get("summary") or status), reason=status, agent_name=agent_name)
             if agent_name:
                 conn.execute(
-                    "UPDATE agents SET current_status = 'success', ended_at = ?, last_seen_at = ?, notes = ? WHERE name = ?",
-                    (now, now, f"Completed non-actionable card#{lane_id}: {status}", agent_name),
+                    "UPDATE agents SET current_status = 'running', ended_at = NULL, last_seen_at = ?, notes = ? WHERE name = ?",
+                    (now, f"Awaiting reassignment after non-actionable card#{lane_id}: {status}", agent_name),
                 )
         elif lane["stage"] == "review" and status in {"review_passed", "accepted", "ready_for_integration", "done"}:
             if lane["integration_required"]:
