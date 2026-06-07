@@ -1524,6 +1524,117 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(spawned_developers, ["developer-2", "developer-3", "developer-4"])
             self.assertEqual(assigned, 3)
 
+    def test_ready_report_releases_current_card_lease_for_reassignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                done_card_id = db.queue_worklane(conn, "Finished code card")
+                next_card_id = db.queue_worklane(conn, "Next code card")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                db.assign_card(conn, done_card_id, "developer-1")
+                db.record_agent_report(
+                    conn,
+                    {
+                        "agent_id": "developer-1",
+                        "card_id": done_card_id,
+                        "worklane_id": done_card_id,
+                        "stage": "development",
+                        "status": "ready_for_review",
+                        "summary": "Code and tests ready.",
+                    },
+                )
+                scheduler.requeue_developers_without_cards(conn)
+                done_card = conn.execute("SELECT stage, status, owner_agent_id FROM worklanes WHERE id = ?", (done_card_id,)).fetchone()
+                next_card = conn.execute("SELECT stage, status, owner_agent_id FROM worklanes WHERE id = ?", (next_card_id,)).fetchone()
+                agent = conn.execute("SELECT id FROM agents WHERE name = 'developer-1'").fetchone()
+
+            self.assertEqual((done_card["stage"], done_card["status"], done_card["owner_agent_id"]), ("review", "needs_verification", None))
+            self.assertEqual((next_card["stage"], next_card["status"], next_card["owner_agent_id"]), ("development", "assigned", agent["id"]))
+            self.assertEqual(len(fake.sent), 1)
+            self.assertIn(f"Assigned card #{next_card_id}", fake.sent[0][1])
+
+    def test_blocked_duplicate_report_retires_card_and_reassigns_developer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                duplicate_id = db.queue_worklane(conn, "Duplicate conflict resolver")
+                fresh_id = db.queue_worklane(conn, "Fresh implementation")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                db.assign_card(conn, duplicate_id, "developer-1")
+                db.record_agent_report(
+                    conn,
+                    {
+                        "agent_id": "developer-1",
+                        "card_id": duplicate_id,
+                        "worklane_id": duplicate_id,
+                        "stage": "development",
+                        "status": "blocked",
+                        "summary": "Duplicate of canonical live worklane 1795 under developer-103; no source edits.",
+                        "next_action": "Assign developer-1 a non-duplicate Developer card.",
+                    },
+                )
+                scheduler.repair_control_plane_cards(conn)
+                scheduler.requeue_developers_without_cards(conn)
+                duplicate = conn.execute("SELECT stage, status, owner_agent_id FROM worklanes WHERE id = ?", (duplicate_id,)).fetchone()
+                fresh = conn.execute("SELECT stage, status, owner_agent_id FROM worklanes WHERE id = ?", (fresh_id,)).fetchone()
+                agent = conn.execute("SELECT id, current_status FROM agents WHERE name = 'developer-1'").fetchone()
+
+            self.assertEqual((duplicate["stage"], duplicate["status"], duplicate["owner_agent_id"]), ("done", "stale", None))
+            self.assertEqual((fresh["stage"], fresh["status"], fresh["owner_agent_id"]), ("development", "assigned", agent["id"]))
+            self.assertEqual(agent["current_status"], "running")
+            self.assertEqual(len(fake.sent), 1)
+            self.assertIn(f"Assigned card #{fresh_id}", fake.sent[0][1])
+
+    def test_claim_developer_card_prefers_implementation_over_report_only_replay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                report_id = db.queue_worklane(
+                    conn,
+                    "Focused replay: secondary extension regression rows",
+                    priority=0,
+                    goal="Read-only replay lane. Write .harness/reports/focused-replay.md. No source edits.",
+                )
+                product_id = db.queue_worklane(conn, "Implement runtime behavior", priority=100)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                lane = scheduler.claim_developer_card(conn, "developer-1", "", "")
+                report = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (report_id,)).fetchone()
+                product = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (product_id,)).fetchone()
+
+            self.assertEqual(lane["id"], product_id)
+            self.assertEqual((product["stage"], product["status"]), ("development", "assigned"))
+            self.assertEqual((report["stage"], report["status"]), ("planned", "queued"))
+
+    def test_report_only_developer_cards_are_limited_to_one_side_slot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                first = db.queue_worklane(conn, "Focused replay one", goal="Read-only report. No source edits.")
+                second = db.queue_worklane(conn, "Focused replay two", goal="Read-only report. No source edits.")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                db.upsert_agent(conn, name="developer-2", role="Developer", current_status="running", tmux_pane="%developer-2", cwd=tmp)
+                first_lane = scheduler.claim_developer_card(conn, "developer-1", "", "")
+                second_lane = scheduler.claim_developer_card(conn, "developer-2", "", "")
+                queued = scheduler.queued_developer_worklanes(conn)
+                first_row = conn.execute("SELECT stage FROM worklanes WHERE id = ?", (first,)).fetchone()
+                second_row = conn.execute("SELECT stage FROM worklanes WHERE id = ?", (second,)).fetchone()
+
+            self.assertEqual(first_lane["id"], first)
+            self.assertIsNone(second_lane)
+            self.assertEqual(queued, 0)
+            self.assertEqual(first_row["stage"], "development")
+            self.assertEqual(second_row["stage"], "planned")
+
     def test_non_actionable_developer_report_retires_card_and_keeps_worker_reassignable(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)

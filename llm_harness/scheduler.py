@@ -44,6 +44,8 @@ HIGH_RESOURCE_SECONDS = 30
 INTEGRATION_BACKPRESSURE_SECONDS = 20 * 60
 INTEGRATION_READY_STATUSES = ("ready_for_integration",)
 INTEGRATION_RECOVERY_ACTIVE_LIMIT = 3
+REPORT_ONLY_DEVELOPER_ACTIVE_LIMIT = 1
+REPORT_ONLY_CARD_MARKERS = ("read-only", "read only", "no source edits", "no_source_edits", ".harness/reports", "focused replay")
 INTEGRATION_RESOLUTION_CARD_RE = re.compile(r"card #(\d+)")
 INTEGRATION_BRANCH_RE = re.compile(r"(?m)^Branch:\s*(\S+)")
 SUPPORT_ROLES = {"Manhole", "Status reporter", "Janitor"}
@@ -710,21 +712,68 @@ class HarnessScheduler:
                 self.spawn_agent(conn, spec.name, title=f"Maintain {spec.name} capacity")
 
     def queued_developer_worklanes(self, conn: sqlite3.Connection) -> int:
-        """Count planned code-producing cards; capacity should not create no-op workers."""
+        """Count planned implementation cards without flooding workers with reports."""
+
+        rows = self.planned_developer_candidates(conn)
+        product = [row for row in rows if not self.is_report_only_developer_card(row)]
+        if product:
+            return len(product)
+        report_only = [row for row in rows if self.is_report_only_developer_card(row)]
+        if report_only and self.active_report_only_developer_cards(conn) < REPORT_ONLY_DEVELOPER_ACTIVE_LIMIT:
+            return 1
+        return 0
+
+    def planned_developer_candidates(self, conn: sqlite3.Connection) -> list[sqlite3.Row]:
+        """Return planned Developer-capacity cards in deterministic claim order."""
 
         roles = tuple(sorted(db.CODE_PRODUCING_ROLES))
         placeholders = ",".join("?" for _ in roles)
-        recovery_filter = "" if self.integration_recovery_slots(conn) > 0 else "AND source_key NOT LIKE 'integration-failure:%' AND title NOT LIKE 'Resolve integration failure for card #%'"
-        return int(
+        allow_recovery = self.integration_recovery_slots(conn) > 0
+        rows = list(
             conn.execute(
                 f"""
-                SELECT COUNT(*) AS count FROM worklanes
-                WHERE stage = 'planned' AND role_type IN ({placeholders})
-                  {recovery_filter}
+                SELECT *
+                FROM worklanes
+                WHERE stage = 'planned'
+                  AND role_type IN ({placeholders})
+                ORDER BY priority ASC, id ASC
                 """,
                 roles,
-            ).fetchone()["count"]
+            ).fetchall()
         )
+        if allow_recovery:
+            return sorted(rows, key=lambda row: (0 if self.is_integration_recovery_card(row) else 1, int(row["priority"]), int(row["id"])))
+        return [row for row in rows if not self.is_integration_recovery_card(row)]
+
+    def is_integration_recovery_card(self, row: sqlite3.Row) -> bool:
+        """Return whether a card is an integration-failure resolver."""
+
+        return str(row["source_key"] or "").startswith("integration-failure:") or str(row["title"] or "").startswith("Resolve integration failure for card #")
+
+    def is_report_only_developer_card(self, row: sqlite3.Row) -> bool:
+        """Identify old Developer cards that only ask for replay/report evidence."""
+
+        if str(row["role_type"] or "") != "Developer":
+            return False
+        text = " ".join(str(row[key] or "") for key in ("title", "description", "goal", "acceptance_criteria", "notes", "source_key")).lower()
+        return any(marker in text for marker in REPORT_ONLY_CARD_MARKERS)
+
+    def active_report_only_developer_cards(self, conn: sqlite3.Connection) -> int:
+        """Count live report-only Developer leases so replay work has a side quota."""
+
+        rows = conn.execute(
+            """
+            SELECT w.*
+            FROM worklanes w
+            JOIN agents a ON a.id = w.owner_agent_id
+            WHERE w.stage = 'development'
+              AND w.status = 'assigned'
+              AND a.current_status NOT IN ('crash', 'success', 'stopped')
+              AND a.ended_at IS NULL
+              AND w.role_type = 'Developer'
+            """
+        ).fetchall()
+        return len([row for row in rows if self.is_report_only_developer_card(row)])
 
     def integration_recovery_slots(self, conn: sqlite3.Connection) -> int:
         """Return how many more integration-recovery cards may be active."""
@@ -747,30 +796,18 @@ class HarnessScheduler:
         return max(0, INTEGRATION_RECOVERY_ACTIVE_LIMIT - active)
 
     def claim_developer_card(self, conn: sqlite3.Connection, agent_name: str, worktree: str, branch: str) -> sqlite3.Row | None:
-        """Assign the next Developer card while capping integration-recovery WIP."""
+        """Assign the next Developer card while preserving product-work capacity."""
 
-        roles = tuple(sorted(db.CODE_PRODUCING_ROLES))
-        placeholders = ",".join("?" for _ in roles)
-        allow_recovery = self.integration_recovery_slots(conn) > 0
-        recovery_filter = "" if allow_recovery else "AND source_key NOT LIKE 'integration-failure:%' AND title NOT LIKE 'Resolve integration failure for card #%'"
-        lane = conn.execute(
-            f"""
-            SELECT *,
-                CASE WHEN source_key LIKE 'integration-failure:%'
-                       OR title LIKE 'Resolve integration failure for card #%'
-                     THEN 0 ELSE 1 END AS recovery_sort
-            FROM worklanes
-            WHERE stage = 'planned'
-              AND role_type IN ({placeholders})
-              {recovery_filter}
-            ORDER BY recovery_sort ASC, priority ASC, id ASC
-            LIMIT 1
-            """,
-            roles,
-        ).fetchone()
-        if lane is None:
+        rows = self.planned_developer_candidates(conn)
+        product = [row for row in rows if not self.is_report_only_developer_card(row)]
+        if product:
+            return db.assign_card(conn, int(product[0]["id"]), agent_name, worktree, branch)
+        if self.active_report_only_developer_cards(conn) >= REPORT_ONLY_DEVELOPER_ACTIVE_LIMIT:
             return None
-        return db.assign_card(conn, int(lane["id"]), agent_name, worktree, branch)
+        report_only = [row for row in rows if self.is_report_only_developer_card(row)]
+        if not report_only:
+            return None
+        return db.assign_card(conn, int(report_only[0]["id"]), agent_name, worktree, branch)
 
     def stabilization_planned_worklanes(self, conn: sqlite3.Connection) -> int:
         """Count planned repair cards that should still get Developers under backpressure."""

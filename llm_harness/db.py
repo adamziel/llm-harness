@@ -45,6 +45,7 @@ STAGE_STATUS = {
 }
 CODE_PRODUCING_ROLES = {"Developer", "Designer", "Conflict Resolver", "Reproducer"}
 NON_ACTIONABLE_REPORT_STATUSES = {"reserve_no_source_edits", "no_source_edits", "not_actionable", "superseded"}
+DUPLICATE_BLOCKED_MARKERS = ("duplicate", "canonical", "superseded", "no source edits", "no_source_edits", "competing")
 MCP_COMPAT_COLUMNS = {
     "events": [
         ("created_at", "TEXT GENERATED ALWAYS AS (ts) VIRTUAL"),
@@ -75,7 +76,23 @@ def is_non_actionable_report_status(status: str) -> bool:
     """Return whether an agent report says this card should be retired, not retried."""
 
     normalized = status.strip().lower()
-    return normalized in NON_ACTIONABLE_REPORT_STATUSES or normalized.startswith("superseded") or "no_source_edits" in normalized
+    return (
+        normalized in NON_ACTIONABLE_REPORT_STATUSES
+        or normalized.startswith("superseded")
+        or "no_source_edits" in normalized
+        or ("duplicate" in normalized and ("blocked" in normalized or "superseded" in normalized))
+    )
+
+
+def is_non_actionable_report(status: str, report: Mapping[str, Any]) -> bool:
+    """Return whether a report proves the assigned card should not keep a worker."""
+
+    if is_non_actionable_report_status(status):
+        return True
+    if status.strip().lower() != "blocked":
+        return False
+    text = json.dumps(report, sort_keys=True).lower()
+    return any(marker in text for marker in DUPLICATE_BLOCKED_MARKERS)
 
 
 def is_retryable_error(exc: BaseException) -> bool:
@@ -1238,16 +1255,16 @@ def update_worklane_status(conn: sqlite3.Connection, lane_id: int, status: str, 
         fields.append("abandoned_at = ?")
         params.append(now)
     if stage == "planned":
-        fields.append("planned_at = COALESCE(planned_at, ?)")
+        fields.extend(["planned_at = COALESCE(planned_at, ?)", "owner_agent_id = NULL"])
         params.append(now)
     elif stage == "review":
-        fields.append("review_ready_at = COALESCE(review_ready_at, ?)")
+        fields.extend(["review_ready_at = COALESCE(review_ready_at, ?)", "owner_agent_id = NULL"])
         params.append(now)
     elif stage == "integration":
-        fields.append("reviewed_at = COALESCE(reviewed_at, ?)")
+        fields.extend(["reviewed_at = COALESCE(reviewed_at, ?)", "owner_agent_id = NULL"])
         params.append(now)
     elif stage == "done":
-        fields.append("done_at = COALESCE(done_at, ?)")
+        fields.extend(["done_at = COALESCE(done_at, ?)", "owner_agent_id = NULL"])
         params.append(now)
     if notes is not None:
         fields.append("notes = ?")
@@ -1287,13 +1304,13 @@ def move_card_stage(
         fields.append("assigned_at = COALESCE(assigned_at, ?)")
         params.append(now)
     elif target_stage == "review":
-        fields.append("review_ready_at = COALESCE(review_ready_at, ?)")
+        fields.extend(["review_ready_at = COALESCE(review_ready_at, ?)", "owner_agent_id = NULL"])
         params.append(now)
     elif target_stage == "integration":
-        fields.extend(["reviewed_at = COALESCE(reviewed_at, ?)", "ready_for_integration_at = COALESCE(ready_for_integration_at, ?)", "integration_queue = COALESCE(NULLIF(integration_queue, ''), 'ready_fast_path')"])
+        fields.extend(["reviewed_at = COALESCE(reviewed_at, ?)", "ready_for_integration_at = COALESCE(ready_for_integration_at, ?)", "integration_queue = COALESCE(NULLIF(integration_queue, ''), 'ready_fast_path')", "owner_agent_id = NULL"])
         params.extend([now, now])
     elif target_stage == "done":
-        fields.append("done_at = COALESCE(done_at, ?)")
+        fields.extend(["done_at = COALESCE(done_at, ?)", "owner_agent_id = NULL"])
         params.append(now)
         if integration_required:
             fields.append("integrated_at = COALESCE(integrated_at, ?)")
@@ -1398,7 +1415,7 @@ def record_agent_report(conn: sqlite3.Connection, report: Mapping[str, Any]) -> 
             accepted = False
         elif lane["stage"] == "development" and status in {"ready_for_review", "needs_verification", "ready_for_integration", "completed", "complete"}:
             move_card_stage(conn, lane_id, "review", "needs_verification", str(report.get("summary") or ""), reason="agent_report", agent_name=agent_name)
-        elif lane["stage"] == "development" and is_non_actionable_report_status(status):
+        elif lane["stage"] == "development" and is_non_actionable_report(status, report):
             retire_card(conn, lane_id, str(report.get("summary") or status), reason=status, agent_name=agent_name)
             if agent_name:
                 conn.execute(
