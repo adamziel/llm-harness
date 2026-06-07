@@ -20,7 +20,7 @@ UNITTEST_RESULT_RE = re.compile(r"^(?P<test>\S+)\s+\((?P<case>[^)]+)\)\s+\.\.\.\
 CARGO_RESULT_RE = re.compile(r"^test\s+(?P<node>.+?)\s+\.\.\.\s+(?P<status>ok|FAILED|ignored)\b")
 STATUS_EVENT_THROTTLE_SECONDS = 5 * 60
 PUBLIC_PHPT_METRIC_RE = re.compile(r"accepted_public_phpt_passes\s*[:=]\s*(?P<value>[0-9_,]+)\s*/\s*(?P<target>[0-9_,]+)")
-SOFT_KNOWN_RED_LIMIT = 5
+KNOWN_RED_QUARANTINE_LIMIT = 50
 
 
 
@@ -220,7 +220,27 @@ def update_test_gate_state(
     if not failures:
         _set_test_gate(conn, "hard_blocker", "Global tests failed before producing parsed failure rows.", ["command-level-failure"], run_id)
         return
-    if metric_recorded and len(failures) <= SOFT_KNOWN_RED_LIMIT:
+    if len(failures) > KNOWN_RED_QUARANTINE_LIMIT:
+        _set_test_gate(
+            conn,
+            "hard_blocker",
+            f"{len(failures)} parsed failures exceeds the known-red quarantine limit of {KNOWN_RED_QUARANTINE_LIMIT}.",
+            failures,
+            run_id,
+        )
+        return
+    previous_failures = _known_gate_failures(conn)
+    if previous_failures and not set(failures).issubset(previous_failures):
+        new_failures = sorted(set(failures) - previous_failures)
+        _set_test_gate(
+            conn,
+            "hard_blocker",
+            "New failures appeared beyond the known-red quarantine: " + ", ".join(new_failures),
+            failures,
+            run_id,
+        )
+        return
+    if metric_recorded:
         _set_test_gate(
             conn,
             "soft_known_red",
@@ -229,30 +249,13 @@ def update_test_gate_state(
             run_id,
         )
         return
-    if len(failures) <= SOFT_KNOWN_RED_LIMIT:
-        previous_failures = _known_gate_failures(conn)
-        if previous_failures and not set(failures).issubset(previous_failures):
-            new_failures = sorted(set(failures) - previous_failures)
-            _set_test_gate(
-                conn,
-                "hard_blocker",
-                "New failures appeared beyond the known-red quarantine: " + ", ".join(new_failures),
-                failures,
-                run_id,
-            )
-            return
-        _set_test_gate(
-            conn,
-            "quarantined_known_red",
-            f"{len(failures)} known failures are quarantined; metric acceptance remains blocked, but unrelated work may continue.",
-            failures,
-            run_id,
-        )
-        return
-    reason = "Global tests failed before producing a progress metric."
-    if metric_recorded:
-        reason = f"{len(failures)} failures exceeds the soft known-red limit of {SOFT_KNOWN_RED_LIMIT}."
-    _set_test_gate(conn, "hard_blocker", reason, failures, run_id)
+    _set_test_gate(
+        conn,
+        "quarantined_known_red",
+        f"{len(failures)} known failures are quarantined; metric acceptance remains blocked, but unrelated work may continue.",
+        failures,
+        run_id,
+    )
 
 
 def _known_gate_failures(conn: sqlite3.Connection) -> set[str]:

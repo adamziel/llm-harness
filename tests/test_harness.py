@@ -1441,6 +1441,52 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(known_failures, ["cleanup::method_invocation", "cleanup::static_invocation"])
             self.assertIn("feature:next", [row["source_key"] for row in candidates])
 
+    def test_failed_global_gate_with_bounded_many_failures_is_quarantined_known_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tools").mkdir()
+            script = root / "tools" / "run-tests.sh"
+            script.write_text(
+                "#!/bin/sh\n"
+                + "".join(f"echo 'test cleanup::case_{index} ... FAILED'\n" for index in range(6))
+                + "exit 1\n"
+            )
+            script.chmod(0o755)
+            paths = db.bootstrap(root)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                run_tests_once(conn, root)
+                db.create_card(conn, "Continue compatibility work", role_type="Developer", source_key="feature:next")
+                candidates = scheduler.planned_developer_candidates(conn)
+                gate_mode = db.get_meta(conn, "test_gate_mode")
+                failure_count = db.get_meta(conn, "test_gate_failure_count")
+
+            self.assertEqual(gate_mode, "quarantined_known_red")
+            self.assertEqual(failure_count, "6")
+            self.assertIn("feature:next", [row["source_key"] for row in candidates])
+
+    def test_failed_global_gate_with_too_many_failures_is_hard_blocker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tools").mkdir()
+            script = root / "tools" / "run-tests.sh"
+            script.write_text(
+                "#!/bin/sh\n"
+                + "".join(f"echo 'test cleanup::case_{index} ... FAILED'\n" for index in range(51))
+                + "exit 1\n"
+            )
+            script.chmod(0o755)
+            paths = db.bootstrap(root)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                run_tests_once(conn, root)
+                gate_mode = db.get_meta(conn, "test_gate_mode")
+                reason = db.get_meta(conn, "test_gate_reason")
+
+            self.assertEqual(gate_mode, "hard_blocker")
+            self.assertIn("exceeds the known-red quarantine limit", reason)
+
     def test_quarantined_gate_becomes_hard_when_new_failure_appears(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
