@@ -16,6 +16,7 @@ from typing import Any
 from . import db
 from .codex import MCP_SERVER_NAME, build_codex_command, codex_mcp_config_args
 from .indexer import refresh_index
+from .integration import branch_integration_state
 from .janitor import run_janitor
 from .resources import sample_resources
 from .roles import prompt_for_role, slug_role, specs_for_team
@@ -42,6 +43,7 @@ LOW_RESOURCE_SECONDS = 60
 HIGH_RESOURCE_SECONDS = 30
 INTEGRATION_BACKPRESSURE_SECONDS = 20 * 60
 INTEGRATION_READY_STATUSES = ("ready_for_integration",)
+INTEGRATION_RECOVERY_ACTIVE_LIMIT = 3
 INTEGRATION_RESOLUTION_CARD_RE = re.compile(r"card #(\d+)")
 INTEGRATION_BRANCH_RE = re.compile(r"(?m)^Branch:\s*(\S+)")
 SUPPORT_ROLES = {"Manhole", "Status reporter", "Janitor"}
@@ -711,15 +713,63 @@ class HarnessScheduler:
 
         roles = tuple(sorted(db.CODE_PRODUCING_ROLES))
         placeholders = ",".join("?" for _ in roles)
+        recovery_filter = "" if self.integration_recovery_slots(conn) > 0 else "AND source_key NOT LIKE 'integration-failure:%' AND title NOT LIKE 'Resolve integration failure for card #%'"
         return int(
             conn.execute(
                 f"""
                 SELECT COUNT(*) AS count FROM worklanes
                 WHERE stage = 'planned' AND role_type IN ({placeholders})
+                  {recovery_filter}
                 """,
                 roles,
             ).fetchone()["count"]
         )
+
+    def integration_recovery_slots(self, conn: sqlite3.Connection) -> int:
+        """Return how many more integration-recovery cards may be active."""
+
+        active = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM worklanes w
+                JOIN agents a ON a.id = w.owner_agent_id
+                WHERE w.stage = 'development'
+                  AND a.current_status NOT IN ('crash', 'success', 'stopped')
+                  AND (
+                    w.source_key LIKE 'integration-failure:%'
+                    OR w.title LIKE 'Resolve integration failure for card #%'
+                  )
+                """
+            ).fetchone()["count"]
+        )
+        return max(0, INTEGRATION_RECOVERY_ACTIVE_LIMIT - active)
+
+    def claim_developer_card(self, conn: sqlite3.Connection, agent_name: str, worktree: str, branch: str) -> sqlite3.Row | None:
+        """Assign the next Developer card while capping integration-recovery WIP."""
+
+        roles = tuple(sorted(db.CODE_PRODUCING_ROLES))
+        placeholders = ",".join("?" for _ in roles)
+        allow_recovery = self.integration_recovery_slots(conn) > 0
+        recovery_filter = "" if allow_recovery else "AND source_key NOT LIKE 'integration-failure:%' AND title NOT LIKE 'Resolve integration failure for card #%'"
+        lane = conn.execute(
+            f"""
+            SELECT *,
+                CASE WHEN source_key LIKE 'integration-failure:%'
+                       OR title LIKE 'Resolve integration failure for card #%'
+                     THEN 0 ELSE 1 END AS recovery_sort
+            FROM worklanes
+            WHERE stage = 'planned'
+              AND role_type IN ({placeholders})
+              {recovery_filter}
+            ORDER BY recovery_sort ASC, priority ASC, id ASC
+            LIMIT 1
+            """,
+            roles,
+        ).fetchone()
+        if lane is None:
+            return None
+        return db.assign_card(conn, int(lane["id"]), agent_name, worktree, branch)
 
     def stabilization_planned_worklanes(self, conn: sqlite3.Connection) -> int:
         """Count planned repair cards that should still get Developers under backpressure."""
@@ -748,7 +798,42 @@ class HarnessScheduler:
         self.retire_non_actionable_development_cards(conn)
         self.requeue_cards_from_terminal_agents(conn)
         self.dedupe_global_test_failure_cards(conn)
+        self.retire_unrecoverable_integration_failures(conn)
         self.dedupe_integration_resolution_cards(conn)
+
+    def retire_unrecoverable_integration_failures(self, conn: sqlite3.Connection) -> int:
+        """Close failed integration cards whose branch state is already settled."""
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM worklanes
+            WHERE stage = 'integration'
+              AND status = 'integration_failed'
+              AND branch_name != ''
+              AND source_key NOT LIKE 'integration-failure:%'
+              AND title NOT LIKE 'Resolve integration failure for card #%'
+            """
+        ).fetchall()
+        repaired = 0
+        for row in rows:
+            state = branch_integration_state(self.root, str(row["branch_name"]))
+            if state == "pending":
+                continue
+            note = ""
+            if state == "merged":
+                db.complete_card(conn, int(row["id"]), f"{row['branch_name']} is already contained in origin mainline.")
+                note = f"Retired because original card#{row['id']} is already integrated."
+            elif state == "missing":
+                db.retire_card(conn, int(row["id"]), f"Candidate branch is missing: {row['branch_name']}", reason="candidate_missing")
+                note = f"Retired because original card#{row['id']} has no candidate branch."
+            else:
+                continue
+            self.retire_resolution_cards_for_target(conn, int(row["id"]), note)
+            repaired += 1
+        if repaired:
+            db.log_event(conn, "integration_queue_repair", f"Settled {repaired} stale integration-failed originals")
+        return repaired
 
     def retire_capacity_cards(self, conn: sqlite3.Connection) -> int:
         """Retire fake Developer capacity cards created by older scheduler versions."""
@@ -964,6 +1049,30 @@ class HarnessScheduler:
                 (now, now, f"Completed duplicate card#{row['id']}: superseded", agent_name),
             )
 
+    def retire_resolution_cards_for_target(self, conn: sqlite3.Connection, target_id: int, note: str) -> int:
+        """Retire all non-done integration-resolution cards for one original card."""
+
+        rows = conn.execute(
+            """
+            SELECT
+                w.*,
+                a.name AS agent_name,
+                a.role AS agent_role,
+                a.current_status AS agent_status
+            FROM worklanes w
+            LEFT JOIN agents a ON a.id = w.owner_agent_id
+            WHERE w.stage != 'done'
+              AND (
+                w.source_key LIKE ?
+                OR w.title LIKE ?
+              )
+            """,
+            (f"integration-failure:{target_id}:%", f"Resolve integration failure for card #{target_id}:%"),
+        ).fetchall()
+        for row in rows:
+            self.retire_card_and_release_agent(conn, row, note)
+        return len(rows)
+
     def requeue_developers_without_cards(self, conn: sqlite3.Connection) -> None:
         """Reassign idle Developers, and stop panes with ambiguous card ownership."""
 
@@ -986,7 +1095,7 @@ class HarnessScheduler:
             if len(rows) == 1:
                 continue
             if len(rows) == 0:
-                lane = db.claim_next_worklane(conn, agent["name"], agent["worktree"], agent["branch"])
+                lane = self.claim_developer_card(conn, agent["name"], agent["worktree"], agent["branch"])
                 if lane is not None:
                     target = _tmux_target(agent)
                     try:
@@ -1271,7 +1380,7 @@ class HarnessScheduler:
             notes=title,
         )
         if role == "Developer":
-            lane = db.assign_card(conn, card_id, name, str(cwd), branch) if card_id else db.claim_next_worklane(conn, name, str(cwd), branch)
+            lane = db.assign_card(conn, card_id, name, str(cwd), branch) if card_id else self.claim_developer_card(conn, name, str(cwd), branch)
             if lane is None:
                 db.update_agent_status(conn, name, "stopped", "Stopped because no planned implementation card was available", ended=True)
                 return ""

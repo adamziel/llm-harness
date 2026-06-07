@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -21,6 +22,8 @@ ANSI = {
     "blue": "\033[34m",
     "bold": "\033[1m",
 }
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 STATUS_REFRESH_SECONDS = 15 * 60
 STATUS_PUBLISH_PATHS = (
@@ -239,9 +242,13 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
             w.expected_metric_impact AS lane_delta
         FROM agents a
         LEFT JOIN worklanes w
-            ON w.owner_agent_id = a.id
-            OR (a.branch != '' AND w.branch_name = a.branch)
-            OR (a.worktree != '' AND w.worktree_path = a.worktree)
+            ON w.stage = 'development'
+            AND w.status = 'assigned'
+            AND (
+                w.owner_agent_id = a.id
+                OR (a.branch != '' AND w.branch_name = a.branch)
+                OR (a.worktree != '' AND w.worktree_path = a.worktree)
+            )
         WHERE a.current_status NOT IN ('crash', 'success', 'stopped')
         ORDER BY
             CASE a.role
@@ -272,6 +279,8 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
               SELECT 1
               FROM agents a
               WHERE a.current_status NOT IN ('crash', 'success', 'stopped')
+                AND w.stage = 'development'
+                AND w.status = 'assigned'
                 AND (
                     w.owner_agent_id = a.id
                     OR (a.branch != '' AND w.branch_name = a.branch)
@@ -324,6 +333,20 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
     failed_integration = conn.execute(
         "SELECT COUNT(*) AS count FROM worklanes WHERE status = 'integration_failed'"
     ).fetchone()
+    integration_health = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN stage = 'integration' AND status = 'ready_for_integration' AND branch_name != '' THEN 1 ELSE 0 END) AS ready_with_branch,
+            SUM(CASE WHEN stage = 'integration' AND status = 'ready_for_integration' AND branch_name = '' THEN 1 ELSE 0 END) AS ready_missing_branch,
+            SUM(CASE WHEN status = 'integration_failed'
+                      AND source_key NOT LIKE 'integration-failure:%'
+                      AND title NOT LIKE 'Resolve integration failure for card #%' THEN 1 ELSE 0 END) AS failed_originals,
+            SUM(CASE WHEN stage != 'done'
+                      AND (source_key LIKE 'integration-failure:%'
+                           OR title LIKE 'Resolve integration failure for card #%') THEN 1 ELSE 0 END) AS recovery_cards
+        FROM worklanes
+        """
+    ).fetchone()
     metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM metadata").fetchall()}
     runtime_alerts = _runtime_alerts(metadata, agents, active_work, pending_lanes)
     return {
@@ -341,6 +364,7 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         "uncarded_agents": uncarded_agents,
         "queued_integration": dict(queued_integration) if queued_integration else {"count": 0, "delta": 0},
         "failed_integration": dict(failed_integration) if failed_integration else {"count": 0},
+        "integration_health": dict(integration_health) if integration_health else {},
         "metadata": metadata,
         "runtime_alerts": runtime_alerts,
     }
@@ -365,7 +389,9 @@ def dashboard(conn: sqlite3.Connection) -> str:
     if red_banner:
         lines.append(_box_line(width, red_banner, ANSI["red"]))
     lines.append(_box_line(width, f"Goal: {shorten(str(goal_text), width=width-10, placeholder='…')}"))
-    lines.append(_box_line(width, f"Progress: {_bar(percent, 24)} {percent:5.1f}%"))
+    progress_count = _progress_count_text(metric)
+    progress_suffix = f" ({progress_count})" if progress_count else ""
+    lines.append(_box_line(width, f"Progress: {_bar(percent, 24)} {percent:5.1f}%{progress_suffix}"))
 
     agents = data["agents"]
     active = sum(1 for a in agents if is_active_agent_status(str(a.get("current_status", ""))))
@@ -392,6 +418,19 @@ def dashboard(conn: sqlite3.Connection) -> str:
     failed = data.get("failed_integration")
     if isinstance(failed, dict) and failed.get("count", 0):
         lines.append(_box_line(width, f"Integration failed queue: {failed.get('count', 0)} lanes", ANSI["red"]))
+    integration_health = data.get("integration_health")
+    if isinstance(integration_health, dict) and integration_health:
+        lines.append(
+            _box_line(
+                width,
+                "Integration: "
+                f"ready with branch={integration_health.get('ready_with_branch') or 0}, "
+                f"missing branch={integration_health.get('ready_missing_branch') or 0}, "
+                f"failed originals={integration_health.get('failed_originals') or 0}, "
+                f"recovery cards={integration_health.get('recovery_cards') or 0}",
+                ANSI["yellow"] if (integration_health.get("failed_originals") or integration_health.get("recovery_cards")) else "",
+            )
+        )
     card_counts = _card_count_text(data.get("card_counts", []))
     if card_counts:
         lines.append(_box_line(width, f"Cards: {card_counts}"))
@@ -530,6 +569,26 @@ def _metric_text(metric: object) -> str:
     if isinstance(metric, dict) and metric:
         return f"{metric.get('metric_name')}: {metric.get('value')} / {metric.get('target')} ({float(metric.get('percent_ready', 0)):.1f}%)"
     return "No progress metric samples recorded yet."
+
+
+def _progress_count_text(metric: object) -> str:
+    """Render the progress numerator/target for the compact TUI."""
+
+    if not isinstance(metric, dict) or not metric:
+        return ""
+    return f"{_display_number(metric.get('value'))} / {_display_number(metric.get('target'))} {metric.get('metric_name')}"
+
+
+def _display_number(value: object) -> str:
+    """Format SQLite numeric values without distracting .0 suffixes."""
+
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return str(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:g}"
 
 
 def _test_text(test_run: object) -> str:
@@ -701,8 +760,16 @@ def _box_bottom(width: int) -> str:
 
 
 def _box_line(width: int, text: str, color: str = "") -> str:
-    plain = shorten(text, width=width - 4, placeholder="…")
+    plain = shorten(_clean_tui_text(text), width=width - 4, placeholder="…")
     padding = " " * max(0, width - 4 - len(plain))
     if color:
         plain = f"{color}{plain}{ANSI['reset']}"
     return f"│ {plain}{padding} │"
+
+
+def _clean_tui_text(text: str) -> str:
+    """Prevent stored terminal control sequences from corrupting the TUI."""
+
+    cleaned = ANSI_ESCAPE_RE.sub("", str(text))
+    cleaned = CONTROL_RE.sub("", cleaned)
+    return cleaned.replace("\r", " ").replace("\n", " ").replace("\t", " ")

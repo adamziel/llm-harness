@@ -16,6 +16,7 @@ from . import db
 
 PYTEST_RESULT_RE = re.compile(r"^(?P<node>\S+?)\s+(?P<status>PASSED|FAILED|SKIPPED|ERROR)\b")
 UNITTEST_RESULT_RE = re.compile(r"^(?P<test>\S+)\s+\((?P<case>[^)]+)\)\s+\.\.\.\s+(?P<status>ok|FAIL|ERROR|skipped\b.*)$")
+STATUS_EVENT_THROTTLE_SECONDS = 5 * 60
 
 
 def discover_test_command(root: str | Path) -> list[str]:
@@ -58,7 +59,7 @@ def run_tests_once(conn: sqlite3.Connection, root: str | Path, command: list[str
     if status == "failed":
         queue_test_fix_lane(conn, run_id, parsed, commit)
         maybe_invoke_architect(conn)
-        db.log_event(conn, "tests_failed", "Full test suite failed; Coordinator should prioritize stabilization lanes", payload={"run_id": run_id})
+        _log_periodic_event(conn, "tests_failed", "Full test suite failed; Coordinator should prioritize stabilization lanes", payload={"run_id": run_id})
     else:
         resolve_fixed_tests(conn, parsed, commit)
         db.log_event(conn, "tests_passed", "Full test suite passed", payload={"run_id": run_id})
@@ -139,7 +140,8 @@ def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dic
             """,
             (notes + f"\nLatest failing run: {run_id}", db.utc_now(), existing["id"]),
         )
-        db.log_event(conn, "worklane_deduplicated", f"Updated existing failing-test card#{existing['id']} from run {run_id}", payload={"card_id": existing["id"], "run_id": run_id})
+        if not _recent_payload_event(conn, "worklane_deduplicated", "card_id", existing["id"], STATUS_EVENT_THROTTLE_SECONDS):
+            db.log_event(conn, "worklane_deduplicated", f"Updated existing failing-test card#{existing['id']} from run {run_id}", payload={"card_id": existing["id"], "run_id": run_id})
         return
     db.create_card(
         conn,
@@ -164,6 +166,41 @@ def is_global_test_command(command: str) -> bool:
         or ("unittest discover" in normalized and "-s tests" in normalized)
         or ("pytest" in normalized and " tests" in f" {normalized}")
     )
+
+
+def _log_periodic_event(conn: sqlite3.Connection, event_type: str, message: str, payload: dict[str, Any]) -> None:
+    """Log noisy test-loop events at most once per throttle window."""
+
+    if _recent_message_event(conn, event_type, message, STATUS_EVENT_THROTTLE_SECONDS):
+        return
+    db.log_event(conn, event_type, message, payload=payload)
+
+
+def _recent_message_event(conn: sqlite3.Connection, event_type: str, message: str, seconds: int) -> bool:
+    cutoff = (datetime.fromisoformat(db.utc_now()) - timedelta(seconds=seconds)).isoformat(timespec="seconds")
+    return (
+        conn.execute(
+            "SELECT 1 FROM events WHERE type = ? AND message = ? AND ts >= ? ORDER BY id DESC LIMIT 1",
+            (event_type, message, cutoff),
+        ).fetchone()
+        is not None
+    )
+
+
+def _recent_payload_event(conn: sqlite3.Connection, event_type: str, key: str, value: object, seconds: int) -> bool:
+    cutoff = (datetime.fromisoformat(db.utc_now()) - timedelta(seconds=seconds)).isoformat(timespec="seconds")
+    rows = conn.execute(
+        "SELECT payload_json FROM events WHERE type = ? AND ts >= ? ORDER BY id DESC LIMIT 50",
+        (event_type, cutoff),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if payload.get(key) == value:
+            return True
+    return False
 
 
 def resolve_fixed_tests(conn: sqlite3.Connection, results: list[dict[str, Any]], commit: str) -> None:

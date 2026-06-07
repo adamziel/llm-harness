@@ -79,14 +79,22 @@ def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainli
         _queue_conflict_card(conn, lane, "candidate_missing", f"Candidate branch not found: {branch}")
         return "failed"
 
-    _reset_worktree(worktree, mainline)
-    if _git_stdout(worktree, ["rev-list", "--count", f"HEAD..{candidate}"]) == "0":
-        sha = _git_stdout(worktree, ["rev-parse", "HEAD"])
+    if branch_integration_state(root, branch, mainline) == "merged":
+        sha = _git_stdout(root, ["rev-parse", f"origin/{mainline}"])
         _finish_attempt(conn, attempt_id, "integrated", "already_merged", "", remote_ref=f"origin/{mainline}", remote_sha=sha, push_result="already on remote")
         db.complete_card(conn, lane_id, f"{branch} already merged on origin/{mainline} at {sha}")
         _delete_integrated_branch(root, branch)
         return "integrated"
 
+    preflight = _preflight_lane(root, mainline, candidate)
+    if preflight:
+        failure_type, reason, tests = preflight
+        _finish_attempt(conn, attempt_id, "integration_failed", failure_type, reason, tests=tests)
+        db.update_worklane_status(conn, lane_id, "integration_failed", reason)
+        _queue_conflict_card(conn, lane, failure_type, reason)
+        return "failed"
+
+    _reset_worktree(worktree, mainline)
     merge = _git(worktree, ["merge", "--no-ff", "--no-commit", candidate])
     if merge.returncode != 0:
         _abort_merge(worktree)
@@ -154,15 +162,16 @@ def _queue_conflict_card(conn: sqlite3.Connection, lane: sqlite3.Row, failure_ty
     """Create one planned conflict-resolution card for a failed integration lane."""
 
     lane_id = int(lane["id"])
+    branch = str(lane["branch_name"])
     title = f"Resolve integration failure for card #{lane_id}: {lane['title']}"
     db.find_or_create_card(
         conn,
-        source_key=f"integration-failure:{lane_id}:{failure_type}",
+        source_key=f"integration-failure:{lane_id}:{failure_type}:{_source_key_token('origin/' + _candidate_ref_name(branch))}",
         title=title,
         role_type="Conflict Resolver",
         description=(
             f"Integration failed for card #{lane_id} ({lane['title']}) with {failure_type}.\n"
-            f"Branch: {lane['branch_name']}\n"
+            f"Branch: {branch}\n"
             f"Reason:\n{reason}"
         ),
         goal="Repair the candidate branch and return the original card to integration.",
@@ -170,6 +179,33 @@ def _queue_conflict_card(conn: sqlite3.Connection, lane: sqlite3.Row, failure_ty
         priority=max(0, int(lane["priority"]) - 1),
         integration_required=True,
     )
+
+
+def _preflight_lane(root: Path, mainline: str, candidate: str) -> tuple[str, str, list[str]] | None:
+    """Return an integration failure discovered before mutating the worktree."""
+
+    merge_tree = _git(root, ["merge-tree", f"origin/{mainline}", candidate])
+    if merge_tree.returncode != 0 or "CONFLICT" in merge_tree.stdout or "<<<<<<<" in merge_tree.stdout:
+        return ("preflight_merge_conflicts", _output(merge_tree) or "merge-tree reported conflicts", ["git merge-tree"])
+    diff_check = _git(root, ["diff", "--check", f"origin/{mainline}...{candidate}"])
+    if diff_check.returncode != 0:
+        return ("preflight_diff_check_failed", _output(diff_check), ["git diff --check"])
+    return None
+
+
+def branch_integration_state(root: str | Path, branch: str, mainline: str | None = None) -> str:
+    """Return missing, merged, pending, or unknown for a candidate integration branch."""
+
+    root_path = Path(root).resolve()
+    resolved_mainline = mainline or _mainline_branch(root_path)
+    if not resolved_mainline:
+        return "unknown"
+    candidate = _candidate_ref(root_path, branch)
+    if not candidate:
+        return "missing"
+    if _git_stdout(root_path, ["rev-list", "--count", f"origin/{resolved_mainline}..{candidate}"]) == "0":
+        return "merged"
+    return "pending"
 
 
 def _finish_attempt(
@@ -213,13 +249,25 @@ def _reset_worktree(worktree: Path, mainline: str) -> None:
 
 
 def _candidate_ref(root: Path, branch: str) -> str:
-    name = branch.removeprefix("refs/heads/").removeprefix("origin/")
+    name = _candidate_ref_name(branch)
     remote_ref = f"origin/{name}"
     if _git_ok(root, ["rev-parse", "--verify", f"{remote_ref}^{{commit}}"]):
         return remote_ref
     if _git_ok(root, ["rev-parse", "--verify", f"{branch}^{{commit}}"]):
         return branch
     return ""
+
+
+def _candidate_ref_name(branch: str) -> str:
+    """Normalize local or remote branch spelling to the remote branch name."""
+
+    return branch.removeprefix("refs/heads/").removeprefix("origin/")
+
+
+def _source_key_token(value: str) -> str:
+    """Keep source keys readable while avoiding separator collisions."""
+
+    return re.sub(r"[^A-Za-z0-9_.@/-]+", "-", value).strip("-")
 
 
 def _mainline_branch(root: Path) -> str:

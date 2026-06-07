@@ -19,7 +19,7 @@ from llm_harness.integration import integrate_once
 from llm_harness.mcp_server import HarnessMCP, serve
 from llm_harness.roles import developer_count_for_building, specs_for_team
 from llm_harness.scheduler import AUDITOR_SPAWN_SECONDS, IDLE_PROMPT_SECONDS, IDLE_SECONDS, HarnessScheduler, watchdog_loop
-from llm_harness.status import dashboard, refresh_reports
+from llm_harness.status import collect_status, dashboard, refresh_reports
 from llm_harness.testing_loop import parse_test_output, run_tests_once
 from llm_harness.tmux import TmuxPane
 
@@ -385,6 +385,7 @@ class HarnessTests(unittest.TestCase):
                 text = dashboard(conn)
                 self.assertIn("Last generated", text)
                 self.assertIn("Progress", text)
+                self.assertIn("3 / 4 tests", text)
                 self.assertIn("Agents: 1 active, 1 crashed, 3 tracked", text)
                 self.assertIn("Active work (agents ↔ cards)", text)
                 self.assertIn("developer-1 [Developer/working] → card#", text)
@@ -404,6 +405,77 @@ class HarnessTests(unittest.TestCase):
                 text = dashboard(conn)
 
             self.assertIn("HARNESS SCHEDULER DEAD", text)
+
+    def test_dashboard_splits_integration_queue_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                with_branch = db.queue_worklane(conn, "Ready with branch", status="ready_for_integration")
+                conn.execute("UPDATE worklanes SET branch_name = 'work/ready' WHERE id = ?", (with_branch,))
+                db.queue_worklane(conn, "Ready missing branch", status="ready_for_integration")
+                original_id = db.queue_worklane(conn, "Failed original", status="integration_failed")
+                db.create_card(
+                    conn,
+                    f"Resolve integration failure for card #{original_id}: queued",
+                    role_type="Conflict Resolver",
+                    source_key=f"integration-failure:{original_id}:merge_conflicts:work/failed",
+                )
+                text = dashboard(conn)
+
+            self.assertIn("Integration: ready with branch=1, missing branch=1, failed originals=1, recovery cards=1", text)
+
+    def test_dashboard_shows_metric_count_next_to_progress_percent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.record_metric(conn, "passing checks", 71, 200)
+                text = dashboard(conn)
+
+            self.assertIn("35.5%", text)
+            self.assertIn("71 / 200 passing checks", text)
+
+    def test_dashboard_strips_terminal_control_sequences_from_db_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.log_event(conn, "note", "bad\x1b[200~paste")
+                text = dashboard(conn)
+
+            self.assertNotIn("\x1b[200~", text)
+            self.assertNotIn("[200~", text)
+            self.assertIn("badpaste", text)
+
+    def test_dashboard_correlates_only_current_development_cards_to_active_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            worktree = str(Path(tmp) / ".harness" / "worktrees" / "developer-1")
+            branch = "work/developer-1"
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", cwd=tmp, worktree=worktree, branch=branch)
+                active_id = db.queue_worklane(conn, "Current implementation", status="queued")
+                db.assign_card(conn, active_id, "developer-1", worktree, branch)
+                done_id = db.queue_worklane(conn, "Already integrated duplicate", status="queued")
+                db.assign_card(conn, done_id, "developer-1", worktree, branch)
+                db.complete_card(conn, done_id, "Already integrated by a newer card.")
+                failed_id = db.queue_worklane(conn, "Stale integration failure", status="integration_failed")
+                agent = conn.execute("SELECT id FROM agents WHERE name = 'developer-1'").fetchone()
+                conn.execute(
+                    "UPDATE worklanes SET owner_agent_id = ?, branch_name = ?, worktree_path = ? WHERE id = ?",
+                    (agent["id"], branch, worktree, failed_id),
+                )
+                conn.commit()
+                data = collect_status(conn)
+                text = dashboard(conn)
+
+            developer_rows = [row for row in data["active_work"] if row["agent_name"] == "developer-1"]
+            self.assertEqual([row["lane_id"] for row in developer_rows], [active_id])
+            self.assertIn(f"developer-1 [Developer/running] → card#{active_id}", text)
+            self.assertNotIn(f"developer-1 [Developer/running] → card#{done_id}", text)
+            self.assertNotIn(f"developer-1 [Developer/running] → card#{failed_id}", text)
 
     def test_dashboard_warns_when_active_agents_have_no_scheduler_pid(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -584,10 +656,46 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(result["failed"], 1)
             self.assertEqual(lane["status"], "integration_failed")
             self.assertEqual(lane["stage"], "integration")
-            self.assertEqual(attempt["merge_result"], "merge_conflicts")
-            self.assertEqual(json.loads(attempt["tests_json"]), [])
+            self.assertEqual(attempt["merge_result"], "preflight_merge_conflicts")
+            self.assertEqual(json.loads(attempt["tests_json"]), ["git merge-tree"])
             self.assertEqual((conflict_card["stage"], conflict_card["status"]), ("planned", "queued"))
             self.assertIn("merge_conflicts", conflict_card["description"])
+
+    def test_integrate_once_preflights_conflicts_and_keys_recovery_by_branch(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=root, check=True)
+            (root / "compiler.rs").write_text("base\n")
+            subprocess.run(["git", "add", "compiler.rs"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "Initial"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "init", "--bare", remote], check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", remote], cwd=root, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "work/developer-branch"], cwd=root, check=True, capture_output=True)
+            (root / "compiler.rs").write_text("branch\n")
+            subprocess.run(["git", "commit", "-am", "Branch edit"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "push", "-u", "origin", "work/developer-branch"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "master"], cwd=root, check=True, capture_output=True)
+            (root / "compiler.rs").write_text("master\n")
+            subprocess.run(["git", "commit", "-am", "Master edit"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "push", "origin", "master"], cwd=root, check=True, capture_output=True)
+
+            paths = db.bootstrap(root)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                lane_id = db.queue_worklane(conn, "Conflicting feature", status="ready_for_integration")
+                conn.execute("UPDATE worklanes SET branch_name = ? WHERE id = ?", ("work/developer-branch", lane_id))
+                result = integrate_once(conn, root)
+                attempt = conn.execute("SELECT * FROM integration_attempts WHERE worklane_id = ?", (lane_id,)).fetchone()
+                conflict_card = conn.execute("SELECT * FROM worklanes WHERE role_type = 'Conflict Resolver'").fetchone()
+
+            self.assertEqual(result["failed"], 1)
+            self.assertEqual(attempt["merge_result"], "preflight_merge_conflicts")
+            self.assertIn("origin/work/developer-branch", conflict_card["source_key"])
+            self.assertIn("Branch: work/developer-branch", conflict_card["description"])
 
     def test_mcp_tools_record_query_spawn_and_search(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1025,6 +1133,37 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(len(cards), 1)
             self.assertEqual(cards[0]["title"], "Fix global test suite failures")
 
+    def test_global_test_loop_throttles_repeated_status_noise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                from llm_harness.testing_loop import queue_test_fix_lane
+
+                for index in range(3):
+                    run_id = db.record_test_run(
+                        conn,
+                        command="python -m unittest discover -s tests -v",
+                        status="failed",
+                        full_log=f"tests/test_{index}.py::test_failure FAILED",
+                        results=[{"nodeid": f"tests/test_{index}.py::test_failure", "status": "failed"}],
+                    )
+                    queue_test_fix_lane(conn, run_id, [{"nodeid": f"tests/test_{index}.py::test_failure", "status": "failed"}], "bad")
+                dedupe_events = conn.execute("SELECT * FROM events WHERE type = 'worklane_deduplicated'").fetchall()
+
+            self.assertEqual(len(dedupe_events), 1)
+
+    def test_test_loop_throttles_repeated_failure_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                for _ in range(2):
+                    run_tests_once(conn, tmp, command=[sys.executable, "-c", "import sys; sys.exit(1)"])
+                failure_events = conn.execute("SELECT * FROM events WHERE type = 'tests_failed'").fetchall()
+
+            self.assertEqual(len(failure_events), 1)
+
     def test_scheduler_repair_retires_bad_capacity_and_duplicate_global_cards(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
@@ -1247,8 +1386,8 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(db.get_meta(conn, "integration_backpressure_active"), "1")
                 assigned = conn.execute("SELECT COUNT(*) AS count FROM worklanes WHERE stage = 'development'").fetchone()["count"]
             spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
-            self.assertEqual(spawned_developers, ["developer-2", "developer-3", "developer-4", "developer-5", "developer-6"])
-            self.assertEqual(assigned, 5)
+            self.assertEqual(spawned_developers, ["developer-2", "developer-3", "developer-4"])
+            self.assertEqual(assigned, 3)
 
     def test_non_actionable_developer_report_retires_card_and_keeps_worker_reassignable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1378,6 +1517,97 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual((fresh["stage"], fresh["status"]), ("development", "assigned"))
             self.assertEqual(len(fake.sent), 1)
             self.assertIn(f"Assigned card #{fresh_id}", fake.sent[0][1])
+
+    def test_scheduler_completes_merged_integration_failure_and_retires_recovery_cards(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=root, check=True)
+            (root / "compiler.rs").write_text("base\n")
+            subprocess.run(["git", "add", "compiler.rs"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "Initial"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "init", "--bare", remote], check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", remote], cwd=root, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "work/already-merged"], cwd=root, check=True, capture_output=True)
+            (root / "compiler.rs").write_text("base\nfeature\n")
+            subprocess.run(["git", "commit", "-am", "Feature"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "push", "-u", "origin", "work/already-merged"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "merge", "--no-ff", "work/already-merged", "-m", "Merge feature"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "push", "origin", "master"], cwd=root, check=True, capture_output=True)
+
+            paths = db.bootstrap(root)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                original_id = db.queue_worklane(conn, "Already merged integration failure", status="integration_failed")
+                conn.execute("UPDATE worklanes SET branch_name = ? WHERE id = ?", ("work/already-merged", original_id))
+                recovery_id = db.create_card(
+                    conn,
+                    f"Resolve integration failure for card #{original_id}: stale merged branch",
+                    role_type="Conflict Resolver",
+                    source_key=f"integration-failure:{original_id}:merge_conflicts:origin/work/already-merged",
+                    description="Branch: work/already-merged\nAlready merged elsewhere.",
+                )
+                scheduler.repair_control_plane_cards(conn)
+                original = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (original_id,)).fetchone()
+                recovery = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (recovery_id,)).fetchone()
+
+            self.assertEqual((original["stage"], original["status"]), ("done", "integrated"))
+            self.assertEqual((recovery["stage"], recovery["status"]), ("done", "stale"))
+
+    def test_scheduler_caps_integration_recovery_wip_and_assigns_fresh_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                for index in range(1, 3):
+                    original_id = db.queue_worklane(conn, f"Failed original {index}", status="integration_failed")
+                    recovery_id = db.create_card(
+                        conn,
+                        f"Resolve integration failure for card #{original_id}: active {index}",
+                        role_type="Conflict Resolver",
+                        source_key=f"integration-failure:{original_id}:merge_conflicts:branch-{index}",
+                        description=f"Branch: work/conflict-{index}\nActive.",
+                    )
+                    db.upsert_agent(conn, name=f"developer-{index}", role="Developer", current_status="running", tmux_pane=f"%developer-{index}", cwd=tmp)
+                    db.assign_card(conn, recovery_id, f"developer-{index}")
+                for index in range(3, 8):
+                    original_id = db.queue_worklane(conn, f"Failed original {index}", status="integration_failed")
+                    db.create_card(
+                        conn,
+                        f"Resolve integration failure for card #{original_id}: queued {index}",
+                        role_type="Conflict Resolver",
+                        source_key=f"integration-failure:{original_id}:merge_conflicts:branch-{index}",
+                        description=f"Branch: work/conflict-{index}\nQueued.",
+                    )
+                for index in range(4):
+                    db.queue_worklane(conn, f"Fresh implementation {index}", role_type="Developer")
+
+                scheduler.ensure_team(conn, "building")
+                active_recovery = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM worklanes
+                    WHERE stage = 'development'
+                      AND (source_key LIKE 'integration-failure:%' OR title LIKE 'Resolve integration failure for card #%')
+                    """
+                ).fetchone()["count"]
+                active_fresh = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM worklanes
+                    WHERE stage = 'development'
+                      AND source_key NOT LIKE 'integration-failure:%'
+                      AND title NOT LIKE 'Resolve integration failure for card #%'
+                    """
+                ).fetchone()["count"]
+
+            self.assertEqual(active_recovery, 3)
+            self.assertEqual(active_fresh, 3)
 
     def test_repair_retires_old_non_actionable_development_cards(self):
         with tempfile.TemporaryDirectory() as tmp:
