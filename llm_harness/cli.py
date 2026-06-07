@@ -94,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "status":
         with db.connect(paths.db) as conn:
             db.init_db(conn)
+            HarnessScheduler(root).reconcile_missing_tmux_agents(conn)
             if args.refresh or not (root / "STATUS.md").exists():
                 refresh_reports(conn, root)
             print(dashboard(conn))

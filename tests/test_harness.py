@@ -477,6 +477,27 @@ class HarnessTests(unittest.TestCase):
             self.assertNotIn(f"developer-1 [Developer/running] → card#{done_id}", text)
             self.assertNotIn(f"developer-1 [Developer/running] → card#{failed_id}", text)
 
+    def test_status_reconciles_missing_tmux_agents_before_rendering(self):
+        class StatusScheduler:
+            def __init__(self, root):
+                self.root = root
+
+            def reconcile_missing_tmux_agents(self, conn):
+                db.update_agent_status(conn, "developer-1", "crash", "tmux pane no longer exists", ended=True)
+                return 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%missing", cwd=tmp)
+
+            stdout = io.StringIO()
+            with mock.patch("llm_harness.cli.HarnessScheduler", StatusScheduler), mock.patch("sys.stdout", stdout):
+                self.assertEqual(main(["--root", tmp, "status"]), 0)
+
+            self.assertIn("Agents: 0 active, 1 crashed, 1 tracked", stdout.getvalue())
+
     def test_dashboard_warns_when_active_agents_have_no_scheduler_pid(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
@@ -1802,6 +1823,26 @@ class HarnessTests(unittest.TestCase):
                 self.assertIn("tmux pane no longer exists", agent["notes"])
                 self.assertEqual((lane["stage"], lane["status"]), ("planned", "queued"))
                 self.assertIn("ended without an accepted report", lane["notes"])
+
+    def test_status_reconciliation_marks_missing_tmux_panes_crashed(self):
+        class MissingTmux(FakeTmux):
+            def target_exists(self, target):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=MissingTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%missing", cwd=tmp)
+                lane_id = db.queue_worklane(conn, "Unreported work")
+                db.assign_card(conn, lane_id, "developer-1")
+                self.assertEqual(scheduler.reconcile_missing_tmux_agents(conn), 1)
+                agent = db.list_agents(conn)[0]
+                lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+
+            self.assertEqual(agent["current_status"], "crash")
+            self.assertEqual((lane["stage"], lane["status"]), ("planned", "queued"))
 
     def test_idle_liveness_prompts_are_throttled(self):
         old = (datetime.now(timezone.utc) - timedelta(seconds=max(IDLE_SECONDS, IDLE_PROMPT_SECONDS) + 1)).isoformat(timespec="seconds")

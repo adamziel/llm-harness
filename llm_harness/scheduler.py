@@ -516,6 +516,7 @@ class HarnessScheduler:
 
         sample = sample_resources(self.root)
         db.record_resource_sample(conn, sample)
+        self.reconcile_missing_tmux_agents(conn)
         self.handle_resource_pressure(conn, sample)
         self.handle_spawn_requests(conn, team)
         reviewed = db.review_ready_cards(conn)
@@ -1283,6 +1284,27 @@ class HarnessScheduler:
         self.requeue_agent_cards(conn, agent, reason)
         db.update_agent_status(conn, agent["name"], "crash", reason, ended=True)
         db.log_event(conn, "agent_missing", f"{agent['name']} {reason}", agent_name=agent["name"])
+
+    def reconcile_missing_tmux_agents(self, conn: sqlite3.Connection) -> int:
+        """Crash active DB agents whose recorded tmux target no longer exists."""
+
+        repaired = 0
+        for agent in db.list_agents(conn):
+            if not db.is_active_agent_status(agent["current_status"]):
+                continue
+            target = _tmux_target(agent)
+            if not target:
+                self.mark_agent_missing(conn, agent, "tmux target was not recorded")
+                repaired += 1
+                continue
+            try:
+                exists = self.tmux.target_exists(target) if hasattr(self.tmux, "target_exists") else True
+            except Exception:
+                exists = False
+            if not exists:
+                self.mark_agent_missing(conn, agent, "tmux pane no longer exists")
+                repaired += 1
+        return repaired
 
     def card_prompt(self, conn: sqlite3.Connection, card_id: int, title: str, prompt: str) -> str:
         """Build the bounded prompt for a concrete card-backed assignment."""
