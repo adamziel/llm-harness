@@ -15,6 +15,7 @@ from unittest import mock
 from llm_harness import __version__, db
 from llm_harness.cli import main
 from llm_harness.codex import CODEX_MODEL, CODEX_REASONING_EFFORT, build_codex_command
+from llm_harness import integration as integration_mod
 from llm_harness.integration import integrate_once
 from llm_harness.mcp_server import HarnessMCP, serve
 from llm_harness.roles import developer_count_for_building, specs_for_team
@@ -1298,6 +1299,63 @@ class HarnessTests(unittest.TestCase):
                 failure_events = conn.execute("SELECT * FROM events WHERE type = 'tests_failed'").fetchall()
 
             self.assertEqual(len(failure_events), 1)
+
+    def test_failed_global_gate_with_metric_is_soft_known_red_and_keeps_product_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tools").mkdir()
+            script = root / "tools" / "run-tests.sh"
+            script.write_text(
+                "#!/bin/sh\n"
+                "echo 'tests/php_a.phpt FAILED'\n"
+                "echo 'tests/php_b.phpt FAILED'\n"
+                "echo 'accepted_public_phpt_passes = 9998 / 10000'\n"
+                "exit 1\n"
+            )
+            script.chmod(0o755)
+            paths = db.bootstrap(root)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                run_tests_once(conn, root)
+                db.create_card(conn, "Add next compatibility slice", role_type="Developer", source_key="feature:next")
+                candidates = scheduler.planned_developer_candidates(conn)
+                gate_mode = db.get_meta(conn, "test_gate_mode")
+                known_failures = json.loads(db.get_meta(conn, "test_gate_failures_json"))
+                rendered = dashboard(conn)
+
+            self.assertEqual(gate_mode, "soft_known_red")
+            self.assertEqual(known_failures, ["tests/php_a.phpt", "tests/php_b.phpt"])
+            self.assertIn("feature:next", [row["source_key"] for row in candidates])
+            self.assertIn("Gate: SOFT KNOWN-RED", rendered)
+
+    def test_failed_global_gate_without_metric_is_hard_blocker_and_pauses_feature_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tools").mkdir()
+            script = root / "tools" / "run-tests.sh"
+            script.write_text("#!/bin/sh\necho 'tests/php_a.phpt FAILED'\nexit 1\n")
+            script.chmod(0o755)
+            paths = db.bootstrap(root)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                run_tests_once(conn, root)
+                feature_card = db.create_card(conn, "Add next compatibility slice", role_type="Developer", source_key="feature:next")
+                gate_card = db.create_card(conn, "Fix metric-producing gate", role_type="Developer", source_key="test-failure:manual-gate", status="ready_for_integration", stage="integration")
+                conn.execute("UPDATE worklanes SET branch_name = 'work/feature' WHERE id = ?", (feature_card,))
+                conn.execute("UPDATE worklanes SET branch_name = 'work/gate' WHERE id = ?", (gate_card,))
+                db.update_worklane_status(conn, feature_card, "ready_for_integration")
+                candidates = scheduler.planned_developer_candidates(conn)
+                ready_lanes = integration_mod._ready_lanes(conn, 10)
+                gate_mode = db.get_meta(conn, "test_gate_mode")
+                rendered = dashboard(conn)
+
+            self.assertEqual(gate_mode, "hard_blocker")
+            self.assertTrue(candidates)
+            self.assertTrue(all(str(row["source_key"]).startswith("test-failure:") for row in candidates))
+            self.assertEqual([row["id"] for row in ready_lanes], [gate_card])
+            self.assertIn("Gate: HARD BLOCKER", rendered)
 
     def test_scheduler_repair_retires_bad_capacity_and_duplicate_global_cards(self):
         with tempfile.TemporaryDirectory() as tmp:

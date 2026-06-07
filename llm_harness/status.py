@@ -348,6 +348,12 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         """
     ).fetchone()
     metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM metadata").fetchall()}
+    test_gate = {
+        "mode": metadata.get("test_gate_mode", ""),
+        "reason": metadata.get("test_gate_reason", ""),
+        "failure_count": metadata.get("test_gate_failure_count", ""),
+        "run_id": metadata.get("test_gate_run_id", ""),
+    }
     runtime_alerts = _runtime_alerts(metadata, agents, active_work, pending_lanes)
     return {
         "goal": dict(goal) if goal else None,
@@ -365,6 +371,7 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
         "queued_integration": dict(queued_integration) if queued_integration else {"count": 0, "delta": 0},
         "failed_integration": dict(failed_integration) if failed_integration else {"count": 0},
         "integration_health": dict(integration_health) if integration_health else {},
+        "test_gate": test_gate,
         "metadata": metadata,
         "runtime_alerts": runtime_alerts,
     }
@@ -405,6 +412,11 @@ def dashboard(conn: sqlite3.Connection) -> str:
         lines.append(_box_line(width, f"Latest tests: {test_run.get('status')} via {test_run.get('command')}", test_color))
     else:
         lines.append(_box_line(width, "Latest tests: no recorded test runs", ANSI["yellow"]))
+    test_gate = data.get("test_gate")
+    if isinstance(test_gate, dict) and test_gate.get("mode") == "hard_blocker":
+        lines.append(_box_line(width, f"Gate: HARD BLOCKER — {test_gate.get('reason')}", ANSI["red"] + ANSI["bold"]))
+    elif isinstance(test_gate, dict) and test_gate.get("mode") == "soft_known_red":
+        lines.append(_box_line(width, f"Gate: SOFT KNOWN-RED — {test_gate.get('failure_count')} known failures, progress allowed", ANSI["yellow"]))
 
     resources = data["resources"]
     if resources:

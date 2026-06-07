@@ -815,9 +815,18 @@ class HarnessScheduler:
                 roles,
             ).fetchall()
         )
+        if db.get_meta(conn, "test_gate_mode") == "hard_blocker":
+            return [row for row in rows if self.is_gate_repair_card(row)]
         if allow_recovery:
             return sorted(rows, key=lambda row: (0 if self.is_integration_recovery_card(row) else 1, int(row["priority"]), int(row["id"])))
         return [row for row in rows if not self.is_integration_recovery_card(row)]
+
+    def is_gate_repair_card(self, row: sqlite3.Row) -> bool:
+        """Return whether a card directly repairs the metric-producing test gate."""
+
+        source_key = str(row["source_key"] or "")
+        title = str(row["title"] or "")
+        return source_key.startswith("test-failure:") or title == "Fix global test suite failures"
 
     def is_integration_recovery_card(self, row: sqlite3.Row) -> bool:
         """Return whether a card is an integration-failure resolver."""

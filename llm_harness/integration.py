@@ -54,6 +54,9 @@ def integrate_once(conn: sqlite3.Connection, root: str | Path, limit: int = INTE
 
 def _ready_lanes(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
     placeholders = ",".join("?" for _ in INTEGRATION_STATUSES)
+    gate_clause = ""
+    if db.get_meta(conn, "test_gate_mode") == "hard_blocker":
+        gate_clause = "AND source_key LIKE 'test-failure:%'"
     return list(
         conn.execute(
             f"""
@@ -61,6 +64,7 @@ def _ready_lanes(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
             WHERE (stage = 'integration' OR status IN ({placeholders}))
               AND status != 'integration_failed'
               AND branch_name != ''
+              {gate_clause}
             ORDER BY priority ASC, ready_for_integration_at IS NULL, ready_for_integration_at ASC, id ASC
             LIMIT ?
             """,

@@ -18,6 +18,7 @@ PYTEST_RESULT_RE = re.compile(r"^(?P<node>\S+?)\s+(?P<status>PASSED|FAILED|SKIPP
 UNITTEST_RESULT_RE = re.compile(r"^(?P<test>\S+)\s+\((?P<case>[^)]+)\)\s+\.\.\.\s+(?P<status>ok|FAIL|ERROR|skipped\b.*)$")
 STATUS_EVENT_THROTTLE_SECONDS = 5 * 60
 PUBLIC_PHPT_METRIC_RE = re.compile(r"accepted_public_phpt_passes\s*[:=]\s*(?P<value>[0-9_,]+)\s*/\s*(?P<target>[0-9_,]+)")
+SOFT_KNOWN_RED_LIMIT = 5
 
 
 
@@ -60,7 +61,8 @@ def run_tests_once(conn: sqlite3.Connection, root: str | Path, command: list[str
         started_at=started,
         ended_at=ended,
     )
-    record_public_phpt_metric(conn, full_log)
+    metric_recorded = record_public_phpt_metric(conn, full_log)
+    update_test_gate_state(conn, run_id, " ".join(shlex.quote(part) for part in cmd), status, parsed, metric_recorded)
     db.note_failing_tests(conn, run_id, commit)
     if status == "failed":
         queue_test_fix_lane(conn, run_id, parsed, commit)
@@ -163,17 +165,68 @@ def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dic
     )
 
 
-def record_public_phpt_metric(conn: sqlite3.Connection, output: str) -> None:
+def record_public_phpt_metric(conn: sqlite3.Connection, output: str) -> bool:
     """Record the public PHPT pass-count metric when the full gate prints it."""
 
     match = PUBLIC_PHPT_METRIC_RE.search(output)
     if not match:
-        return
+        return False
     value = int(match.group("value").replace(",", "").replace("_", ""))
     target = int(match.group("target").replace(",", "").replace("_", ""))
     if target <= 0:
-        return
+        return False
     db.record_metric(conn, "accepted_public_phpt_passes", value, target)
+    return True
+
+
+def update_test_gate_state(
+    conn: sqlite3.Connection,
+    run_id: int,
+    command: str,
+    status: str,
+    results: list[dict[str, Any]],
+    metric_recorded: bool,
+) -> None:
+    """Classify global gate failures as hard blockers or soft known-red debt."""
+
+    if not is_global_test_command(command):
+        return
+    failures = sorted({str(result.get("nodeid", "")) for result in results if result.get("status") in {"failed", "error"} and result.get("nodeid")})
+    if status == "passed":
+        _set_test_gate(conn, "green", "Global test gate is green.", [], run_id)
+        return
+    if not failures:
+        failures = ["command-level-failure"]
+    if metric_recorded and len(failures) <= SOFT_KNOWN_RED_LIMIT:
+        _set_test_gate(
+            conn,
+            "soft_known_red",
+            f"{len(failures)} known failures remain, but the metric-producing gate still ran.",
+            failures,
+            run_id,
+        )
+        return
+    reason = "Global tests failed before producing a progress metric."
+    if metric_recorded:
+        reason = f"{len(failures)} failures exceeds the soft known-red limit of {SOFT_KNOWN_RED_LIMIT}."
+    _set_test_gate(conn, "hard_blocker", reason, failures, run_id)
+
+
+def _set_test_gate(conn: sqlite3.Connection, mode: str, reason: str, failures: list[str], run_id: int) -> None:
+    previous = (
+        db.get_meta(conn, "test_gate_mode"),
+        db.get_meta(conn, "test_gate_reason"),
+        db.get_meta(conn, "test_gate_failures_json"),
+    )
+    failures_json = json.dumps(failures, sort_keys=True)
+    db.set_meta(conn, "test_gate_mode", mode)
+    db.set_meta(conn, "test_gate_reason", reason)
+    db.set_meta(conn, "test_gate_failures_json", failures_json)
+    db.set_meta(conn, "test_gate_failure_count", str(len(failures)))
+    db.set_meta(conn, "test_gate_run_id", str(run_id))
+    current = (mode, reason, failures_json)
+    if current != previous:
+        db.log_event(conn, f"test_gate_{mode}", reason, payload={"run_id": run_id, "failures": failures})
 
 
 def is_global_test_command(command: str) -> bool:
