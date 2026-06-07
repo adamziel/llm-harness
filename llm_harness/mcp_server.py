@@ -159,8 +159,13 @@ class HarnessMCP:
                         notes = args.get("notes")
                         if status != requested_status:
                             notes = f"{requested_status}: {notes}" if notes else requested_status
-                        db.update_agent_status(conn, str(args["name"]), status, notes, bool(args.get("ended", False)))
-                        result = _text({"ok": True})
+                        ended = bool(args.get("ended", False))
+                        agent = conn.execute("SELECT ended_at FROM agents WHERE name = ?", (str(args["name"]),)).fetchone()
+                        if agent and agent["ended_at"] and not ended:
+                            result = _text({"ok": False, "status": "agent_ended"})
+                        else:
+                            db.update_agent_status(conn, str(args["name"]), status, notes, ended)
+                            result = _text({"ok": True})
                 elif name == "agent_report":
                     report_id = db.record_agent_report(conn, args)
                     result = _text({"report_id": report_id, "ok": True})

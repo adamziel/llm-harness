@@ -972,6 +972,24 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(agent["current_status"], "running")
             self.assertEqual(agent["notes"], "working: claimed lane")
 
+    def test_mcp_activity_status_does_not_revive_ended_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            server = HarnessMCP(tmp, paths.db)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", cwd=tmp)
+                db.update_agent_status(conn, "developer-1", "crash", "tmux pane no longer exists", ended=True)
+
+            result = server.call_tool("memory_update_agent", {"name": "developer-1", "status": "working", "notes": "late heartbeat"})
+            self.assertIn('"ok": false', result["content"][0]["text"])
+            with db.connect(paths.db) as conn:
+                agent = conn.execute("SELECT * FROM agents WHERE name = 'developer-1'").fetchone()
+
+            self.assertEqual(agent["current_status"], "crash")
+            self.assertIn("tmux pane no longer exists", agent["notes"])
+            self.assertTrue(agent["ended_at"])
+
     def test_stdio_mcp_initialize_and_tools_list(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
@@ -1843,6 +1861,74 @@ class HarnessTests(unittest.TestCase):
 
             self.assertEqual(agent["current_status"], "crash")
             self.assertEqual((lane["stage"], lane["status"]), ("planned", "queued"))
+
+    def test_repair_requeues_cards_from_agents_with_ended_at_even_if_status_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", tmux_pane="%developer-1", cwd=tmp)
+                db.update_agent_status(conn, "developer-1", "crash", "ended once", ended=True)
+                db.update_agent_status(conn, "developer-1", "running", "stale heartbeat")
+                lane_id = db.queue_worklane(conn, "Should be requeued")
+                db.assign_card(conn, lane_id, "developer-1")
+
+                scheduler.repair_control_plane_cards(conn)
+                lane = conn.execute("SELECT stage, status, owner_agent_id FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+
+            self.assertEqual((lane["stage"], lane["status"], lane["owner_agent_id"]), ("planned", "queued", None))
+
+    def test_reconciliation_closes_terminal_agent_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(
+                    conn,
+                    name="developer-1",
+                    role="Developer",
+                    current_status="success",
+                    tmux_session="fake-session",
+                    tmux_window="developer-1",
+                    tmux_pane="%developer-1",
+                    cwd=tmp,
+                    ended_at=db.utc_now(),
+                )
+                self.assertEqual(scheduler.reconcile_missing_tmux_agents(conn), 1)
+
+            self.assertIn(("fake-session", "developer-1"), fake.killed_windows)
+
+    def test_reconciliation_stops_duplicate_coordinators(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                for name in ("coordinator-1", "coordinator-2"):
+                    db.upsert_agent(
+                        conn,
+                        name=name,
+                        role="Coordinator",
+                        current_status="running",
+                        tmux_session="fake-session",
+                        tmux_window=name,
+                        tmux_pane=f"%{name}",
+                        cwd=tmp,
+                    )
+                card_id = db.create_card(conn, "Duplicate coordinator alert", role_type="Coordinator", integration_required=False)
+                db.assign_card(conn, card_id, "coordinator-2")
+
+                self.assertEqual(scheduler.reconcile_missing_tmux_agents(conn), 1)
+                agents = conn.execute("SELECT name, current_status FROM agents ORDER BY name").fetchall()
+                card = conn.execute("SELECT stage, status, owner_agent_id FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+
+            self.assertEqual([(row["name"], row["current_status"]) for row in agents], [("coordinator-1", "running"), ("coordinator-2", "stopped")])
+            self.assertEqual((card["stage"], card["status"], card["owner_agent_id"]), ("planned", "queued", None))
+            self.assertIn(("fake-session", "coordinator-2"), fake.killed_windows)
 
     def test_idle_liveness_prompts_are_throttled(self):
         old = (datetime.now(timezone.utc) - timedelta(seconds=max(IDLE_SECONDS, IDLE_PROMPT_SECONDS) + 1)).isoformat(timespec="seconds")

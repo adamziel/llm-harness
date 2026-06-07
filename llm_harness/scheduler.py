@@ -902,7 +902,7 @@ class HarnessScheduler:
             FROM worklanes w
             JOIN agents a ON w.owner_agent_id = a.id
             WHERE w.stage = 'development'
-              AND a.current_status IN ({placeholders})
+              AND (a.current_status IN ({placeholders}) OR a.ended_at IS NOT NULL)
             """,
             db.AGENT_TERMINAL_STATUSES,
         ).fetchall()
@@ -1168,6 +1168,9 @@ class HarnessScheduler:
         for agent in conn.execute("SELECT * FROM agents WHERE role = ?", (role,)):
             if not db.is_active_agent_status(agent["current_status"]):
                 continue
+            if agent["ended_at"]:
+                self.mark_agent_missing(conn, agent, "agent row already ended")
+                continue
             target = _tmux_target(agent)
             if not target:
                 self.mark_agent_missing(conn, agent, "tmux target was not recorded")
@@ -1226,7 +1229,7 @@ class HarnessScheduler:
         agents = [
             agent
             for agent in conn.execute("SELECT * FROM agents WHERE role = ? ORDER BY id", (role,))
-            if db.is_active_agent_status(agent["current_status"])
+            if db.is_active_agent_status(agent["current_status"]) and not agent["ended_at"]
         ]
         for agent in agents:
             target = _tmux_target(agent)
@@ -1283,6 +1286,7 @@ class HarnessScheduler:
 
         self.requeue_agent_cards(conn, agent, reason)
         db.update_agent_status(conn, agent["name"], "crash", reason, ended=True)
+        self.kill_agent_window(agent)
         db.log_event(conn, "agent_missing", f"{agent['name']} {reason}", agent_name=agent["name"])
 
     def reconcile_missing_tmux_agents(self, conn: sqlite3.Connection) -> int:
@@ -1290,21 +1294,73 @@ class HarnessScheduler:
 
         repaired = 0
         for agent in db.list_agents(conn):
-            if not db.is_active_agent_status(agent["current_status"]):
-                continue
             target = _tmux_target(agent)
+            if agent["ended_at"] or not db.is_active_agent_status(agent["current_status"]):
+                if agent["ended_at"] and db.is_active_agent_status(agent["current_status"]):
+                    self.mark_agent_missing(conn, agent, "agent row already ended")
+                    repaired += 1
+                elif target and self.target_exists(target):
+                    self.kill_agent_window(agent)
+                    db.log_event(conn, "terminal_agent_window_closed", f"Closed terminal {agent['name']} tmux window", agent_name=agent["name"])
+                    repaired += 1
+                continue
             if not target:
                 self.mark_agent_missing(conn, agent, "tmux target was not recorded")
                 repaired += 1
                 continue
-            try:
-                exists = self.tmux.target_exists(target) if hasattr(self.tmux, "target_exists") else True
-            except Exception:
-                exists = False
-            if not exists:
+            if not self.target_exists(target):
                 self.mark_agent_missing(conn, agent, "tmux pane no longer exists")
                 repaired += 1
+        repaired += self.reconcile_singleton_agent_duplicates(conn)
         return repaired
+
+    def reconcile_singleton_agent_duplicates(self, conn: sqlite3.Connection) -> int:
+        """Keep one Coordinator/Manager control-plane worker and stop duplicates."""
+
+        rows = [
+            agent
+            for agent in conn.execute(
+                """
+                SELECT * FROM agents
+                WHERE role IN ('Coordinator', 'Manager')
+                  AND ended_at IS NULL
+                ORDER BY id
+                """
+            )
+            if db.is_active_agent_status(agent["current_status"]) and _tmux_target(agent) and self.target_exists(_tmux_target(agent))
+        ]
+        if len(rows) <= 1:
+            return 0
+        kept = rows[0]
+        stopped = 0
+        for agent in rows[1:]:
+            self.requeue_agent_cards(conn, agent, f"duplicate singleton worker; kept {kept['name']}")
+            db.update_agent_status(conn, agent["name"], "stopped", f"Stopped duplicate Coordinator; kept {kept['name']}", ended=True)
+            self.kill_agent_window(agent)
+            stopped += 1
+        if stopped:
+            db.log_event(conn, "duplicate_singleton_stopped", f"Stopped {stopped} duplicate Coordinator workers", payload={"kept": kept["name"]})
+        return stopped
+
+    def target_exists(self, target: str) -> bool:
+        """Return whether a tmux target is reachable, treating tmux errors as absent."""
+
+        try:
+            return self.tmux.target_exists(target) if hasattr(self.tmux, "target_exists") else True
+        except Exception:
+            return False
+
+    def kill_agent_window(self, agent: sqlite3.Row) -> None:
+        """Best-effort close of one harness-owned agent window."""
+
+        session = str(agent["tmux_session"] or "")
+        window = str(agent["tmux_window"] or "")
+        if not session or not window:
+            return
+        try:
+            self.tmux.kill_window(session, window)
+        except Exception:
+            return
 
     def card_prompt(self, conn: sqlite3.Connection, card_id: int, title: str, prompt: str) -> str:
         """Build the bounded prompt for a concrete card-backed assignment."""
