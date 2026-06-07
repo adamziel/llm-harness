@@ -17,12 +17,17 @@ from . import db
 PYTEST_RESULT_RE = re.compile(r"^(?P<node>\S+?)\s+(?P<status>PASSED|FAILED|SKIPPED|ERROR)\b")
 UNITTEST_RESULT_RE = re.compile(r"^(?P<test>\S+)\s+\((?P<case>[^)]+)\)\s+\.\.\.\s+(?P<status>ok|FAIL|ERROR|skipped\b.*)$")
 STATUS_EVENT_THROTTLE_SECONDS = 5 * 60
+PUBLIC_PHPT_METRIC_RE = re.compile(r"accepted_public_phpt_passes\s*[:=]\s*(?P<value>[0-9_,]+)\s*/\s*(?P<target>[0-9_,]+)")
+
 
 
 def discover_test_command(root: str | Path) -> list[str]:
     """Choose a deterministic full-suite command for the current repository."""
 
     root_path = Path(root)
+    repo_script = root_path / "tools" / "run-tests.sh"
+    if repo_script.exists() and repo_script.is_file():
+        return ["tools/run-tests.sh"]
     wants_pytest = (root_path / "pytest.ini").exists() or (root_path / "pyproject.toml").exists() or (root_path / "tests").exists()
     if wants_pytest and importlib.util.find_spec("pytest") is not None:
         return ["python", "-m", "pytest", "-vv"]
@@ -55,6 +60,7 @@ def run_tests_once(conn: sqlite3.Connection, root: str | Path, command: list[str
         started_at=started,
         ended_at=ended,
     )
+    record_public_phpt_metric(conn, full_log)
     db.note_failing_tests(conn, run_id, commit)
     if status == "failed":
         queue_test_fix_lane(conn, run_id, parsed, commit)
@@ -122,7 +128,7 @@ def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dic
     failure_key = "global-suite" if global_command else ",".join(sorted(failures)) if failures else "command-level-failure"
     title = "Fix global test suite failures" if global_command else f"Fix failing tests from run {run_id}"
     notes = "Failed tests: " + (", ".join(failures) if failures else "see full test log") + f"\nFirst failing commit: {commit}"
-    source_key = f"test-failure:{command}:{failure_key}"
+    source_key = "test-failure:global-suite" if global_command else f"test-failure:{command}:{failure_key}"
     existing = conn.execute(
         """
         SELECT id FROM worklanes
@@ -155,6 +161,19 @@ def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dic
         acceptance_criteria="The failing tests pass in the deterministic test loop.",
         source_key=source_key,
     )
+
+
+def record_public_phpt_metric(conn: sqlite3.Connection, output: str) -> None:
+    """Record the public PHPT pass-count metric when the full gate prints it."""
+
+    match = PUBLIC_PHPT_METRIC_RE.search(output)
+    if not match:
+        return
+    value = int(match.group("value").replace(",", "").replace("_", ""))
+    target = int(match.group("target").replace(",", "").replace("_", ""))
+    if target <= 0:
+        return
+    db.record_metric(conn, "accepted_public_phpt_passes", value, target)
 
 
 def is_global_test_command(command: str) -> bool:

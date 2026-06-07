@@ -13,6 +13,7 @@ from . import db
 INTEGRATION_STATUSES = ("needs_verification", "ready_for_integration")
 INTEGRATION_WORKTREE = "integrator-mainline"
 INTEGRATION_LIMIT = 5
+GENERATED_REPORT_PATHS = {"STATUS.md", "STATUS.html", "progress.md", "progress.html"}
 
 
 def integrate_once(conn: sqlite3.Connection, root: str | Path, limit: int = INTEGRATION_LIMIT) -> dict[str, int]:
@@ -85,6 +86,15 @@ def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainli
         db.complete_card(conn, lane_id, f"{branch} already merged on origin/{mainline} at {sha}")
         _delete_integrated_branch(root, branch)
         return "integrated"
+
+    changed_paths = _changed_paths(root, mainline, candidate)
+    if changed_paths and _is_report_only_change(changed_paths):
+        reason = "Skipped report-only/status-only branch; generated status files are not merged as product progress."
+        _finish_attempt(conn, attempt_id, "skipped", "report_only", reason, tests=["git diff --name-only"])
+        db.retire_card(conn, lane_id, reason, reason="report_only_integration_skipped")
+        db.log_event(conn, "integration_report_only_skipped", f"Skipped report-only worklane#{lane_id}", payload={"branch": branch, "paths": changed_paths})
+        _delete_integrated_branch(root, branch)
+        return "skipped"
 
     preflight = _preflight_lane(root, mainline, candidate)
     if preflight:
@@ -179,6 +189,15 @@ def _queue_conflict_card(conn: sqlite3.Connection, lane: sqlite3.Row, failure_ty
         priority=max(0, int(lane["priority"]) - 1),
         integration_required=True,
     )
+
+
+def _changed_paths(root: Path, mainline: str, candidate: str) -> list[str]:
+    output = _git_stdout(root, ["diff", "--name-only", f"origin/{mainline}...{candidate}"])
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def _is_report_only_change(paths: list[str]) -> bool:
+    return bool(paths) and all(path in GENERATED_REPORT_PATHS for path in paths)
 
 
 def _preflight_lane(root: Path, mainline: str, candidate: str) -> tuple[str, str, list[str]] | None:

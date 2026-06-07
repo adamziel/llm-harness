@@ -20,7 +20,7 @@ from llm_harness.mcp_server import HarnessMCP, serve
 from llm_harness.roles import developer_count_for_building, specs_for_team
 from llm_harness.scheduler import AUDITOR_SPAWN_SECONDS, IDLE_PROMPT_SECONDS, IDLE_SECONDS, HarnessScheduler, watchdog_loop
 from llm_harness.status import collect_status, dashboard, refresh_reports
-from llm_harness.testing_loop import parse_test_output, run_tests_once
+from llm_harness.testing_loop import discover_test_command, parse_test_output, run_tests_once
 from llm_harness.tmux import TmuxPane
 
 
@@ -642,6 +642,43 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual((conflict_card["stage"], conflict_card["status"]), ("planned", "queued"))
             self.assertIn("push_failed", conflict_card["description"])
 
+    def test_integrate_once_retires_status_only_branch_without_merging(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=root, check=True)
+            (root / "compiler.rs").write_text("base\n")
+            (root / "STATUS.md").write_text("old status\n")
+            subprocess.run(["git", "add", "compiler.rs", "STATUS.md"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "Initial"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "init", "--bare", remote], check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", remote], cwd=root, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "work/status-only"], cwd=root, check=True, capture_output=True)
+            (root / "STATUS.md").write_text("new status\n")
+            (root / "progress.md").write_text("new progress\n")
+            subprocess.run(["git", "add", "STATUS.md", "progress.md"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "Update harness status"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "push", "-u", "origin", "work/status-only"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "master"], cwd=root, check=True, capture_output=True)
+
+            paths = db.bootstrap(root)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                lane_id = db.queue_worklane(conn, "Update harness status", status="ready_for_integration")
+                conn.execute("UPDATE worklanes SET branch_name = ? WHERE id = ?", ("work/status-only", lane_id))
+                result = integrate_once(conn, root)
+                lane = conn.execute("SELECT stage, status, notes FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+
+            subprocess.run(["git", "fetch", "origin"], cwd=root, check=True, capture_output=True)
+            log = subprocess.check_output(["git", "log", "--oneline", "origin/master"], cwd=root, text=True)
+            self.assertEqual(result["skipped"], 1)
+            self.assertEqual((lane["stage"], lane["status"]), ("done", "stale"))
+            self.assertIn("report-only", lane["notes"])
+            self.assertNotIn("Integrate worklane", log)
+
     def test_integrate_once_records_conflicts_without_running_full_tests(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
             root = Path(tmp) / "repo"
@@ -1171,6 +1208,65 @@ class HarnessTests(unittest.TestCase):
                 cards = conn.execute("SELECT * FROM worklanes WHERE status != 'stale'").fetchall()
             self.assertEqual(len(cards), 1)
             self.assertEqual(cards[0]["title"], "Fix global test suite failures")
+
+    def test_global_test_loop_uses_one_stabilization_card_across_full_suite_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                from llm_harness.testing_loop import queue_test_fix_lane
+
+                first = db.record_test_run(
+                    conn,
+                    command="python -m unittest discover -s tests -v",
+                    status="failed",
+                    full_log="tests/test_a.py::test_one FAILED",
+                    results=[{"nodeid": "tests/test_a.py::test_one", "status": "failed"}],
+                )
+                queue_test_fix_lane(conn, first, [{"nodeid": "tests/test_a.py::test_one", "status": "failed"}], "bad")
+                second = db.record_test_run(
+                    conn,
+                    command="tools/run-tests.sh",
+                    status="failed",
+                    full_log="tests/test_b.py::test_two FAILED",
+                    results=[{"nodeid": "tests/test_b.py::test_two", "status": "failed"}],
+                )
+                queue_test_fix_lane(conn, second, [{"nodeid": "tests/test_b.py::test_two", "status": "failed"}], "bad")
+                cards = conn.execute("SELECT * FROM worklanes WHERE status != 'stale'").fetchall()
+            self.assertEqual(len(cards), 1)
+            self.assertEqual(cards[0]["source_key"], "test-failure:global-suite")
+
+    def test_discover_test_command_prefers_repo_run_tests_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tools").mkdir()
+            script = root / "tools" / "run-tests.sh"
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+
+            self.assertEqual(discover_test_command(root), ["tools/run-tests.sh"])
+
+    def test_test_loop_records_public_phpt_metric_from_full_gate_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                run_tests_once(
+                    conn,
+                    tmp,
+                    command=[
+                        sys.executable,
+                        "-c",
+                        "print('accepted_public_phpt_passes = 7873 / 20294 = 38.79%')",
+                    ],
+                )
+                metric = db.latest_metric(conn)
+
+            self.assertIsNotNone(metric)
+            self.assertEqual(metric["metric_name"], "accepted_public_phpt_passes")
+            self.assertEqual(metric["value"], 7873)
+            self.assertEqual(metric["target"], 20294)
 
     def test_global_test_loop_throttles_repeated_status_noise(self):
         with tempfile.TemporaryDirectory() as tmp:
