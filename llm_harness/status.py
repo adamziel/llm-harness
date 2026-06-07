@@ -417,6 +417,8 @@ def dashboard(conn: sqlite3.Connection) -> str:
         lines.append(_box_line(width, f"Gate: HARD BLOCKER — {test_gate.get('reason')}", ANSI["red"] + ANSI["bold"]))
     elif isinstance(test_gate, dict) and test_gate.get("mode") == "soft_known_red":
         lines.append(_box_line(width, f"Gate: SOFT KNOWN-RED — {test_gate.get('failure_count')} known failures, progress allowed", ANSI["yellow"]))
+    elif isinstance(test_gate, dict) and test_gate.get("mode") == "quarantined_known_red":
+        lines.append(_box_line(width, f"Gate: KNOWN-RED QUARANTINE — {test_gate.get('failure_count')} known failures, progress allowed", ANSI["yellow"]))
 
     resources = data["resources"]
     if resources:

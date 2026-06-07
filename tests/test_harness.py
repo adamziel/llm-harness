@@ -1355,7 +1355,7 @@ class HarnessTests(unittest.TestCase):
             root = Path(tmp)
             (root / "tools").mkdir()
             script = root / "tools" / "run-tests.sh"
-            script.write_text("#!/bin/sh\necho 'tests/php_a.phpt FAILED'\nexit 1\n")
+            script.write_text("#!/bin/sh\necho 'runtime crashed before per-test rows'\nexit 1\n")
             script.chmod(0o755)
             paths = db.bootstrap(root)
             scheduler = HarnessScheduler(root, tmux=FakeTmux())
@@ -1377,6 +1377,72 @@ class HarnessTests(unittest.TestCase):
             self.assertTrue(all(str(row["source_key"]).startswith("test-failure:") for row in candidates))
             self.assertEqual([row["id"] for row in ready_lanes], [gate_card])
             self.assertIn("Gate: HARD BLOCKER", rendered)
+
+    def test_failed_global_gate_with_small_parsed_failures_is_quarantined_known_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tools").mkdir()
+            script = root / "tools" / "run-tests.sh"
+            script.write_text(
+                "#!/bin/sh\n"
+                "echo 'tests/php_a.phpt FAILED'\n"
+                "echo 'tests/php_b.phpt FAILED'\n"
+                "exit 1\n"
+            )
+            script.chmod(0o755)
+            paths = db.bootstrap(root)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                run_tests_once(conn, root)
+                feature_card = db.create_card(conn, "Add next compatibility slice", role_type="Developer", source_key="feature:next")
+                conn.execute("UPDATE worklanes SET branch_name = 'work/feature' WHERE id = ?", (feature_card,))
+                db.update_worklane_status(conn, feature_card, "ready_for_integration")
+                db.create_card(conn, "Another product slice", role_type="Developer", source_key="feature:planned")
+                candidates = scheduler.planned_developer_candidates(conn)
+                ready_lanes = integration_mod._ready_lanes(conn, 10)
+                gate_mode = db.get_meta(conn, "test_gate_mode")
+                known_failures = json.loads(db.get_meta(conn, "test_gate_failures_json"))
+                rendered = dashboard(conn)
+
+            self.assertEqual(gate_mode, "quarantined_known_red")
+            self.assertEqual(known_failures, ["tests/php_a.phpt", "tests/php_b.phpt"])
+            self.assertIn("feature:planned", [row["source_key"] for row in candidates])
+            self.assertIn(feature_card, [row["id"] for row in ready_lanes])
+            self.assertIn("Gate: KNOWN-RED QUARANTINE", rendered)
+
+    def test_quarantined_gate_becomes_hard_when_new_failure_appears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                first_run = db.record_test_run(
+                    conn,
+                    command="tools/run-tests.sh",
+                    status="failed",
+                    full_log="tests/php_a.phpt FAILED",
+                    results=[{"nodeid": "tests/php_a.phpt", "status": "failed"}],
+                )
+                from llm_harness.testing_loop import update_test_gate_state
+
+                update_test_gate_state(conn, first_run, "tools/run-tests.sh", "failed", [{"nodeid": "tests/php_a.phpt", "status": "failed"}], False)
+                second_results = [
+                    {"nodeid": "tests/php_a.phpt", "status": "failed"},
+                    {"nodeid": "tests/php_new.phpt", "status": "failed"},
+                ]
+                second_run = db.record_test_run(
+                    conn,
+                    command="tools/run-tests.sh",
+                    status="failed",
+                    full_log="tests/php_a.phpt FAILED\ntests/php_new.phpt FAILED",
+                    results=second_results,
+                )
+                update_test_gate_state(conn, second_run, "tools/run-tests.sh", "failed", second_results, False)
+                gate_mode = db.get_meta(conn, "test_gate_mode")
+                reason = db.get_meta(conn, "test_gate_reason")
+
+            self.assertEqual(gate_mode, "hard_blocker")
+            self.assertIn("New failures appeared", reason)
 
     def test_failed_global_gate_requeues_stale_failed_gate_card(self):
         with tempfile.TemporaryDirectory() as tmp:

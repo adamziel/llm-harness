@@ -200,7 +200,8 @@ def update_test_gate_state(
         _set_test_gate(conn, "green", "Global test gate is green.", [], run_id)
         return
     if not failures:
-        failures = ["command-level-failure"]
+        _set_test_gate(conn, "hard_blocker", "Global tests failed before producing parsed failure rows.", ["command-level-failure"], run_id)
+        return
     if metric_recorded and len(failures) <= SOFT_KNOWN_RED_LIMIT:
         _set_test_gate(
             conn,
@@ -210,10 +211,45 @@ def update_test_gate_state(
             run_id,
         )
         return
+    if len(failures) <= SOFT_KNOWN_RED_LIMIT:
+        previous_failures = _known_gate_failures(conn)
+        if previous_failures and not set(failures).issubset(previous_failures):
+            new_failures = sorted(set(failures) - previous_failures)
+            _set_test_gate(
+                conn,
+                "hard_blocker",
+                "New failures appeared beyond the known-red quarantine: " + ", ".join(new_failures),
+                failures,
+                run_id,
+            )
+            return
+        _set_test_gate(
+            conn,
+            "quarantined_known_red",
+            f"{len(failures)} known failures are quarantined; metric acceptance remains blocked, but unrelated work may continue.",
+            failures,
+            run_id,
+        )
+        return
     reason = "Global tests failed before producing a progress metric."
     if metric_recorded:
         reason = f"{len(failures)} failures exceeds the soft known-red limit of {SOFT_KNOWN_RED_LIMIT}."
     _set_test_gate(conn, "hard_blocker", reason, failures, run_id)
+
+
+def _known_gate_failures(conn: sqlite3.Connection) -> set[str]:
+    """Return the current known-red quarantine failure set."""
+
+    mode = db.get_meta(conn, "test_gate_mode")
+    if mode not in {"quarantined_known_red", "soft_known_red"}:
+        return set()
+    try:
+        values = json.loads(db.get_meta(conn, "test_gate_failures_json", "[]"))
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(values, list):
+        return set()
+    return {str(value) for value in values}
 
 
 def _set_test_gate(conn: sqlite3.Connection, mode: str, reason: str, failures: list[str], run_id: int) -> None:
