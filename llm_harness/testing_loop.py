@@ -133,13 +133,17 @@ def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dic
     source_key = "test-failure:global-suite" if global_command else f"test-failure:{command}:{failure_key}"
     existing = conn.execute(
         """
-        SELECT id FROM worklanes
+        SELECT id, status FROM worklanes
         WHERE source_key = ? AND stage != 'done' AND status NOT IN ('abandoned', 'cancelled', 'stale')
         ORDER BY id LIMIT 1
         """,
         (source_key,),
     ).fetchone()
     if existing:
+        if global_command and existing["status"] == "integration_failed":
+            db.requeue_card(conn, int(existing["id"]), notes + f"\nLatest failing run: {run_id}")
+            db.log_event(conn, "worklane_requeued", f"Requeued failing global gate card#{existing['id']} from run {run_id}", payload={"card_id": existing["id"], "run_id": run_id})
+            return
         conn.execute(
             """
             UPDATE worklanes

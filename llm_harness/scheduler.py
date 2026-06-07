@@ -767,6 +767,7 @@ class HarnessScheduler:
         )
         manhole_command = build_codex_command(manhole_prompt, self.root, self.root, self.paths.db, self.harness_executable())
         self.tmux.ensure_window(session, "manhole", manhole_command)
+        self.tmux.ensure_window(session, "status", "watch -c -n 5 ./harness status")
         db.log_event(conn, "tmux", "Interactive support windows ready", payload={"session": session, "attach": attach})
 
     def ensure_team(self, conn: sqlite3.Connection, team: str) -> None:

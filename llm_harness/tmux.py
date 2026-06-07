@@ -40,13 +40,10 @@ class Tmux:
         return self.runner(["tmux", *args], check=check, text=True, capture_output=True)
 
     def current_or_create_session(self, root: str | Path) -> str:
-        """Use the user's current tmux session, or create a detached harness one."""
+        """Use a harness-owned tmux session instead of borrowing the user's."""
 
         if not self.available():
             raise TmuxUnavailable("tmux is not installed or not on PATH")
-        if os.environ.get("TMUX"):
-            result = self.run(["display-message", "-p", "#S"])
-            return result.stdout.strip()
         session = _session_name(root)
         existing = self.run(["has-session", "-t", session], check=False)
         if existing.returncode != 0:

@@ -44,8 +44,9 @@ directly.
 
 `init` records the goal in `.harness/harness.sqlite3`, initializes Git if needed,
 creates `DEVELOPMENT.md`, `PLAN.md`, status templates, role prompt files, and
-validates the harness MCP. `run` then starts a small resident control plane:
-Coordinator, Integrator, queued Developer capacity, and a Manhole window. Conceptual
+validates the harness MCP. `run` then starts a small resident control plane in a
+harness-owned tmux session: Coordinator, Integrator, queued Developer capacity,
+Manhole, and a watched status dashboard. Conceptual
 roles such as Architect, Conflict Resolver, Lane Scout, and Goal Planner are
 capabilities invoked as short-lived jobs rather than standing sessions. All
 Codex worker commands are generated with `--yolo` and `--model gpt-5.5 -c model_reasoning_effort="xhigh"`.

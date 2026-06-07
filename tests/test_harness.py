@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -22,7 +23,7 @@ from llm_harness.roles import developer_count_for_building, specs_for_team
 from llm_harness.scheduler import AUDITOR_SPAWN_SECONDS, IDLE_PROMPT_SECONDS, IDLE_SECONDS, HarnessScheduler, watchdog_loop
 from llm_harness.status import collect_status, dashboard, refresh_reports
 from llm_harness.testing_loop import discover_test_command, parse_test_output, run_tests_once
-from llm_harness.tmux import TmuxPane
+from llm_harness.tmux import Tmux, TmuxPane
 
 
 class FakeTmux:
@@ -72,6 +73,26 @@ class FakeTmux:
 
 
 class HarnessTests(unittest.TestCase):
+    def test_tmux_uses_harness_session_even_inside_user_tmux(self):
+        calls = []
+
+        def runner(args, check=True, text=True, capture_output=True):
+            calls.append(args)
+            if args[:2] == ["tmux", "has-session"]:
+                return subprocess.CompletedProcess(args, 1, "", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-1000/default,1,0"}),
+                mock.patch("llm_harness.tmux.shutil_which", return_value="/usr/bin/tmux"),
+            ):
+                session = Tmux(runner=runner).current_or_create_session(tmp)
+
+        self.assertTrue(session.startswith("llm-harness-"))
+        self.assertTrue(any(call[:3] == ["tmux", "new-session", "-d"] for call in calls))
+        self.assertFalse(any("display-message" in call for call in calls))
+
     def test_db_schema_tracks_required_agent_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
@@ -1357,6 +1378,32 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual([row["id"] for row in ready_lanes], [gate_card])
             self.assertIn("Gate: HARD BLOCKER", rendered)
 
+    def test_failed_global_gate_requeues_stale_failed_gate_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tools").mkdir()
+            script = root / "tools" / "run-tests.sh"
+            script.write_text("#!/bin/sh\necho 'tests/php_a.phpt FAILED'\nexit 1\n")
+            script.chmod(0o755)
+            paths = db.bootstrap(root)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                stale_card = db.create_card(
+                    conn,
+                    "Fix global test suite failures",
+                    role_type="Developer",
+                    source_key="test-failure:global-suite",
+                    status="integration_failed",
+                    stage="integration",
+                )
+                run_tests_once(conn, root)
+                card = conn.execute("SELECT stage, status, owner_agent_id FROM worklanes WHERE id = ?", (stale_card,)).fetchone()
+                candidates = scheduler.planned_developer_candidates(conn)
+
+            self.assertEqual((card["stage"], card["status"], card["owner_agent_id"]), ("planned", "queued", None))
+            self.assertEqual([row["id"] for row in candidates], [stale_card])
+
     def test_scheduler_repair_retires_bad_capacity_and_duplicate_global_cards(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
@@ -1397,12 +1444,13 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(code, 0)
             window_names = {window for _, window, _ in fake.commands}
             self.assertIn("manhole", window_names)
-            self.assertNotIn("status", window_names)
+            self.assertIn("status", window_names)
             self.assertNotIn("updater", window_names)
             self.assertNotIn("integration", window_names)
             self.assertNotIn("tests", window_names)
             self.assertNotIn("switch:status", window_names)
-            codex_commands = [command for _, window, command in fake.commands if window != "manhole" and not window.startswith("switch:")]
+            self.assertIn(("fake-session", "status", "watch -c -n 5 ./harness status"), fake.commands)
+            codex_commands = [command for _, window, command in fake.commands if window not in {"manhole", "status"} and not window.startswith("switch:")]
             self.assertTrue(codex_commands)
             self.assertTrue(all("--yolo" in command and f"--model {CODEX_MODEL}" in command and f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"' in command for command in codex_commands))
             self.assertIn("Default to supervisor/read-only mode", (root / ".harness" / "prompts" / "manhole.md").read_text())
