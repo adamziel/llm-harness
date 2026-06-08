@@ -42,6 +42,9 @@ SINGLETON_SPAWN_ROLES = {
 JANITOR_SECONDS = 60 * 60
 LOW_RESOURCE_SECONDS = 60
 HIGH_RESOURCE_SECONDS = 30
+RESOURCE_RECOVERY_DISK_FREE_GB = 5
+RESOURCE_BLOCKER_WORDS = ("disk", "cpu", "ram", "memory", "resource", "space")
+RESOURCE_BLOCKER_CONTEXT = ("block", "pressure", "exhaust", "low", "full")
 INTEGRATION_BACKPRESSURE_SECONDS = 20 * 60
 INTEGRATION_READY_STATUSES = ("ready_for_integration",)
 INTEGRATION_RECOVERY_ACTIVE_LIMIT = 4
@@ -86,6 +89,13 @@ Edit it with project-specific commands and conventions for future agents.
 - Avoid unsupported claims of completion; cite tests, files, commits, or other evidence.
 - Leave unrelated files untouched.
 """
+
+
+def _looks_resource_blocker(notes: object) -> bool:
+    """Return whether free-form notes describe an active resource blocker."""
+
+    text = str(notes or "").lower()
+    return any(word in text for word in RESOURCE_BLOCKER_WORDS) and any(marker in text for marker in RESOURCE_BLOCKER_CONTEXT)
 
 
 def goal_looks_corrupted(goal: str) -> bool:
@@ -1418,6 +1428,9 @@ class HarnessScheduler:
     def handle_spawn_requests(self, conn: Any, team: str = "building") -> None:
         """Accept MCP spawn requests by starting agents through scheduler-owned code."""
 
+        cancelled = db.reconcile_spawn_requests(conn)
+        if cancelled:
+            db.log_event(conn, "spawn_request_reconciled", f"Cancelled {cancelled} stale spawn requests")
         for request in db.next_spawn_requests(conn):
             role = "Coordinator" if request["role"] == "Manager" else request["role"]
             card_id = int(request["card_id"] or 0)
@@ -1805,7 +1818,7 @@ class HarnessScheduler:
     def check_progress_stall(self, conn: Any) -> None:
         """Raise a visible alert if the progress metric has not increased in 30 minutes."""
 
-        metric = db.latest_metric(conn)
+        metric = db.selected_metric(conn)
         if metric is None:
             return
         percent = float(metric["percent_ready"])
@@ -1909,6 +1922,28 @@ class HarnessScheduler:
                 db.set_meta(conn, "high_resource_since", str(now))
         else:
             db.set_meta(conn, "high_resource_since", "0")
+            self.clear_recovered_resource_blockers(conn, sample)
+
+    def clear_recovered_resource_blockers(self, conn: Any, sample: dict[str, Any]) -> None:
+        """Remove stale resource-blocker notes once host resources are healthy again."""
+
+        cpu = float(sample.get("cpu_percent", 0))
+        ram = float(sample.get("ram_percent", 0))
+        disk_free = float(sample.get("disk_free_gb", 0))
+        if cpu >= 95 or ram >= 95 or disk_free < RESOURCE_RECOVERY_DISK_FREE_GB:
+            return
+        note = f"Recovered at {db.utc_now()}; resume normal routing."
+        changed = 0
+        for agent in conn.execute("SELECT name, notes FROM agents WHERE ended_at IS NULL AND current_status NOT IN ('crash', 'success', 'stopped') AND notes != ''").fetchall():
+            if _looks_resource_blocker(agent["notes"]):
+                conn.execute("UPDATE agents SET notes = ?, last_seen_at = ? WHERE name = ?", (note, db.utc_now(), agent["name"]))
+                changed += 1
+        for lane in conn.execute("SELECT id, notes FROM worklanes WHERE stage != 'done' AND notes != ''").fetchall():
+            if _looks_resource_blocker(lane["notes"]):
+                conn.execute("UPDATE worklanes SET notes = ?, last_activity_at = ? WHERE id = ?", (note, db.utc_now(), lane["id"]))
+                changed += 1
+        if changed:
+            db.log_event(conn, "resource_recovered", f"Cleared stale resource blockers for {changed} active records", payload=sample)
 
     def prompt_coordinator(self, conn: Any, message: str) -> None:
         """Ask the Coordinator to reorganize work when deterministic monitors fire."""

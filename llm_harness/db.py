@@ -43,6 +43,7 @@ STAGE_STATUS = {
     "integration": "ready_for_integration",
     "done": "done",
 }
+PREFERRED_METRIC_NAMES = ("accepted_public_phpt_passes",)
 CODE_PRODUCING_ROLES = {"Developer", "Designer", "Conflict Resolver", "Reproducer"}
 NON_ACTIONABLE_REPORT_STATUSES = {"reserve_no_source_edits", "no_source_edits", "not_actionable", "superseded"}
 DUPLICATE_BLOCKED_MARKERS = ("duplicate", "canonical", "superseded", "no source edits", "no_source_edits", "competing")
@@ -1155,6 +1156,7 @@ def assign_card(conn: Any, card_id: int, agent_name: str, worktree: str = "", br
     )
     if old_stage != "development":
         record_card_transition(conn, card_id, old_stage, "development", "assigned", agent_name)
+    cancel_routed_spawn_requests(conn, card_id)
     log_event(conn, "worklane_assigned", f"Assigned worklane#{card_id} to {agent_name}", agent_name=agent_name, payload={"worklane_id": card_id, "card_id": card_id, "stage": "development"})
     return conn.execute("SELECT * FROM worklanes WHERE id = ?", (card_id,)).fetchone()
 
@@ -1442,6 +1444,36 @@ def latest_metric(conn: Any) -> Any | None:
     return conn.execute("SELECT * FROM metric_samples ORDER BY id DESC LIMIT 1").fetchone()
 
 
+def selected_metric(conn: Any) -> Any | None:
+    """Return the canonical metric sample for dashboards and stall checks."""
+
+    configured = get_meta(conn, "canonical_metric_name", "")
+    names = (configured, *PREFERRED_METRIC_NAMES) if configured else PREFERRED_METRIC_NAMES
+    for name in names:
+        if not name:
+            continue
+        row = conn.execute(
+            "SELECT * FROM metric_samples WHERE metric_name = ? ORDER BY id DESC LIMIT 1",
+            (name,),
+        ).fetchone()
+        if row is not None:
+            return row
+    return latest_metric(conn)
+
+
+def metric_history(conn: Any, metric_name: str, limit: int = 24) -> list[Any]:
+    """Return recent samples for one metric name so charts do not mix semantics."""
+
+    if not metric_name:
+        return []
+    return list(
+        conn.execute(
+            "SELECT * FROM metric_samples WHERE metric_name = ? ORDER BY id DESC LIMIT ?",
+            (metric_name, limit),
+        )
+    )
+
+
 def queue_spawn_request(
     conn: Any,
     role: str,
@@ -1453,6 +1485,21 @@ def queue_spawn_request(
     """Route sub-agent spawning requests through scheduler-owned state."""
 
     normalized_role = "Coordinator" if role == "Manager" else role
+    existing = conn.execute(
+        """
+        SELECT id FROM spawn_requests
+        WHERE requester = ?
+          AND role = ?
+          AND title = ?
+          AND status IN ('queued', 'deferred', 'started')
+        ORDER BY CASE status WHEN 'started' THEN 0 WHEN 'deferred' THEN 1 ELSE 2 END, id
+        LIMIT 1
+        """,
+        (requester, normalized_role, title),
+    ).fetchone()
+    if existing is not None:
+        log_event(conn, "spawn_request_coalesced", f"{requester or 'agent'} reused {normalized_role}: {title}", payload={"spawn_request_id": int(existing["id"])})
+        return int(existing["id"])
     card_id = find_or_create_card(
         conn,
         source_key=f"spawn:{normalized_role}:{title}",
@@ -1468,10 +1515,46 @@ def queue_spawn_request(
         INSERT INTO spawn_requests(ts, requester, role, title, prompt, card_id, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (utc_now(), requester, role, title, prompt, card_id, notes),
+        (utc_now(), requester, normalized_role, title, prompt, card_id, notes),
     )
     log_event(conn, "spawn_request", f"{requester or 'agent'} requested {normalized_role}: {title}", payload={"card_id": card_id})
     return int(cur.lastrowid)
+
+
+def cancel_routed_spawn_requests(conn: Any, card_id: int) -> int:
+    """Cancel queued spawn intents once the card itself has been assigned."""
+
+    if not card_id:
+        return 0
+    return int(
+        conn.execute(
+            """
+            UPDATE spawn_requests
+            SET status = 'cancelled'
+            WHERE card_id = ?
+              AND status IN ('queued', 'deferred')
+            """,
+            (card_id,),
+        ).rowcount
+    )
+
+
+def reconcile_spawn_requests(conn: Any) -> int:
+    """Cancel queued/deferred spawn intents whose card already left planning."""
+
+    return int(
+        conn.execute(
+            """
+            UPDATE spawn_requests
+            SET status = 'cancelled'
+            WHERE status IN ('queued', 'deferred')
+              AND card_id IN (
+                SELECT id FROM worklanes
+                WHERE stage != 'planned' OR status != 'queued'
+              )
+            """
+        ).rowcount
+    )
 
 
 def find_or_create_card(conn: Any, source_key: str, title: str, **fields: Any) -> int:

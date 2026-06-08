@@ -12,7 +12,7 @@ from pathlib import Path
 from textwrap import shorten
 from typing import Any
 
-from .db import is_active_agent_status, latest_metric, log_event, recent_events, set_meta, utc_now
+from .db import is_active_agent_status, log_event, metric_history, recent_events, selected_metric, set_meta, utc_now
 
 ANSI = {
     "reset": "\033[0m",
@@ -117,7 +117,7 @@ def ensure_templates(root: str | Path) -> None:
         html_template.write_text(HTML_TEMPLATE)
 
 
-def refresh_reports(conn: Any, root: str | Path) -> tuple[Path, Path]:
+def refresh_reports(conn: Any, root: str | Path, publish: bool = True) -> tuple[Path, Path]:
     """Render STATUS.md and STATUS.html from Turso so status is restart-safe."""
 
     root_path = Path(root)
@@ -139,7 +139,8 @@ def refresh_reports(conn: Any, root: str | Path) -> tuple[Path, Path]:
     conn.execute("INSERT INTO status_snapshots(created_at, summary_json) VALUES (?, ?)", (generated, json.dumps(data, sort_keys=True)))
     set_meta(conn, "last_status_refresh_epoch", str(time.time()))
     conn.commit()
-    commit_and_push_status(conn, root_path)
+    if publish:
+        commit_and_push_status(conn, root_path)
     return status_md, status_html
 
 
@@ -220,8 +221,8 @@ def collect_status(conn: Any) -> dict[str, object]:
     work_lanes = conn.execute("SELECT * FROM worklanes ORDER BY id DESC LIMIT 10").fetchall()
     test_run = conn.execute("SELECT * FROM test_runs ORDER BY id DESC LIMIT 1").fetchone()
     resources = conn.execute("SELECT * FROM resource_samples ORDER BY id DESC LIMIT 24").fetchall()
-    metric = latest_metric(conn)
-    metric_history = conn.execute("SELECT * FROM metric_samples ORDER BY id DESC LIMIT 24").fetchall()
+    metric = selected_metric(conn)
+    history = metric_history(conn, str(metric["metric_name"])) if metric else []
     events = recent_events(conn, 12)
     active_work = conn.execute(
         """
@@ -362,7 +363,7 @@ def collect_status(conn: Any) -> dict[str, object]:
         "test_run": dict(test_run) if test_run else None,
         "resources": [dict(row) for row in resources],
         "metric": dict(metric) if metric else None,
-        "metric_history": [dict(row) for row in metric_history],
+        "metric_history": [dict(row) for row in history],
         "events": [dict(row) for row in events],
         "active_work": [dict(row) for row in active_work],
         "pending_lanes": [dict(row) for row in pending_lanes],

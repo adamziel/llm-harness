@@ -15,7 +15,7 @@ from .integration import integrate_once
 from .janitor import run_janitor
 from .mcp_server import main as mcp_main
 from .scheduler import HarnessScheduler, nixos_service, watchdog_loop, watchdog_service
-from .status import dashboard, refresh_reports
+from .status import collect_status, dashboard, refresh_reports
 from .testing_loop import run_tests_once
 
 
@@ -25,7 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="harness", description="Deterministic Codex agent harness")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--root", default=os.getcwd(), help=argparse.SUPPRESS)
-    sub = parser.add_subparsers(dest="command", required=True, metavar="{init,run,status,stop,reset-counters,poke,doctor,logs,lanes,agents}")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="{init,run,status,render-status,stop,reset-counters,poke,doctor,logs,lanes,agents}")
 
     init = sub.add_parser("init", help="Initialize or repair harness state")
     init.add_argument("--goal", help="Goal to record during initialization")
@@ -37,6 +37,9 @@ def main(argv: list[str] | None = None) -> int:
 
     status = sub.add_parser("status", help="Show the Unicode/ANSI dashboard")
     status.add_argument("--refresh", action="store_true", help=argparse.SUPPRESS)
+    status.add_argument("--json", action="store_true", help="Print one JSON status snapshot and exit")
+
+    sub.add_parser("render-status", help="Render STATUS/progress files without committing or pushing")
 
     sub.add_parser("stop", help="Stop harness agents and runtime windows")
     sub.add_parser("reset-counters", help="Clear stale harness counters after an upgrade")
@@ -89,9 +92,19 @@ def main(argv: list[str] | None = None) -> int:
         with db.connect(paths.db) as conn:
             db.init_db(conn)
             HarnessScheduler(root).reconcile_missing_tmux_agents(conn)
-            if args.refresh or not (root / "STATUS.md").exists():
-                refresh_reports(conn, root)
-            print(dashboard(conn))
+            if args.json:
+                print(json.dumps(collect_status(conn), indent=2, sort_keys=True))
+            else:
+                if args.refresh or not (root / "STATUS.md").exists():
+                    refresh_reports(conn, root)
+                print(dashboard(conn))
+        return 0
+    if args.command == "render-status":
+        with db.connect(paths.db) as conn:
+            db.init_db(conn)
+            md, html = refresh_reports(conn, root, publish=False)
+            db.log_event(conn, "status", f"Rendered {md.name} and {html.name} without publishing")
+        print(f"Rendered {md} and {html}")
         return 0
     if args.command == "stop":
         result = HarnessScheduler(root).stop()

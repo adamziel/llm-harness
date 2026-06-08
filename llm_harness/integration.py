@@ -21,35 +21,67 @@ def integrate_once(conn: Any, root: str | Path, limit: int = INTEGRATION_LIMIT) 
 
     root_path = Path(root).resolve()
     result = {"integrated": 0, "failed": 0, "skipped": 0}
-    if not _git_ok(root_path, ["rev-parse", "--is-inside-work-tree"]):
-        db.log_event(conn, "integration_skipped", "Repository is not a git worktree")
-        return result
-    mainline = _mainline_branch(root_path)
-    if not mainline:
-        db.log_event(conn, "integration_skipped", "Could not determine remote mainline branch")
-        return result
-    if not _git_ok(root_path, ["remote", "get-url", "origin"]):
-        db.log_event(conn, "integration_skipped", "No origin remote is configured")
-        return result
-    fetch = _git(root_path, ["fetch", "origin", "--prune"])
-    if fetch.returncode != 0:
-        db.log_event(conn, "integration_skipped", f"git fetch failed: {_output(fetch)}")
-        return result
-    try:
-        worktree = _ensure_integration_worktree(root_path, mainline)
-    except RuntimeError as exc:
-        db.log_event(conn, "integration_skipped", str(exc))
-        return result
-
     lanes = _ready_lanes(conn, limit)
     if not lanes:
         db.log_event(conn, "integration_idle", "No needs_verification or ready_for_integration lanes with branches")
         return result
     for lane in lanes:
-        outcome = _integrate_lane(conn, root_path, worktree, mainline, lane)
+        repo_root = _integration_repo_root(root_path, lane)
+        if not _git_ok(repo_root, ["rev-parse", "--is-inside-work-tree"]):
+            outcome = _fail_lane_before_merge(conn, lane, "missing_git_worktree", f"Integration repository is not a git worktree: {repo_root}")
+            result[outcome] += 1
+            continue
+        if not _git_ok(repo_root, ["remote", "get-url", "origin"]):
+            outcome = _fail_lane_before_merge(conn, lane, "missing_origin", f"No origin remote is configured for integration repository: {repo_root}")
+            result[outcome] += 1
+            continue
+        mainline = _mainline_branch(repo_root)
+        if not mainline:
+            outcome = _fail_lane_before_merge(conn, lane, "missing_mainline", f"Could not determine remote mainline branch for integration repository: {repo_root}")
+            result[outcome] += 1
+            continue
+        fetch = _git(repo_root, ["fetch", "origin", "--prune"])
+        if fetch.returncode != 0:
+            outcome = _fail_lane_before_merge(conn, lane, "fetch_failed", f"git fetch failed in {repo_root}: {_output(fetch)}")
+            result[outcome] += 1
+            continue
+        try:
+            worktree = _ensure_integration_worktree(repo_root, mainline)
+        except RuntimeError as exc:
+            outcome = _fail_lane_before_merge(conn, lane, "worktree_failed", str(exc))
+            result[outcome] += 1
+            continue
+        outcome = _integrate_lane(conn, repo_root, worktree, mainline, lane)
         result[outcome] += 1
     conn.commit()
     return result
+
+
+def _integration_repo_root(root: Path, lane: Any) -> Path:
+    """Return the git repo that owns the candidate branch for a lane."""
+
+    if _git_ok(root, ["rev-parse", "--is-inside-work-tree"]) and _git_ok(root, ["remote", "get-url", "origin"]):
+        return root
+    lane_worktree = str(lane["worktree_path"] or "").strip()
+    if lane_worktree:
+        path = Path(lane_worktree).resolve()
+        if path.exists():
+            repo = _git_stdout(path, ["rev-parse", "--show-toplevel"])
+            if repo:
+                return Path(repo).resolve()
+    return root
+
+
+def _fail_lane_before_merge(conn: Any, lane: Any, failure_type: str, reason: str) -> str:
+    """Record integration failures that happen before a merge attempt can start."""
+
+    lane_id = int(lane["id"])
+    branch = str(lane["branch_name"])
+    attempt_id = _record_attempt(conn, lane_id, branch)
+    _finish_attempt(conn, attempt_id, "integration_failed", failure_type, reason)
+    db.update_worklane_status(conn, lane_id, "integration_failed", reason)
+    _queue_conflict_card(conn, lane, failure_type, reason)
+    return "failed"
 
 
 def _ready_lanes(conn: Any, limit: int) -> list[Any]:

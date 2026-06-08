@@ -2,7 +2,7 @@
 
 Use this skill in every Codex agent launched by the harness.
 
-The harness exposes a local MCP server backed by `.harness/harness.turso3`.
+The harness exposes a local MCP server backed by `.harness/harness.turso`.
 Use it as the shared memory and coordination surface instead of relying on chat
 history alone.
 

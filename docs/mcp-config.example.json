@@ -5,7 +5,7 @@
       "args": ["mcp"],
       "env": {
         "HARNESS_ROOT": ".",
-        "HARNESS_DB": ".harness/harness.sqlite3"
+        "HARNESS_DB": ".harness/harness.turso"
       }
     }
   }

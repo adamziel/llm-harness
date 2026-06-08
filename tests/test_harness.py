@@ -307,6 +307,31 @@ class HarnessTests(unittest.TestCase):
                 self.assertIn(f"card#{ready_lane_id} integration/ready_for_integration/Developer: Merge finished runtime lane", text)
                 self.assertIn("status is alive", text)
 
+    def test_resource_recovery_clears_stale_blocker_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(
+                    conn,
+                    name="developer-1",
+                    role="Developer",
+                    current_status="running",
+                    cwd=tmp,
+                    notes="blocked on disk exhaustion",
+                )
+                lane_id = db.queue_worklane(conn, "Resume after disk recovery", status="assigned", notes="blocked by low disk space")
+                scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+                scheduler.clear_recovered_resource_blockers(conn, {"cpu_percent": 10, "ram_percent": 20, "disk_free_gb": 30})
+                agent = conn.execute("SELECT notes FROM agents WHERE name = 'developer-1'").fetchone()
+                lane = conn.execute("SELECT notes FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+                event = conn.execute("SELECT * FROM events WHERE type = 'resource_recovered'").fetchone()
+
+            self.assertIn("resume normal routing", agent["notes"])
+            self.assertIn("resume normal routing", lane["notes"])
+            self.assertNotIn("disk", agent["notes"].lower())
+            self.assertIsNotNone(event)
+
     def test_dashboard_warns_when_recorded_scheduler_pid_is_dead(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
@@ -347,6 +372,27 @@ class HarnessTests(unittest.TestCase):
 
             self.assertIn("35.5%", text)
             self.assertIn("71 / 200 passing checks", text)
+
+    def test_status_prefers_accepted_metric_and_filters_metric_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.record_metric(conn, "accepted_public_phpt_passes", 7873, 20294)
+                db.record_metric(conn, "blocked_221205_candidate_phpt_passes", 7197, 20294)
+                data = collect_status(conn)
+                text = dashboard(conn)
+                md, html = refresh_reports(conn, tmp, publish=False)
+
+            self.assertEqual(data["metric"]["metric_name"], "accepted_public_phpt_passes")
+            self.assertEqual(data["metric"]["value"], 7873)
+            self.assertEqual({row["metric_name"] for row in data["metric_history"]}, {"accepted_public_phpt_passes"})
+            self.assertIn("7873 / 20294 accepted_public_phpt_passes", text)
+            self.assertNotIn("7197 / 20294 blocked_221205_candidate_phpt_passes", text)
+            self.assertIn("accepted_public_phpt_passes", md.read_text())
+            self.assertNotIn("blocked_221205_candidate_phpt_passes", md.read_text())
+            self.assertIn("accepted_public_phpt_passes", html.read_text())
+            self.assertNotIn("blocked_221205_candidate_phpt_passes", html.read_text())
 
     def test_dashboard_strips_terminal_control_sequences_from_db_text(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -410,6 +456,20 @@ class HarnessTests(unittest.TestCase):
 
             self.assertIn("Agents: 0 active, 1 crashed, 1 tracked", stdout.getvalue())
 
+    def test_status_json_prints_one_snapshot_and_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_goal(conn, "Inspect once", measure="json")
+
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                self.assertEqual(main(["--root", tmp, "status", "--json"]), 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["goal"]["text"], "Inspect once")
+            self.assertFalse((Path(tmp) / "STATUS.md").exists())
+
     def test_dashboard_warns_when_active_agents_have_no_scheduler_pid(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = db.bootstrap(tmp)
@@ -456,6 +516,33 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("Publish status", remote_status)
             staged = subprocess.check_output(["git", "diff", "--cached", "--name-only"], cwd=root, text=True).strip()
             self.assertEqual(staged, "")
+
+    def test_render_status_command_does_not_commit_or_push(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "--allow-empty", "-m", "Initial"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "init", "--bare", remote], check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", remote], cwd=root, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "main"], cwd=root, check=True, capture_output=True)
+            paths = db.bootstrap(root)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_goal(conn, "Render only", measure="status rendered")
+                db.record_metric(conn, "accepted_public_phpt_passes", 2, 4)
+
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                self.assertEqual(main(["--root", str(root), "render-status"]), 0)
+
+            self.assertIn("Rendered", stdout.getvalue())
+            self.assertEqual(subprocess.check_output(["git", "log", "-1", "--pretty=%s"], cwd=root, text=True).strip(), "Initial")
+            self.assertIn("Render only", (root / "STATUS.md").read_text())
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.check_output(["git", f"--git-dir={remote}", "show", "main:STATUS.md"], text=True, stderr=subprocess.DEVNULL)
 
     def test_dashboard_marks_uncarded_active_specialist_work(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -610,6 +697,50 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("report-only", lane["notes"])
             self.assertNotIn("Integrate worklane", log)
 
+    def test_integrate_once_uses_product_worktree_remote_when_harness_root_has_no_origin(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
+            harness_root = Path(tmp) / "static-sites"
+            harness_root.mkdir()
+            subprocess.run(["git", "init", "-b", "master"], cwd=harness_root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=harness_root, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=harness_root, check=True)
+            subprocess.run(["git", "commit", "--allow-empty", "-m", "Wrapper"], cwd=harness_root, check=True, capture_output=True)
+
+            product = harness_root / "wp-extensions"
+            product.mkdir()
+            subprocess.run(["git", "init", "-b", "master"], cwd=product, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=product, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=product, check=True)
+            (product / "plugin.php").write_text("base\n")
+            subprocess.run(["git", "add", "plugin.php"], cwd=product, check=True)
+            subprocess.run(["git", "commit", "-m", "Initial"], cwd=product, check=True, capture_output=True)
+            subprocess.run(["git", "init", "--bare", remote], check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", remote], cwd=product, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "master"], cwd=product, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "work/developer-1"], cwd=product, check=True, capture_output=True)
+            (product / "plugin.php").write_text("base\nfeature\n")
+            subprocess.run(["git", "commit", "-am", "Add feature"], cwd=product, check=True, capture_output=True)
+            subprocess.run(["git", "push", "-u", "origin", "work/developer-1"], cwd=product, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "master"], cwd=product, check=True, capture_output=True)
+
+            paths = db.bootstrap(harness_root)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                lane_id = db.queue_worklane(conn, "Integrate product feature", status="ready_for_integration")
+                conn.execute(
+                    "UPDATE worklanes SET branch_name = ?, worktree_path = ? WHERE id = ?",
+                    ("work/developer-1", str(product), lane_id),
+                )
+                result = integrate_once(conn, harness_root)
+                lane = conn.execute("SELECT * FROM worklanes WHERE id = ?", (lane_id,)).fetchone()
+                attempt = conn.execute("SELECT * FROM integration_attempts WHERE worklane_id = ?", (lane_id,)).fetchone()
+
+            self.assertEqual(result["integrated"], 1)
+            self.assertEqual((lane["stage"], lane["status"]), ("done", "integrated"))
+            self.assertEqual(attempt["status"], "integrated")
+            remote_file = subprocess.check_output(["git", f"--git-dir={remote}", "show", "master:plugin.php"], text=True)
+            self.assertIn("feature", remote_file)
+
     def test_integrate_once_records_conflicts_without_running_full_tests(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
             root = Path(tmp) / "repo"
@@ -701,6 +832,32 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("queued", spawn["content"][0]["text"])
             search = server.call_tool("code_search", {"query": "answer", "refresh": True})
             self.assertIn("example.py", search["content"][0]["text"])
+
+    def test_spawn_requests_are_idempotent_by_requester_role_and_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                first = db.queue_spawn_request(conn, "Architect", "Investigate repeated failure", "first prompt", requester="tests")
+                second = db.queue_spawn_request(conn, "Architect", "Investigate repeated failure", "second prompt", requester="tests")
+                requests = conn.execute("SELECT * FROM spawn_requests WHERE role = 'Architect'").fetchall()
+
+            self.assertEqual(first, second)
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0]["status"], "queued")
+
+    def test_assigned_card_cancels_stale_queued_spawn_requests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                request_id = db.queue_spawn_request(conn, "Architect", "Investigate repeated failure", "prompt", requester="tests")
+                request = conn.execute("SELECT * FROM spawn_requests WHERE id = ?", (request_id,)).fetchone()
+                db.upsert_agent(conn, name="architect-1", role="Architect", current_status="running", cwd=tmp)
+                db.assign_card(conn, int(request["card_id"]), "architect-1")
+                request = conn.execute("SELECT * FROM spawn_requests WHERE id = ?", (request_id,)).fetchone()
+
+            self.assertEqual(request["status"], "cancelled")
 
     def test_mcp_memory_query_supports_common_schema_aliases(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1023,7 +1180,7 @@ class HarnessTests(unittest.TestCase):
     def test_public_help_only_lists_requested_commands(self):
         root = Path(__file__).resolve().parents[1]
         completed = subprocess.run([sys.executable, str(root / "harness"), "--help"], text=True, capture_output=True, check=True)
-        self.assertIn("{init,run,status,stop,reset-counters,poke,doctor,logs,lanes,agents}", completed.stdout)
+        self.assertIn("{init,run,status,render-status,stop,reset-counters,poke,doctor,logs,lanes,agents}", completed.stdout)
         self.assertNotIn("test-loop", completed.stdout)
         self.assertNotIn("update-status", completed.stdout)
         self.assertNotIn("integrate", completed.stdout)
