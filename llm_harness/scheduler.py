@@ -676,21 +676,10 @@ class HarnessScheduler:
         harness = self.harness_executable()
         if not harness.exists():
             return self._mcp_preflight_failed(conn, f"Harness executable not found for MCP: {harness}")
-        try:
-            server = subprocess.run(
-                [str(harness), "--root", str(self.root), "mcp"],
-                input='{"jsonrpc":"2.0","id":1,"method":"initialize"}\n{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n',
-                cwd=self.root,
-                text=True,
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return self._mcp_preflight_failed(conn, f"Harness MCP server did not start: {exc}")
-        if server.returncode != 0 or "memory_query" not in server.stdout:
-            detail = (server.stderr or server.stdout or "no MCP output").strip()
-            return self._mcp_preflight_failed(conn, f"Harness MCP server did not expose memory tools: {detail}")
+        from .mcp_server import TOOLS
+
+        if "memory_query" not in {str(tool.get("name", "")) for tool in TOOLS}:
+            return self._mcp_preflight_failed(conn, "Harness MCP server did not expose memory tools.")
 
         try:
             codex = subprocess.run(
@@ -1455,6 +1444,7 @@ class HarnessScheduler:
         """Crash active DB agents whose recorded tmux target no longer exists."""
 
         repaired = 0
+        closed_terminal_windows: list[str] = []
         for agent in db.list_agents(conn):
             target = _tmux_target(agent)
             if agent["ended_at"] or not db.is_active_agent_status(agent["current_status"]):
@@ -1463,7 +1453,7 @@ class HarnessScheduler:
                     repaired += 1
                 elif target and self.target_exists(target):
                     self.kill_agent_window(agent)
-                    db.log_event(conn, "terminal_agent_window_closed", f"Closed terminal {agent['name']} tmux window", agent_name=agent["name"])
+                    closed_terminal_windows.append(str(agent["name"]))
                     repaired += 1
                 continue
             if not target:
@@ -1473,6 +1463,13 @@ class HarnessScheduler:
             if not self.target_exists(target):
                 self.mark_agent_missing(conn, agent, "tmux pane no longer exists")
                 repaired += 1
+        if closed_terminal_windows:
+            db.log_event(
+                conn,
+                "terminal_agent_windows_closed",
+                f"Closed {len(closed_terminal_windows)} terminal agent tmux windows",
+                payload={"agents": closed_terminal_windows[:50]},
+            )
         repaired += self.reconcile_singleton_agent_duplicates(conn)
         return repaired
 

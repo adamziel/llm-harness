@@ -1667,6 +1667,97 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(gate_mode, "quarantined_known_red")
             self.assertIn("native_invocation_cleanup::magic_args", known_failures)
 
+    def test_quarantined_gate_keeps_union_for_oscillating_related_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                from llm_harness.testing_loop import update_test_gate_state
+
+                initial_results = [
+                    {"nodeid": "native_invocation_cleanup::method_args", "status": "failed"},
+                    {"nodeid": "native_invocation_cleanup::static_args", "status": "failed"},
+                ]
+                initial_run = db.record_test_run(conn, command="tools/run-tests.sh", status="failed", full_log="", results=initial_results)
+                update_test_gate_state(conn, initial_run, "tools/run-tests.sh", "failed", initial_results, False)
+
+                subset_results = [
+                    {"nodeid": "native_invocation_cleanup::method_args", "status": "failed"},
+                ]
+                subset_run = db.record_test_run(conn, command="tools/run-tests.sh", status="failed", full_log="", results=subset_results)
+                update_test_gate_state(conn, subset_run, "tools/run-tests.sh", "failed", subset_results, False)
+
+                expanded_results = [
+                    {"nodeid": "native_invocation_cleanup::method_args", "status": "failed"},
+                    {"nodeid": "native_invocation_cleanup::magic_args", "status": "failed"},
+                ]
+                expanded_run = db.record_test_run(conn, command="tools/run-tests.sh", status="failed", full_log="", results=expanded_results)
+                update_test_gate_state(conn, expanded_run, "tools/run-tests.sh", "failed", expanded_results, False)
+                gate_mode = db.get_meta(conn, "test_gate_mode")
+                known_failures = json.loads(db.get_meta(conn, "test_gate_failures_json"))
+                failure_count = db.get_meta(conn, "test_gate_failure_count")
+
+            self.assertEqual(gate_mode, "quarantined_known_red")
+            self.assertEqual(
+                known_failures,
+                [
+                    "native_invocation_cleanup::magic_args",
+                    "native_invocation_cleanup::method_args",
+                    "native_invocation_cleanup::static_args",
+                ],
+            )
+            self.assertEqual(failure_count, "3")
+
+    def test_quarantined_gate_suppresses_repeated_architect_requests_for_known_cluster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "test_gate_mode", "quarantined_known_red")
+                db.set_meta(
+                    conn,
+                    "test_gate_failures_json",
+                    json.dumps(["native_invocation_cleanup::method_args"]),
+                )
+                from llm_harness.testing_loop import maybe_invoke_architect
+
+                for _ in range(4):
+                    run_id = db.record_test_run(
+                        conn,
+                        command="tools/run-tests.sh",
+                        status="failed",
+                        full_log="",
+                        results=[{"nodeid": "native_invocation_cleanup::method_args", "status": "failed"}],
+                    )
+                    db.note_failing_tests(conn, run_id, "bad")
+                maybe_invoke_architect(conn)
+                request_count = conn.execute("SELECT COUNT(*) AS count FROM spawn_requests WHERE role = 'Architect'").fetchone()["count"]
+
+            self.assertEqual(request_count, 0)
+
+    def test_repeated_unknown_failure_queues_only_one_architect_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                from llm_harness.testing_loop import maybe_invoke_architect
+
+                for _ in range(4):
+                    run_id = db.record_test_run(
+                        conn,
+                        command="tools/run-tests.sh",
+                        status="failed",
+                        full_log="",
+                        results=[{"nodeid": "tests/php_new.phpt", "status": "failed"}],
+                    )
+                    db.note_failing_tests(conn, run_id, "bad")
+                maybe_invoke_architect(conn)
+                maybe_invoke_architect(conn)
+                requests = conn.execute("SELECT role, title, status FROM spawn_requests WHERE role = 'Architect'").fetchall()
+
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0]["status"], "queued")
+
     def test_failed_global_gate_requeues_stale_failed_gate_card(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2563,6 +2654,31 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(scheduler.reconcile_missing_tmux_agents(conn), 1)
 
             self.assertIn(("fake-session", "developer-1"), fake.killed_windows)
+
+    def test_reconciliation_summarizes_terminal_agent_window_closures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                for name in ("developer-1", "integrator-1"):
+                    db.upsert_agent(
+                        conn,
+                        name=name,
+                        role="Developer",
+                        current_status="success",
+                        tmux_session="fake-session",
+                        tmux_window=name,
+                        tmux_pane=f"%{name}",
+                        cwd=tmp,
+                        ended_at=db.utc_now(),
+                    )
+                self.assertEqual(scheduler.reconcile_missing_tmux_agents(conn), 2)
+                events = conn.execute("SELECT type, message FROM events ORDER BY id").fetchall()
+
+            self.assertEqual([row["type"] for row in events], ["terminal_agent_windows_closed"])
+            self.assertIn("Closed 2 terminal agent tmux windows", events[0]["message"])
 
     def test_reconciliation_stops_duplicate_coordinators(self):
         with tempfile.TemporaryDirectory() as tmp:

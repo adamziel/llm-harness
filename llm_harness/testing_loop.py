@@ -245,9 +245,10 @@ def update_test_gate_state(
             run_id,
         )
         return
+    current_failures = set(failures)
     previous_failures = _known_gate_failures(conn)
-    if previous_failures and not set(failures).issubset(previous_failures) and not _same_failure_cluster(previous_failures, set(failures)):
-        new_failures = sorted(set(failures) - previous_failures)
+    if previous_failures and not current_failures.issubset(previous_failures) and not _same_failure_cluster(previous_failures, current_failures):
+        new_failures = sorted(current_failures - previous_failures)
         _set_test_gate(
             conn,
             "hard_blocker",
@@ -256,6 +257,17 @@ def update_test_gate_state(
             run_id,
         )
         return
+    if previous_failures:
+        failures = sorted(previous_failures | current_failures)
+        if len(failures) > KNOWN_RED_QUARANTINE_LIMIT:
+            _set_test_gate(
+                conn,
+                "hard_blocker",
+                f"{len(failures)} known failures exceeds the known-red quarantine limit of {KNOWN_RED_QUARANTINE_LIMIT}.",
+                failures,
+                run_id,
+            )
+            return
     if metric_recorded:
         _set_test_gate(
             conn,
@@ -406,6 +418,7 @@ def maybe_invoke_architect(conn: sqlite3.Connection) -> None:
     """Escalate tests that have failed repeatedly in the last 24 hours."""
 
     since = (datetime.fromisoformat(db.utc_now()) - timedelta(hours=24)).isoformat(timespec="seconds")
+    known_gate_failures = _known_gate_failures(conn)
     repeated = conn.execute(
         """
         SELECT test_nodeid, occurrences FROM bug_reports
@@ -414,16 +427,51 @@ def maybe_invoke_architect(conn: sqlite3.Connection) -> None:
         (since,),
     ).fetchall()
     for row in repeated:
+        test_nodeid = row["test_nodeid"]
+        if known_gate_failures and _same_failure_cluster(known_gate_failures, {test_nodeid}):
+            continue
+        title = f"Find systemic cause for repeated failure: {test_nodeid}"
+        if _architect_escalation_exists(conn, title):
+            continue
         db.queue_spawn_request(
             conn,
             role="Architect",
-            title=f"Find systemic cause for repeated failure: {row['test_nodeid']}",
+            title=title,
             prompt=(
-                f"Test {row['test_nodeid']} has failed more than three times in 24 hours. "
+                f"Test {test_nodeid} has failed more than three times in 24 hours. "
                 "Investigate the structural root cause and plan a reliability refactor."
             ),
             requester="test-loop",
         )
+
+
+def _architect_escalation_exists(conn: sqlite3.Connection, title: str) -> bool:
+    """Return whether this repeated-failure escalation is already routed."""
+
+    if conn.execute(
+        """
+        SELECT 1 FROM spawn_requests
+        WHERE role = 'Architect'
+          AND title = ?
+          AND status IN ('queued', 'deferred', 'started')
+        LIMIT 1
+        """,
+        (title,),
+    ).fetchone():
+        return True
+    return (
+        conn.execute(
+            """
+            SELECT 1 FROM worklanes
+            WHERE source_key = ?
+              AND stage != 'done'
+              AND status NOT IN ('abandoned', 'cancelled', 'stale')
+            LIMIT 1
+            """,
+            (f"spawn:Architect:{title}",),
+        ).fetchone()
+        is not None
+    )
 
 
 def _git_commit(root: Path) -> str:
