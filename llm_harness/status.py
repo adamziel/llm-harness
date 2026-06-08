@@ -490,6 +490,8 @@ def _active_work_lines(rows: object) -> list[str]:
         lane_id = row.get("lane_id")
         if lane_id is None:
             note = str(row.get("agent_notes") or "no assigned lane")
+            if note.startswith("Maintain "):
+                continue
             lane = f"no lane · {note}" if note else "no lane"
         else:
             title = str(row.get("lane_title") or "untitled")
@@ -500,7 +502,7 @@ def _active_work_lines(rows: object) -> list[str]:
         if branch:
             lane = f"{lane} ({branch})"
         lines.append(f"{agent} [{role}/{status}] → {lane}")
-    return lines
+    return lines or ["No active agents or assigned lanes."]
 
 
 def _pending_lane_lines(rows: object) -> list[str]:

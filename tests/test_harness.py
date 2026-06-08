@@ -585,6 +585,25 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("Uncarded active work", text)
             self.assertIn("architect-1 [Architect] has no card", text)
 
+    def test_dashboard_hides_resident_capacity_maintenance_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.upsert_agent(
+                    conn,
+                    name="coordinator-1",
+                    role="Coordinator",
+                    current_status="running",
+                    cwd=tmp,
+                    tmux_pane="%coordinator",
+                    notes="Maintain Coordinator capacity",
+                )
+                text = dashboard(conn)
+
+            self.assertNotIn("Uncarded active work", text)
+            self.assertNotIn("Maintain Coordinator capacity", text)
+
     def test_integrate_once_merges_pushes_and_deletes_ready_branch(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as remote:
             root = Path(tmp) / "repo"
@@ -1981,6 +2000,56 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(spawned_developers, [])
             self.assertEqual(request["status"], "rejected")
             self.assertIn("capacity is already full", event["message"])
+
+    def test_developer_handoff_spawn_request_is_retired_without_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(tmp, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                request_id = db.queue_spawn_request(
+                    conn,
+                    role="Developer",
+                    title="Provide next sanctioned Developer card after developer-329 capacity handoff",
+                    prompt="Assign a fresh narrow sanctioned Developer implementation card.",
+                )
+                scheduler.handle_spawn_requests(conn, "building")
+                request = conn.execute("SELECT * FROM spawn_requests WHERE id = ?", (request_id,)).fetchone()
+                card = conn.execute("SELECT * FROM worklanes WHERE id = ?", (request["card_id"],)).fetchone()
+                event = conn.execute("SELECT * FROM events WHERE type = 'spawn_handoff_retired' ORDER BY id DESC LIMIT 1").fetchone()
+
+            spawned_developers = [window for _, window, _ in fake.commands if window.startswith("developer-")]
+            self.assertEqual(spawned_developers, [])
+            self.assertEqual(request["status"], "rejected")
+            self.assertEqual((card["stage"], card["status"]), ("done", "stale"))
+            self.assertIn("handoff", event["message"])
+
+    def test_repair_retires_stale_developer_handoff_spawn_cards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                handoff = db.create_card(
+                    conn,
+                    "Provide next concrete Developer card after capacity handoff",
+                    role_type="Developer",
+                    description="Assign a fresh narrow sanctioned Developer implementation card.",
+                    source_key="spawn:Developer:Provide next concrete Developer card after capacity handoff",
+                )
+                real = db.create_card(
+                    conn,
+                    "Fix parser edge case",
+                    role_type="Developer",
+                    source_key="spawn:Developer:Fix parser edge case",
+                )
+                scheduler.repair_control_plane_cards(conn)
+                handoff_row = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (handoff,)).fetchone()
+                real_row = conn.execute("SELECT stage, status FROM worklanes WHERE id = ?", (real,)).fetchone()
+
+            self.assertEqual((handoff_row["stage"], handoff_row["status"]), ("done", "stale"))
+            self.assertEqual((real_row["stage"], real_row["status"]), ("planned", "queued"))
 
     def test_integration_backpressure_prevents_developer_scaleup(self):
         old = str(__import__("time").time() - 21 * 60)

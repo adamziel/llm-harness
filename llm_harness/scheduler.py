@@ -52,6 +52,12 @@ INTEGRATION_RESOLUTION_CARD_RE = re.compile(r"card #(\d+)")
 INTEGRATION_BRANCH_RE = re.compile(r"(?m)^Branch:\s*(\S+)")
 SUPPORT_ROLES = {"Manhole", "Status reporter", "Janitor"}
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+DEVELOPER_HANDOFF_MARKERS = (
+    "capacity handoff",
+    "fresh narrow sanctioned developer",
+    "next concrete developer",
+    "next sanctioned developer",
+)
 DEFAULT_DEVELOPMENT_MD = """# Development Guide
 
 This starter file was created by the harness because DEVELOPMENT.md was missing.
@@ -947,6 +953,7 @@ class HarnessScheduler:
         """Repair card state left behind by older harness control-plane bugs."""
 
         self.retire_capacity_cards(conn)
+        self.retire_developer_handoff_cards(conn)
         self.retire_non_actionable_development_cards(conn)
         self.requeue_cards_from_terminal_agents(conn)
         self.dedupe_global_test_failure_cards(conn)
@@ -1009,6 +1016,39 @@ class HarnessScheduler:
         if retired:
             db.log_event(conn, "card_repair", f"Retired {retired} obsolete Developer capacity cards")
         return int(retired)
+
+    def retire_developer_handoff_cards(self, conn: sqlite3.Connection) -> int:
+        """Retire scheduler-handoff cards that old Developer spawn requests leaked."""
+
+        rows = conn.execute(
+            """
+            SELECT id, title, description, goal, acceptance_criteria, notes
+            FROM worklanes
+            WHERE stage != 'done'
+              AND role_type = 'Developer'
+              AND source_key LIKE 'spawn:Developer:%'
+            """
+        ).fetchall()
+        retired = 0
+        for row in rows:
+            if not self.is_developer_handoff_text(
+                row["title"],
+                row["description"],
+                row["goal"],
+                row["acceptance_criteria"],
+                row["notes"],
+            ):
+                continue
+            db.retire_card(
+                conn,
+                int(row["id"]),
+                "Retired scheduler handoff card; Python assigns queued Developer cards directly.",
+                reason="developer_handoff",
+            )
+            retired += 1
+        if retired:
+            db.log_event(conn, "card_repair", f"Retired {retired} obsolete Developer handoff cards")
+        return retired
 
     def retire_non_actionable_development_cards(self, conn: sqlite3.Connection) -> int:
         """Retire cards that older releases left assigned after no-op reports."""
@@ -1341,6 +1381,17 @@ class HarnessScheduler:
         for request in db.next_spawn_requests(conn):
             role = "Coordinator" if request["role"] == "Manager" else request["role"]
             card_id = int(request["card_id"] or 0)
+            if role == "Developer" and self.is_developer_handoff_text(request["title"], request["prompt"], request["notes"]):
+                if card_id:
+                    db.retire_card(
+                        conn,
+                        card_id,
+                        "Retired scheduler handoff spawn card; Python assigns queued Developer cards directly.",
+                        reason="developer_handoff",
+                    )
+                db.mark_spawn_request(conn, request["id"], "rejected", "")
+                db.log_event(conn, "spawn_handoff_retired", f"Rejected Developer handoff spawn request: {request['title']}", payload={"request_id": request["id"], "card_id": card_id})
+                continue
             if role == "Developer":
                 reason = self.developer_spawn_blocker(conn, team)
                 if reason:
@@ -1373,6 +1424,12 @@ class HarnessScheduler:
                 continue
             name = self.spawn_agent(conn, role, request["title"], extra=request["prompt"], card_id=card_id or None)
             db.mark_spawn_request(conn, request["id"], "started" if name else "failed", name or "")
+
+    def is_developer_handoff_text(self, *parts: object) -> bool:
+        """Return whether text asks the scheduler for another Developer slot, not code work."""
+
+        text = " ".join(str(part or "").lower() for part in parts)
+        return any(marker in text for marker in DEVELOPER_HANDOFF_MARKERS)
 
     def running_role_agent(self, conn: sqlite3.Connection, role: str) -> sqlite3.Row | None:
         """Return one reachable active agent for a singleton role."""
