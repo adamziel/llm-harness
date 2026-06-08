@@ -843,12 +843,62 @@ class HarnessTests(unittest.TestCase):
             with db.connect(root / ".harness" / "harness.sqlite3") as conn:
                 self.assertTrue(db.get_meta(conn, "initialized_at"))
 
+    def test_init_rejects_terminal_escape_goal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with (
+                mock.patch.object(scheduler, "check_gh"),
+                mock.patch.object(scheduler, "check_local_tools"),
+                mock.patch.object(scheduler, "check_harness_mcp", return_value=True),
+                mock.patch.object(scheduler, "initialize_index"),
+            ):
+                self.assertEqual(scheduler.init_project(goal="\x1b[A --help"), 1)
+            self.assertEqual(scheduler.tmux.commands, [])
+            with db.connect(root / ".harness" / "harness.sqlite3") as conn:
+                self.assertIn("Provided goal appears corrupted", db.get_meta(conn, "red_banner"))
+
+    def test_init_goal_repairs_corrupt_stored_goal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = db.bootstrap(root)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_goal(conn, "\x1b[A --help", measure="bad")
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with (
+                mock.patch.object(scheduler, "check_gh"),
+                mock.patch.object(scheduler, "check_local_tools"),
+                mock.patch.object(scheduler, "check_harness_mcp", return_value=True),
+                mock.patch.object(scheduler, "initialize_index"),
+            ):
+                self.assertEqual(scheduler.init_project(goal="Real compiler goal"), 0)
+            with db.connect(root / ".harness" / "harness.sqlite3") as conn:
+                self.assertEqual(db.get_goal(conn)["text"], "Real compiler goal")
+                self.assertEqual(db.get_meta(conn, "red_banner"), "")
+
     def test_run_requires_init_before_resident_team_starts(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake = FakeTmux()
             scheduler = HarnessScheduler(tmp, tmux=fake)
             self.assertEqual(scheduler.run(goal="later", once=True), 1)
             self.assertEqual(fake.commands, [])
+
+    def test_run_refuses_corrupt_stored_goal_before_starting_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = db.bootstrap(root)
+            fake = FakeTmux()
+            scheduler = HarnessScheduler(root, tmux=fake)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "initialized_at", db.utc_now())
+                db.set_goal(conn, "ESC[A --help", measure="bad")
+            with mock.patch.object(scheduler, "check_codex_mcp", return_value=True):
+                self.assertEqual(scheduler.run(team="minimal", once=True), 1)
+            self.assertEqual(fake.commands, [])
+            with db.connect(root / ".harness" / "harness.sqlite3") as conn:
+                self.assertIn("Stored goal appears corrupted", db.get_meta(conn, "red_banner"))
 
     def test_refined_schema_has_required_control_plane_tables(self):
         with tempfile.TemporaryDirectory() as tmp:

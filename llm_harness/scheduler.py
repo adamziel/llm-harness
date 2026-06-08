@@ -51,6 +51,7 @@ REPORT_ONLY_CARD_MARKERS = ("read-only", "read only", "no source edits", "no_sou
 INTEGRATION_RESOLUTION_CARD_RE = re.compile(r"card #(\d+)")
 INTEGRATION_BRANCH_RE = re.compile(r"(?m)^Branch:\s*(\S+)")
 SUPPORT_ROLES = {"Manhole", "Status reporter", "Janitor"}
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 DEFAULT_DEVELOPMENT_MD = """# Development Guide
 
 This starter file was created by the harness because DEVELOPMENT.md was missing.
@@ -82,6 +83,19 @@ Edit it with project-specific commands and conventions for future agents.
 """
 
 
+def goal_looks_corrupted(goal: str) -> bool:
+    """Return whether a goal is terminal control noise rather than user intent."""
+
+    if not goal:
+        return False
+    stripped = ANSI_ESCAPE_RE.sub("", goal).strip()
+    if stripped != goal.strip():
+        return True
+    if any(ord(char) < 32 and char not in {"\n", "\r", "\t"} for char in goal):
+        return True
+    return stripped.startswith(("ESC[", "^["))
+
+
 class HarnessScheduler:
     """Own the durable event loop instead of trusting worker agents to self-manage."""
 
@@ -98,8 +112,9 @@ class HarnessScheduler:
             self.check_gh(conn)
             self.check_project_context(conn)
             ensure_templates(self.root)
+            if not self.ensure_goal(conn, goal):
+                return 1
             self.write_role_prompt_files(conn)
-            self.ensure_goal(conn, goal)
             self.check_local_tools(conn)
             conn.commit()
             if not self.check_harness_mcp(conn):
@@ -119,6 +134,8 @@ class HarnessScheduler:
 
         def start(conn: sqlite3.Connection) -> int:
             if not self.validate_initialized(conn):
+                return 1
+            if not self.ensure_goal(conn, goal):
                 return 1
             db.set_meta(conn, "scheduler_pid", str(os.getpid()))
             self.ensure_git_repo(conn)
@@ -711,19 +728,41 @@ class HarnessScheduler:
                 return candidate
         return self.root / "harness"
 
-    def ensure_goal(self, conn: sqlite3.Connection, provided: str | None) -> None:
-        """Capture the initial goal seed during init, then let Coordinator refine lanes."""
+    def ensure_goal(self, conn: sqlite3.Connection, provided: str | None) -> bool:
+        """Capture a valid goal seed without preserving terminal-noise corruption."""
 
-        if db.get_goal(conn) is not None:
-            return
+        existing = db.get_goal(conn)
+        if existing is not None and not goal_looks_corrupted(str(existing["text"])):
+            return True
+        if existing is not None and provided is None:
+            message = "Stored goal appears corrupted by terminal input; rerun ./harness init --goal with the real goal."
+            db.set_meta(conn, "red_banner", message)
+            db.log_event(conn, "goal_corrupt", message, payload={"stored_goal": str(existing["text"])})
+            print(f"\033[31m{message}\033[0m", file=sys.stderr)
+            return False
+
         goal = provided or os.environ.get("HARNESS_GOAL") or ""
+        if goal_looks_corrupted(goal):
+            message = "Provided goal appears corrupted by terminal input; pass the real goal with ./harness init --goal."
+            db.set_meta(conn, "red_banner", message)
+            db.log_event(conn, "goal_corrupt", message, payload={"provided_goal": goal})
+            print(f"\033[31m{message}\033[0m", file=sys.stderr)
+            return False
         if not goal and sys.stdin.isatty():
             goal = input("Describe the goal for this harness run: ").strip()
+            if goal_looks_corrupted(goal):
+                message = "Entered goal appears corrupted by terminal input; rerun ./harness init --goal with the real goal."
+                db.set_meta(conn, "red_banner", message)
+                db.log_event(conn, "goal_corrupt", message, payload={"entered_goal": goal})
+                print(f"\033[31m{message}\033[0m", file=sys.stderr)
+                return False
         if not goal:
             goal = "Goal not captured yet; Coordinator or Goal Planner must ask the user for the real goal."
         measure = "Coordinator must maintain a deterministic success metric and acceptance criteria."
         db.set_goal(conn, goal, measure=measure, status="active", auditor_summary="Auditor/Verifier must prefer deterministic metric evidence over freeform claims.")
+        db.set_meta(conn, "red_banner", "")
         self.write_initial_plan_stub(goal)
+        return True
 
     def write_initial_plan_stub(self, goal: str) -> None:
         """Create PLAN.md so restarted agents have a concrete planning artifact."""
