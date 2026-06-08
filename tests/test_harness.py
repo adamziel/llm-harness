@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1863,6 +1865,34 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual([agent["role"] for agent in agents], ["Coordinator"])
                 self.assertEqual(db.get_meta(conn, "red_banner"), "")
                 self.assertEqual(db.get_meta(conn, "harness_stopped"), "0")
+
+    def test_supervisor_ignores_unexpected_sigterm_and_records_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(scheduler.paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "harness_stopped", "0")
+                conn.commit()
+
+            scheduler.handle_supervisor_sigterm(signal.SIGTERM, None)
+            result = asyncio.run(scheduler.supervised_once("scheduler", lambda: "tick complete"))
+            with db.connect(scheduler.paths.db) as conn:
+                event = conn.execute("SELECT * FROM events WHERE type = 'scheduler_signal' ORDER BY id DESC LIMIT 1").fetchone()
+
+            self.assertEqual(result, "ok")
+            self.assertIn("unexpected SIGTERM", event["message"])
+
+    def test_supervisor_sigterm_from_harness_stop_exits_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(scheduler.paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "harness_stopped", "1")
+                conn.commit()
+
+            scheduler.handle_supervisor_sigterm(signal.SIGTERM, None)
+            with self.assertRaises(KeyboardInterrupt):
+                asyncio.run(scheduler.supervised_once("scheduler", lambda: self.fail("action should not run")))
 
     def test_supervisor_once_isolates_loop_failures_and_continues(self):
         with tempfile.TemporaryDirectory() as tmp:

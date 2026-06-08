@@ -109,6 +109,7 @@ class HarnessScheduler:
         self.root = Path(root).resolve()
         self.paths = db.bootstrap(self.root)
         self.tmux = tmux or Tmux()
+        self._pending_sigterms = 0
 
     def init_project(self, goal: str | None = None) -> int:
         """Initialize or repair harness state without starting the resident team."""
@@ -184,17 +185,21 @@ class HarnessScheduler:
             return 0
 
         print("Harness supervisor running. Press Ctrl-C to stop; workers remain inspectable in tmux.", flush=True)
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, self.handle_supervisor_sigterm)
         try:
             asyncio.run(self.supervisor_loop(team))
         except KeyboardInterrupt:
-            print("Harness supervisor stopped by user; agent tmux windows remain available.", flush=True)
+            print("Harness supervisor stopped by user or ./harness stop; agent tmux windows remain available.", flush=True)
 
             def mark_stopped(conn: sqlite3.Connection) -> None:
-                db.log_event(conn, "scheduler", "Harness supervisor stopped by user")
+                db.log_event(conn, "scheduler", "Harness supervisor stopped by user or ./harness stop")
                 db.set_meta(conn, "scheduler_pid", "")
 
             self.with_retrying_db("shutdown", mark_stopped)
             return 0
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         return 0
 
     def with_retrying_db(self, label: str, action):
@@ -268,6 +273,7 @@ class HarnessScheduler:
     async def supervised_once(self, name: str, action) -> str:
         """Run one loop pass in a worker thread and print a prefixed summary."""
 
+        self.handle_pending_supervisor_sigterms()
         try:
             result = await asyncio.to_thread(action)
         except Exception as exc:
@@ -277,6 +283,42 @@ class HarnessScheduler:
             return "error"
         self.supervisor_log(name, str(result or "ok"))
         return "ok"
+
+
+    def handle_supervisor_sigterm(self, signum, frame) -> None:
+        """Defer SIGTERM handling until the supervisor can inspect durable stop state."""
+
+        self._pending_sigterms += 1
+
+    def handle_pending_supervisor_sigterms(self) -> None:
+        """Stop only for ./harness stop; otherwise keep the supervisor alive."""
+
+        if not self._pending_sigterms:
+            return
+        count = self._pending_sigterms
+        self._pending_sigterms = 0
+        if self.harness_stop_requested():
+            raise KeyboardInterrupt
+        message = f"Ignored unexpected SIGTERM x{count}; use ./harness stop for intentional shutdown"
+        print(f"\033[33m{message}.\033[0m", file=sys.stderr, flush=True)
+
+        def record(conn: sqlite3.Connection) -> None:
+            db.log_event(conn, "scheduler_signal", message, payload={"signal": "SIGTERM", "count": count})
+
+        try:
+            self.with_retrying_db("SIGTERM handling", record)
+        except Exception:
+            return
+
+    def harness_stop_requested(self) -> bool:
+        """Return whether a SIGTERM came from ./harness stop instead of outside noise."""
+
+        try:
+            with db.connect(self.paths.db) as conn:
+                db.init_db(conn)
+                return db.get_meta(conn, "harness_stopped") == "1"
+        except Exception:
+            return False
 
     def supervisor_log(self, name: str, message: str) -> None:
         """Print one structured supervisor line to the single run stream."""
