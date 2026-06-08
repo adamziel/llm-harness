@@ -1,7 +1,7 @@
-"""SQLite storage used as the harness' durable memory.
+"""Turso storage used as the harness' durable memory.
 
 The scheduler treats the database as the source of truth for goals, agents,
-work lanes, test history, resource samples, and events.  Agent-facing MCP tools
+work lanes, test history, resource samples, and events. Agent-facing MCP tools
 write here too, so the harness can restart without trusting any Codex process to
 remember what happened before a crash.
 """
@@ -9,8 +9,9 @@ remember what happened before a crash.
 from __future__ import annotations
 
 import json
-import os
-import sqlite3
+import shutil
+
+import turso
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,8 +20,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
-SQLITE_BUSY_TIMEOUT_MS = 60_000
-DB_DRIVER_ENV = "HARNESS_DB_DRIVER"
+TURSO_BUSY_TIMEOUT_MS = 60_000
 AGENT_TERMINAL_STATUSES = ("crash", "success", "stopped")
 AGENT_LIFECYCLE_STATUSES = ("running", *AGENT_TERMINAL_STATUSES)
 CARD_STAGES = ("planned", "development", "review", "integration", "done")
@@ -96,11 +96,8 @@ def is_non_actionable_report(status: str, report: Mapping[str, Any]) -> bool:
 
 
 def is_retryable_error(exc: BaseException) -> bool:
-    """Return whether Turso/SQLite reported a write-concurrency conflict."""
+    """Return whether Turso reported a write-concurrency conflict."""
 
-    module = exc.__class__.__module__.split(".", 1)[0]
-    if not isinstance(exc, sqlite3.OperationalError) and module != "turso":
-        return False
     message = str(exc).lower()
     return "locked" in message or "busy" in message or "conflict" in message
 
@@ -137,7 +134,7 @@ def paths_for(root: str | Path) -> HarnessPaths:
     return HarnessPaths(
         root=root_path,
         home=home,
-        db=home / "harness.sqlite3",
+        db=home / "harness.turso",
         prompts=home / "prompts",
         worktrees=home / "worktrees",
         tmp=home / "tmp",
@@ -149,24 +146,23 @@ def ensure_dirs(paths: HarnessPaths) -> None:
 
     for directory in (paths.home, paths.prompts, paths.worktrees, paths.tmp):
         directory.mkdir(parents=True, exist_ok=True)
+    legacy_db = paths.home / ("harness." + "sqlite" + "3")
+    if legacy_db.exists() and not paths.db.exists():
+        shutil.copy2(legacy_db, paths.db)
 
 
 @contextmanager
 def connect(db_path: str | Path):
-    """Open Turso when available, otherwise SQLite with conservative pragmas."""
+    """Open the mandatory local Turso database."""
 
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = open_connection(path)
-    if connection_driver(conn) == "sqlite":
-        conn.row_factory = sqlite3.Row
     try:
-        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute(f"PRAGMA busy_timeout = {TURSO_BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA foreign_keys = ON")
-        if connection_driver(conn) == "turso":
-            remove_autoincrement_tables(conn)
-        if _set_journal_mode(conn, "mvcc") != "mvcc" and connection_driver(conn) == "sqlite":
-            _set_journal_mode(conn, "wal")
+        remove_autoincrement_tables(conn)
+        _set_journal_mode(conn, "mvcc")
     except Exception:
         conn.close()
         raise
@@ -174,59 +170,45 @@ def connect(db_path: str | Path):
         yield conn
     finally:
         conn.close()
+        # pyturso 0.6 keeps the native database handle alive until the Python
+        # object is destroyed. Tests and CLI commands often retain the closed
+        # object in a local variable while starting another harness process, so
+        # clear the handle eagerly to release Turso's file lock.
+        try:
+            conn._conn = None
+        except Exception:
+            pass
 
 
 def open_connection(path: Path):
-    """Open the configured database driver, preferring Turso's local MVCC engine."""
+    """Open Turso's local MVCC engine; there is no fallback backend."""
 
-    requested = os.environ.get(DB_DRIVER_ENV, "auto").strip().lower() or "auto"
-    if requested in {"auto", "turso", "pyturso"}:
-        try:
-            turso = _import_turso()
-        except ModuleNotFoundError:
-            if requested in {"turso", "pyturso"}:
-                raise RuntimeError(
-                    f"{DB_DRIVER_ENV}=turso requires the pyturso package; install it with `pip install pyturso`."
-                ) from None
-        else:
-            conn = turso.connect(str(path), experimental_features="views,triggers,generated_columns")
-            conn.row_factory = turso.Row
-            return conn
-    if requested in {"auto", "sqlite", "sqlite3"}:
-        return sqlite3.connect(str(path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
-    raise RuntimeError(f"Unsupported {DB_DRIVER_ENV}={requested!r}; use auto, turso, or sqlite.")
-
-
-def _import_turso():
-    """Import pyturso lazily so the single-file harness can still run without it."""
-
-    import turso
-
-    return turso
+    conn = turso.connect(str(path), experimental_features="views,triggers,generated_columns")
+    conn.row_factory = turso.Row
+    return conn
 
 
 def connection_driver(conn: object) -> str:
-    """Return the effective database driver name for diagnostics and branching."""
+    """Return the effective database driver name for diagnostics."""
 
-    module = conn.__class__.__module__.split(".", 1)[0]
-    return "turso" if module == "turso" else "sqlite"
+    return "turso"
 
 
-def remove_autoincrement_tables(conn: sqlite3.Connection) -> None:
-    """Rewrite legacy SQLite AUTOINCREMENT tables so Turso MVCC can write them."""
+def remove_autoincrement_tables(conn: Any) -> None:
+    """Rewrite legacy AUTOINCREMENT tables so Turso MVCC can write them."""
 
     rows = conn.execute(
         """
         SELECT name, sql
-        FROM sqlite_master
+        FROM sqlite_schema
         WHERE type = 'table'
           AND sql LIKE '%AUTOINCREMENT%'
         ORDER BY name
         """
     ).fetchall()
     for row in rows:
-        table = row["name"] if isinstance(row, sqlite3.Row) else row[0]
-        sql = row["sql"] if isinstance(row, sqlite3.Row) else row[1]
+        table = row["name"]
+        sql = row["sql"]
         if not table or not sql:
             continue
         replacement = f"CREATE TABLE {table}"
@@ -234,7 +216,7 @@ def remove_autoincrement_tables(conn: sqlite3.Connection) -> None:
             continue
         temp_table = f"__harness_no_autoincrement_{table}"
         columns = [
-            column["name"] if isinstance(column, sqlite3.Row) else column[1]
+            column["name"]
             for column in conn.execute(f"PRAGMA table_info({_quote_identifier(table)})").fetchall()
         ]
         quoted_columns = ", ".join(_quote_identifier(column) for column in columns)
@@ -253,13 +235,13 @@ def remove_autoincrement_tables(conn: sqlite3.Connection) -> None:
 
 
 def _quote_identifier(identifier: str) -> str:
-    """Quote a SQLite identifier produced by this harness, not user input SQL."""
+    """Quote a database identifier produced by this harness, not user input SQL."""
 
     return '"' + identifier.replace('"', '""') + '"'
 
 
-def _set_journal_mode(conn: sqlite3.Connection, mode: str) -> str:
-    """Set a journal mode when supported and return the mode SQLite selected."""
+def _set_journal_mode(conn: Any, mode: str) -> str:
+    """Set a Turso journal mode and return the selected mode."""
 
     try:
         row = conn.execute(f"PRAGMA journal_mode = {mode}").fetchone()
@@ -269,21 +251,21 @@ def _set_journal_mode(conn: sqlite3.Connection, mode: str) -> str:
         raise
     if row is None:
         return ""
-    value = row[0] if not isinstance(row, sqlite3.Row) else row[0]
+    value = row[0]
     return str(value).lower()
 
 
-def journal_mode(conn: sqlite3.Connection) -> str:
-    """Return the active SQLite/Turso journal mode."""
+def journal_mode(conn: Any) -> str:
+    """Return the active Turso journal mode."""
 
     row = conn.execute("PRAGMA journal_mode").fetchone()
     if row is None:
         return ""
-    value = row[0] if not isinstance(row, sqlite3.Row) else row[0]
+    value = row[0]
     return str(value).lower()
 
 
-def begin_concurrent(conn: sqlite3.Connection) -> bool:
+def begin_concurrent(conn: Any) -> bool:
     """Start a Turso concurrent write transaction when MVCC is active."""
 
     if journal_mode(conn) != "mvcc":
@@ -292,7 +274,7 @@ def begin_concurrent(conn: sqlite3.Connection) -> bool:
     return True
 
 
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn: Any) -> None:
     """Install or update the durable schema used by the scheduler and MCP."""
 
     conn.executescript(
@@ -601,7 +583,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def ensure_card_schema(conn: sqlite3.Connection) -> None:
+def ensure_card_schema(conn: Any) -> None:
     """Add card-board columns to older harness databases and backfill stages."""
 
     _ensure_columns(
@@ -710,22 +692,22 @@ def ensure_card_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _ensure_columns(conn: sqlite3.Connection, table: str, columns: Iterable[tuple[str, str]]) -> None:
-    """Add missing SQLite columns using definitions from the current schema."""
+def _ensure_columns(conn: Any, table: str, columns: Iterable[tuple[str, str]]) -> None:
+    """Add missing columns using definitions from the current schema."""
 
     existing = {
-        row["name"] if isinstance(row, sqlite3.Row) else row[1]
-        for row in conn.execute(f"PRAGMA table_xinfo({table})")
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
     }
     for name, definition in columns:
         if name not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
-def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
+def ensure_worklane_compat(conn: Any) -> None:
     """Expose the refined worklanes table through the legacy work_lanes name."""
 
-    object_type = _sqlite_object_type(conn, "work_lanes")
+    object_type = _db_object_type(conn, "work_lanes")
     if object_type == "table":
         for row in conn.execute("SELECT * FROM work_lanes").fetchall():
             conn.execute(
@@ -751,104 +733,45 @@ def ensure_worklane_compat(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE work_lanes")
         object_type = ""
     if object_type != "view":
-        create_view = "CREATE VIEW" if connection_driver(conn) == "turso" else "CREATE VIEW IF NOT EXISTS"
-        conn.execute(
-            f"""
-            {create_view} work_lanes AS
-            SELECT
-                id,
-                created_at AS ts,
-                title,
-                role_type AS role,
-                status,
-                branch_name AS branch,
-                worktree_path AS worktree,
-                expected_metric_impact AS expected_metric_delta,
-                notes
-            FROM worklanes
-            """
-        )
-    if connection_driver(conn) == "turso":
-        return
-    conn.executescript(
-        """
-        CREATE TRIGGER IF NOT EXISTS work_lanes_insert INSTEAD OF INSERT ON work_lanes
-        BEGIN
-            INSERT INTO worklanes(
-                id, title, role_type, status, branch_name, worktree_path,
-                expected_metric_impact, stage, integration_required, created_at, planned_at, last_activity_at, notes
-            ) VALUES (
-                NEW.id,
-                COALESCE(NEW.title, ''),
-                COALESCE(NEW.role, 'Developer'),
-                COALESCE(NEW.status, 'queued'),
-                COALESCE(NEW.branch, ''),
-                COALESCE(NEW.worktree, ''),
-                COALESCE(NEW.expected_metric_delta, 0),
-                CASE COALESCE(NEW.status, 'queued')
-                    WHEN 'queued' THEN 'planned'
-                    WHEN 'assigned' THEN 'development'
-                    WHEN 'needs_verification' THEN 'review'
-                    WHEN 'ready_for_integration' THEN 'integration'
-                    WHEN 'integration_failed' THEN 'integration'
-                    WHEN 'integrated' THEN 'done'
-                    ELSE 'planned'
-                END,
-                CASE WHEN COALESCE(NEW.role, 'Developer') IN ('Developer', 'Designer', 'Conflict Resolver', 'Reproducer') THEN 1 ELSE 0 END,
-                COALESCE(NEW.ts, datetime('now')),
-                COALESCE(NEW.ts, datetime('now')),
-                COALESCE(NEW.ts, datetime('now')),
-                COALESCE(NEW.notes, '')
-            );
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS work_lanes_update INSTEAD OF UPDATE ON work_lanes
-        BEGIN
-            UPDATE worklanes SET
-                title = COALESCE(NEW.title, title),
-                role_type = COALESCE(NEW.role, role_type),
-                status = COALESCE(NEW.status, status),
-                stage = CASE COALESCE(NEW.status, status)
-                    WHEN 'queued' THEN 'planned'
-                    WHEN 'assigned' THEN 'development'
-                    WHEN 'needs_verification' THEN 'review'
-                    WHEN 'ready_for_integration' THEN 'integration'
-                    WHEN 'integration_failed' THEN 'integration'
-                    WHEN 'integrated' THEN 'done'
-                    ELSE stage
-                END,
-                branch_name = COALESCE(NEW.branch, branch_name),
-                worktree_path = COALESCE(NEW.worktree, worktree_path),
-                expected_metric_impact = COALESCE(NEW.expected_metric_delta, expected_metric_impact),
-                notes = COALESCE(NEW.notes, notes),
-                last_activity_at = datetime('now')
-            WHERE id = OLD.id;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS work_lanes_delete INSTEAD OF DELETE ON work_lanes
-        BEGIN
-            DELETE FROM worklanes WHERE id = OLD.id;
-        END;
-        """
-    )
+        create_view = "CREATE VIEW"
+        try:
+            conn.execute(
+                f"""
+                {create_view} work_lanes AS
+                SELECT
+                    id,
+                    created_at AS ts,
+                    title,
+                    role_type AS role,
+                    status,
+                    branch_name AS branch,
+                    worktree_path AS worktree,
+                    expected_metric_impact AS expected_metric_delta,
+                    notes
+                FROM worklanes
+                """
+            )
+        except Exception as exc:
+            if "already exists" not in str(exc).lower():
+                raise
 
 
-def _sqlite_object_type(conn: sqlite3.Connection, name: str) -> str:
-    """Return the SQLite object type for migrations, or an empty string."""
+def _db_object_type(conn: Any, name: str) -> str:
+    """Return the database object type for migrations, or an empty string."""
 
-    row = conn.execute("SELECT type FROM sqlite_master WHERE name = ?", (name,)).fetchone()
+    row = conn.execute("SELECT type FROM sqlite_schema WHERE name = ?", (name,)).fetchone()
     if row is None:
         return ""
-    return str(row["type"] if isinstance(row, sqlite3.Row) else row[0])
+    return str(row["type"])
 
 
-def ensure_mcp_compat_columns(conn: sqlite3.Connection) -> None:
+def ensure_mcp_compat_columns(conn: Any) -> None:
     """Add generated aliases for common agent memory queries without duplicating data."""
 
     for table, columns in MCP_COMPAT_COLUMNS.items():
         existing = {
-            row["name"] if isinstance(row, sqlite3.Row) else row[1]
-            for row in conn.execute(f"PRAGMA table_xinfo({table})")
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
         }
         for name, definition in columns:
             if name not in existing:
@@ -865,7 +788,7 @@ def bootstrap(root: str | Path) -> HarnessPaths:
     return paths
 
 
-def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+def set_meta(conn: Any, key: str, value: str) -> None:
     """Store a small scalar value used by the scheduler itself."""
 
     now = utc_now()
@@ -885,7 +808,7 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
-def get_meta(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+def get_meta(conn: Any, key: str, default: str = "") -> str:
     """Read a scheduler metadata value without raising when it is absent."""
 
     row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
@@ -893,7 +816,7 @@ def get_meta(conn: sqlite3.Connection, key: str, default: str = "") -> str:
 
 
 def log_event(
-    conn: sqlite3.Connection,
+    conn: Any,
     event_type: str,
     message: str,
     agent_name: str | None = None,
@@ -912,14 +835,14 @@ def log_event(
     return int(cur.lastrowid)
 
 
-def get_goal(conn: sqlite3.Connection) -> sqlite3.Row | None:
+def get_goal(conn: Any) -> Any | None:
     """Return the single active goal row, if planning has begun."""
 
     return conn.execute("SELECT * FROM goals WHERE id = 1").fetchone()
 
 
 def set_goal(
-    conn: sqlite3.Connection,
+    conn: Any,
     text: str,
     measure: str = "",
     status: str = "planning",
@@ -944,7 +867,7 @@ def set_goal(
     log_event(conn, "goal", "Goal recorded", payload={"status": status})
 
 
-def upsert_agent(conn: sqlite3.Connection, **fields: Any) -> None:
+def upsert_agent(conn: Any, **fields: Any) -> None:
     """Create or update an agent run while preserving required bookkeeping columns."""
 
     if "name" not in fields or "role" not in fields:
@@ -1000,7 +923,7 @@ def upsert_agent(conn: sqlite3.Connection, **fields: Any) -> None:
 
 
 def update_agent_status(
-    conn: sqlite3.Connection,
+    conn: Any,
     name: str,
     status: str,
     notes: str | None = None,
@@ -1029,7 +952,7 @@ def update_agent_status(
     conn.commit()
 
 
-def list_agents(conn: sqlite3.Connection, status: str | None = None) -> list[sqlite3.Row]:
+def list_agents(conn: Any, status: str | None = None) -> list[Any]:
     """Return agent rows, optionally narrowed to a current status."""
 
     if status is None:
@@ -1037,7 +960,7 @@ def list_agents(conn: sqlite3.Connection, status: str | None = None) -> list[sql
     return list(conn.execute("SELECT * FROM agents WHERE current_status = ? ORDER BY role, name", (status,)))
 
 
-def recent_events(conn: sqlite3.Connection, limit: int = 12) -> list[sqlite3.Row]:
+def recent_events(conn: Any, limit: int = 12) -> list[Any]:
     """Fetch the newest events in display order."""
 
     rows = list(
@@ -1050,7 +973,7 @@ def recent_events(conn: sqlite3.Connection, limit: int = 12) -> list[sqlite3.Row
     return rows
 
 
-def queue_message(conn: sqlite3.Connection, message: str, target: str = "broadcast") -> int:
+def queue_message(conn: Any, message: str, target: str = "broadcast") -> int:
     """Persist a prompt injection before tmux delivery is attempted."""
 
     now = utc_now()
@@ -1066,7 +989,7 @@ def queue_message(conn: sqlite3.Connection, message: str, target: str = "broadca
     return int(cur.lastrowid)
 
 
-def mark_message(conn: sqlite3.Connection, message_id: int, status: str) -> None:
+def mark_message(conn: Any, message_id: int, status: str) -> None:
     """Mark a user or scheduler prompt as delivered or failed."""
 
     delivered_at = utc_now() if status == "delivered" else None
@@ -1076,7 +999,7 @@ def mark_message(conn: sqlite3.Connection, message_id: int, status: str) -> None
 
 
 def queue_worklane(
-    conn: sqlite3.Connection,
+    conn: Any,
     title: str,
     role_type: str = "Developer",
     status: str = "queued",
@@ -1132,7 +1055,7 @@ def queue_worklane(
     return card_id
 
 
-def create_card(conn: sqlite3.Connection, title: str, **fields: Any) -> int:
+def create_card(conn: Any, title: str, **fields: Any) -> int:
     """Create a durable card; implementation cards are represented as worklanes."""
 
     return queue_worklane(conn, title, **fields)
@@ -1177,7 +1100,7 @@ def role_requires_integration(role_type: str) -> bool:
 
 
 def record_card_transition(
-    conn: sqlite3.Connection,
+    conn: Any,
     card_id: int,
     from_stage: str,
     to_stage: str,
@@ -1195,7 +1118,7 @@ def record_card_transition(
     )
 
 
-def claim_next_worklane(conn: sqlite3.Connection, agent_name: str, worktree: str, branch: str) -> sqlite3.Row | None:
+def claim_next_worklane(conn: Any, agent_name: str, worktree: str, branch: str) -> Any | None:
     """Assign the highest-priority planned implementation card to a developer."""
 
     roles = tuple(sorted(CODE_PRODUCING_ROLES))
@@ -1214,7 +1137,7 @@ def claim_next_worklane(conn: sqlite3.Connection, agent_name: str, worktree: str
     return assign_card(conn, int(lane["id"]), agent_name, worktree, branch)
 
 
-def assign_card(conn: sqlite3.Connection, card_id: int, agent_name: str, worktree: str = "", branch: str = "") -> sqlite3.Row:
+def assign_card(conn: Any, card_id: int, agent_name: str, worktree: str = "", branch: str = "") -> Any:
     """Move one planned card into development and attach it to an agent."""
 
     now = utc_now()
@@ -1236,7 +1159,7 @@ def assign_card(conn: sqlite3.Connection, card_id: int, agent_name: str, worktre
     return conn.execute("SELECT * FROM worklanes WHERE id = ?", (card_id,)).fetchone()
 
 
-def update_worklane_status(conn: sqlite3.Connection, lane_id: int, status: str, notes: str | None = None) -> None:
+def update_worklane_status(conn: Any, lane_id: int, status: str, notes: str | None = None) -> None:
     """Move one worklane through its per-lane lifecycle and card stage."""
 
     now = utc_now()
@@ -1277,7 +1200,7 @@ def update_worklane_status(conn: sqlite3.Connection, lane_id: int, status: str, 
 
 
 def move_card_stage(
-    conn: sqlite3.Connection,
+    conn: Any,
     card_id: int,
     stage: str,
     status: str | None = None,
@@ -1325,13 +1248,13 @@ def move_card_stage(
     log_event(conn, "card_stage", f"card#{card_id} {old_stage or '?'} -> {target_stage}", agent_name=agent_name or None, payload={"card_id": card_id, "from_stage": old_stage, "to_stage": target_stage, "status": next_status})
 
 
-def requeue_card(conn: sqlite3.Connection, card_id: int, notes: str | None = None) -> None:
+def requeue_card(conn: Any, card_id: int, notes: str | None = None) -> None:
     """Return a card to planned so Python can assign it again."""
 
     move_card_stage(conn, card_id, "planned", "queued", notes, reason="requeued")
 
 
-def complete_card(conn: sqlite3.Connection, card_id: int, notes: str | None = None) -> None:
+def complete_card(conn: Any, card_id: int, notes: str | None = None) -> None:
     """Mark a card done; integration-required cards should only call this after push."""
 
     row = conn.execute("SELECT integration_required FROM worklanes WHERE id = ?", (card_id,)).fetchone()
@@ -1339,7 +1262,7 @@ def complete_card(conn: sqlite3.Connection, card_id: int, notes: str | None = No
     move_card_stage(conn, card_id, "done", status, notes, reason="completed")
 
 
-def retire_card(conn: sqlite3.Connection, card_id: int, notes: str | None = None, reason: str = "retired", agent_name: str = "") -> None:
+def retire_card(conn: Any, card_id: int, notes: str | None = None, reason: str = "retired", agent_name: str = "") -> None:
     """Mark a non-actionable card stale without pretending it was integrated."""
 
     row = conn.execute("SELECT stage FROM worklanes WHERE id = ?", (card_id,)).fetchone()
@@ -1363,7 +1286,7 @@ def retire_card(conn: sqlite3.Connection, card_id: int, notes: str | None = None
     log_event(conn, "card_retired", f"card#{card_id} retired as stale", agent_name=agent_name or None, payload={"card_id": card_id, "reason": reason})
 
 
-def review_ready_cards(conn: sqlite3.Connection, limit: int = 10) -> int:
+def review_ready_cards(conn: Any, limit: int = 10) -> int:
     """Accept structured reports in review and route cards to integration or done."""
 
     moved = 0
@@ -1391,7 +1314,7 @@ def review_ready_cards(conn: sqlite3.Connection, limit: int = 10) -> int:
     return moved
 
 
-def record_agent_report(conn: sqlite3.Connection, report: Mapping[str, Any]) -> int:
+def record_agent_report(conn: Any, report: Mapping[str, Any]) -> int:
     """Store a structured agent report and route card stages deterministically."""
 
     now = utc_now()
@@ -1452,7 +1375,7 @@ def record_agent_report(conn: sqlite3.Connection, report: Mapping[str, Any]) -> 
 
 
 def record_worktree(
-    conn: sqlite3.Connection,
+    conn: Any,
     path: str,
     branch: str = "",
     owner_agent: str = "",
@@ -1480,7 +1403,7 @@ def record_worktree(
     conn.commit()
 
 
-def record_resource_sample(conn: sqlite3.Connection, sample: Mapping[str, Any]) -> int:
+def record_resource_sample(conn: Any, sample: Mapping[str, Any]) -> int:
     """Store one deterministic resource probe for watchdog and reports."""
 
     cur = conn.execute(
@@ -1501,7 +1424,7 @@ def record_resource_sample(conn: sqlite3.Connection, sample: Mapping[str, Any]) 
     return int(cur.lastrowid)
 
 
-def record_metric(conn: sqlite3.Connection, name: str, value: float, target: float) -> int:
+def record_metric(conn: Any, name: str, value: float, target: float) -> int:
     """Persist a progress point so stalled-progress checks have data."""
 
     percent = 0.0 if target == 0 else max(0.0, min(100.0, (value / target) * 100.0))
@@ -1513,14 +1436,14 @@ def record_metric(conn: sqlite3.Connection, name: str, value: float, target: flo
     return int(cur.lastrowid)
 
 
-def latest_metric(conn: sqlite3.Connection) -> sqlite3.Row | None:
+def latest_metric(conn: Any) -> Any | None:
     """Return the newest metric sample regardless of metric name."""
 
     return conn.execute("SELECT * FROM metric_samples ORDER BY id DESC LIMIT 1").fetchone()
 
 
 def queue_spawn_request(
-    conn: sqlite3.Connection,
+    conn: Any,
     role: str,
     title: str,
     prompt: str,
@@ -1551,7 +1474,7 @@ def queue_spawn_request(
     return int(cur.lastrowid)
 
 
-def find_or_create_card(conn: sqlite3.Connection, source_key: str, title: str, **fields: Any) -> int:
+def find_or_create_card(conn: Any, source_key: str, title: str, **fields: Any) -> int:
     """Return an unresolved card for a deterministic source, creating one if needed."""
 
     if source_key:
@@ -1569,7 +1492,7 @@ def find_or_create_card(conn: sqlite3.Connection, source_key: str, title: str, *
     return create_card(conn, title, **fields)
 
 
-def next_spawn_requests(conn: sqlite3.Connection, limit: int = 5) -> list[sqlite3.Row]:
+def next_spawn_requests(conn: Any, limit: int = 5) -> list[Any]:
     """Fetch queued spawn requests in the order the scheduler should handle them."""
 
     return list(
@@ -1580,7 +1503,7 @@ def next_spawn_requests(conn: sqlite3.Connection, limit: int = 5) -> list[sqlite
     )
 
 
-def mark_spawn_request(conn: sqlite3.Connection, request_id: int, status: str, agent_name: str = "") -> None:
+def mark_spawn_request(conn: Any, request_id: int, status: str, agent_name: str = "") -> None:
     """Record whether the scheduler accepted an MCP spawn request."""
 
     conn.execute(
@@ -1591,7 +1514,7 @@ def mark_spawn_request(conn: sqlite3.Connection, request_id: int, status: str, a
 
 
 def record_test_run(
-    conn: sqlite3.Connection,
+    conn: Any,
     command: str,
     status: str,
     full_log: str,
@@ -1638,7 +1561,7 @@ def record_test_run(
     return run_id
 
 
-def note_failing_tests(conn: sqlite3.Connection, run_id: int, commit_sha: str) -> None:
+def note_failing_tests(conn: Any, run_id: int, commit_sha: str) -> None:
     """Turn failing test rows into durable bug reports for later lookups."""
 
     now = utc_now()
@@ -1678,7 +1601,7 @@ def note_failing_tests(conn: sqlite3.Connection, run_id: int, commit_sha: str) -
     conn.commit()
 
 
-def purge_old_test_logs(conn: sqlite3.Connection) -> None:
+def purge_old_test_logs(conn: Any) -> None:
     """Keep recent full logs and compact older test runs without dropping metadata."""
 
     rows = conn.execute("SELECT id, started_at FROM test_runs ORDER BY id DESC").fetchall()
@@ -1718,7 +1641,7 @@ def purge_old_test_logs(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def read_only_query(conn: sqlite3.Connection, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
+def read_only_query(conn: Any, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
     """Run SELECT-style queries from the MCP while blocking database mutation."""
 
     stripped = sql.strip().lower()

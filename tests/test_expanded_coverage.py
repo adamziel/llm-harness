@@ -5,7 +5,6 @@ import io
 import json
 import os
 import shlex
-import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -33,16 +32,11 @@ from llm_harness.tmux import Tmux, _session_name, shell_command
 
 @contextmanager
 def memory_conn():
-    """Create a fast SQLite connection with the same row behavior as db.connect."""
+    """Create a temporary Turso connection with the same behavior as db.connect."""
 
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    db.init_db(conn)
-    try:
+    with tempfile.TemporaryDirectory() as tmp, db.connect(Path(tmp) / "harness.turso") as conn:
+        db.init_db(conn)
         yield conn
-    finally:
-        conn.close()
 
 
 def add_cases(cls: type[unittest.TestCase], prefix: str, cases, func) -> None:
@@ -81,13 +75,13 @@ class RolePromptAndSlugTests(unittest.TestCase):
 
 
 def _role_prompt_case(self: unittest.TestCase, role: str) -> None:
-    prompt = prompt_for_role(role, f"agent-{slug_role(role)}", "ship it", "/tmp/harness.sqlite3", "/repo")
+    prompt = prompt_for_role(role, f"agent-{slug_role(role)}", "ship it", "/tmp/harness.turso", "/repo")
     self.assertIn("ship it", prompt)
-    self.assertIn("/tmp/harness.sqlite3", prompt)
+    self.assertIn("/tmp/harness.turso", prompt)
     self.assertIn("/repo", prompt)
     self.assertIn("--yolo", prompt)
     self.assertIn("gpt-5.5 xhigh fast", prompt)
-    self.assertIn("SQLite MCP", prompt)
+    self.assertIn("Turso MCP", prompt)
 
 
 def _slug_case(self: unittest.TestCase, case: tuple[str, str]) -> None:
@@ -385,7 +379,7 @@ class StatusRenderingTests(unittest.TestCase):
 
 def _status_report_case(self: unittest.TestCase, case: tuple[float, float]) -> None:
     value, target = case
-    with tempfile.TemporaryDirectory() as tmp, db.connect(Path(tmp) / "harness.sqlite3") as conn:
+    with tempfile.TemporaryDirectory() as tmp, db.connect(Path(tmp) / "harness.turso") as conn:
         db.init_db(conn)
         db.set_goal(conn, f"Goal {value}", measure="metric")
         db.record_metric(conn, "metric", value, target)
@@ -403,7 +397,7 @@ def _red_banner_case(self: unittest.TestCase, banner: str) -> None:
 
 
 def _html_escape_case(self: unittest.TestCase, text: str) -> None:
-    with tempfile.TemporaryDirectory() as tmp, db.connect(Path(tmp) / "harness.sqlite3") as conn:
+    with tempfile.TemporaryDirectory() as tmp, db.connect(Path(tmp) / "harness.turso") as conn:
         db.init_db(conn)
         db.set_goal(conn, text, measure="metric")
         _, html_file = status_mod.refresh_reports(conn, tmp)
@@ -456,7 +450,7 @@ def _readonly_reject_case(self: unittest.TestCase, sql: str) -> None:
 
 def _code_index_case(self: unittest.TestCase, case: tuple[str, str]) -> None:
     filename, content = case
-    with tempfile.TemporaryDirectory() as tmp, db.connect(Path(tmp) / ".harness.sqlite3") as conn:
+    with tempfile.TemporaryDirectory() as tmp, db.connect(Path(tmp) / ".harness.turso") as conn:
         root = Path(tmp)
         (root / filename).write_text(content)
         db.init_db(conn)

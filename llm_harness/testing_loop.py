@@ -1,4 +1,4 @@
-"""Non-agentic test runner that records full and parsed results in SQLite."""
+"""Non-agentic test runner that records full and parsed results in Turso."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import importlib.util
 import json
 import re
 import shlex
-import sqlite3
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -39,7 +38,7 @@ def discover_test_command(root: str | Path) -> list[str]:
     return ["python", "-m", "unittest", "discover"]
 
 
-def run_tests_once(conn: sqlite3.Connection, root: str | Path, command: list[str] | None = None) -> int:
+def run_tests_once(conn: Any, root: str | Path, command: list[str] | None = None) -> int:
     """Run the full suite once and record logs, summaries, failures, and bugs."""
 
     root_path = Path(root)
@@ -105,7 +104,7 @@ def parse_test_output(output: str) -> list[dict[str, Any]]:
 
 
 def _normalize_unittest_status(status: str) -> str:
-    """Map unittest verbose words to the status vocabulary stored in SQLite."""
+    """Map unittest verbose words to the status vocabulary stored in Turso."""
 
     if status == "ok":
         return "passed"
@@ -117,7 +116,7 @@ def _normalize_unittest_status(status: str) -> str:
 
 
 def _normalize_cargo_status(status: str) -> str:
-    """Map Cargo test words to the status vocabulary stored in SQLite."""
+    """Map Cargo test words to the status vocabulary stored in Turso."""
 
     if status == "ok":
         return "passed"
@@ -138,7 +137,7 @@ def summarize_results(results: list[dict[str, Any]], returncode: int) -> dict[st
     return summary
 
 
-def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dict[str, Any]], commit: str) -> None:
+def queue_test_fix_lane(conn: Any, run_id: int, results: list[dict[str, Any]], commit: str) -> None:
     """Put main-branch test failures at the top of the durable card queue."""
 
     failures = [result["nodeid"] for result in results if result.get("status") in {"failed", "error"}]
@@ -203,7 +202,7 @@ def _test_fix_acceptance(command: str, global_command: bool) -> str:
     )
 
 
-def record_public_phpt_metric(conn: sqlite3.Connection, output: str) -> bool:
+def record_public_phpt_metric(conn: Any, output: str) -> bool:
     """Record the public PHPT pass-count metric when the full gate prints it."""
 
     match = PUBLIC_PHPT_METRIC_RE.search(output)
@@ -218,7 +217,7 @@ def record_public_phpt_metric(conn: sqlite3.Connection, output: str) -> bool:
 
 
 def update_test_gate_state(
-    conn: sqlite3.Connection,
+    conn: Any,
     run_id: int,
     command: str,
     status: str,
@@ -286,7 +285,7 @@ def update_test_gate_state(
     )
 
 
-def _known_gate_failures(conn: sqlite3.Connection) -> set[str]:
+def _known_gate_failures(conn: Any) -> set[str]:
     """Return the current known-red quarantine failure set."""
 
     mode = db.get_meta(conn, "test_gate_mode")
@@ -316,7 +315,7 @@ def _failure_cluster(nodeid: str) -> str:
     return nodeid.rsplit("::", 1)[0]
 
 
-def _set_test_gate(conn: sqlite3.Connection, mode: str, reason: str, failures: list[str], run_id: int) -> None:
+def _set_test_gate(conn: Any, mode: str, reason: str, failures: list[str], run_id: int) -> None:
     previous = (
         db.get_meta(conn, "test_gate_mode"),
         db.get_meta(conn, "test_gate_reason"),
@@ -344,7 +343,7 @@ def is_global_test_command(command: str) -> bool:
     )
 
 
-def _log_periodic_event(conn: sqlite3.Connection, event_type: str, message: str, payload: dict[str, Any]) -> None:
+def _log_periodic_event(conn: Any, event_type: str, message: str, payload: dict[str, Any]) -> None:
     """Log noisy test-loop events at most once per throttle window."""
 
     if _recent_message_event(conn, event_type, message, STATUS_EVENT_THROTTLE_SECONDS):
@@ -352,7 +351,7 @@ def _log_periodic_event(conn: sqlite3.Connection, event_type: str, message: str,
     db.log_event(conn, event_type, message, payload=payload)
 
 
-def _recent_message_event(conn: sqlite3.Connection, event_type: str, message: str, seconds: int) -> bool:
+def _recent_message_event(conn: Any, event_type: str, message: str, seconds: int) -> bool:
     cutoff = (datetime.fromisoformat(db.utc_now()) - timedelta(seconds=seconds)).isoformat(timespec="seconds")
     return (
         conn.execute(
@@ -363,7 +362,7 @@ def _recent_message_event(conn: sqlite3.Connection, event_type: str, message: st
     )
 
 
-def _recent_payload_event(conn: sqlite3.Connection, event_type: str, key: str, value: object, seconds: int) -> bool:
+def _recent_payload_event(conn: Any, event_type: str, key: str, value: object, seconds: int) -> bool:
     cutoff = (datetime.fromisoformat(db.utc_now()) - timedelta(seconds=seconds)).isoformat(timespec="seconds")
     rows = conn.execute(
         "SELECT payload_json FROM events WHERE type = ? AND ts >= ? ORDER BY id DESC LIMIT 50",
@@ -379,7 +378,7 @@ def _recent_payload_event(conn: sqlite3.Connection, event_type: str, key: str, v
     return False
 
 
-def resolve_fixed_tests(conn: sqlite3.Connection, results: list[dict[str, Any]], commit: str) -> None:
+def resolve_fixed_tests(conn: Any, results: list[dict[str, Any]], commit: str) -> None:
     """Close bug reports when a later passing run proves the test is fixed."""
 
     passed = {result["nodeid"] for result in results if result.get("status") == "passed"}
@@ -414,7 +413,7 @@ def resolve_fixed_tests(conn: sqlite3.Connection, results: list[dict[str, Any]],
     conn.commit()
 
 
-def maybe_invoke_architect(conn: sqlite3.Connection) -> None:
+def maybe_invoke_architect(conn: Any) -> None:
     """Escalate tests that have failed repeatedly in the last 24 hours."""
 
     since = (datetime.fromisoformat(db.utc_now()) - timedelta(hours=24)).isoformat(timespec="seconds")
@@ -445,7 +444,7 @@ def maybe_invoke_architect(conn: sqlite3.Connection) -> None:
         )
 
 
-def _architect_escalation_exists(conn: sqlite3.Connection, title: str) -> bool:
+def _architect_escalation_exists(conn: Any, title: str) -> bool:
     """Return whether this repeated-failure escalation is already routed."""
 
     if conn.execute(

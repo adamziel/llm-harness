@@ -7,7 +7,6 @@ import os
 import re
 import signal
 import shlex
-import sqlite3
 import subprocess
 import sys
 import time
@@ -114,7 +113,7 @@ class HarnessScheduler:
     def init_project(self, goal: str | None = None) -> int:
         """Initialize or repair harness state without starting the resident team."""
 
-        def initialize(conn: sqlite3.Connection) -> int:
+        def initialize(conn: Any) -> int:
             self.ensure_git_repo(conn)
             self.check_gh(conn)
             self.check_project_context(conn)
@@ -139,7 +138,7 @@ class HarnessScheduler:
     def run(self, goal: str | None = None, team: str = "auto", once: bool = False) -> int:
         """Start or resume the harness, then keep monitoring worker state."""
 
-        def start(conn: sqlite3.Connection) -> int:
+        def start(conn: Any) -> int:
             if not self.validate_initialized(conn):
                 return 1
             if not self.ensure_goal(conn, goal):
@@ -167,8 +166,7 @@ class HarnessScheduler:
             if not db.is_disk_io_error(exc):
                 raise
             print(
-                "\033[31mHarness database disk I/O error during startup. Free disk space, repair the filesystem/database, "
-                "or run with HARNESS_DB_DRIVER=turso.\033[0m",
+                "\033[31mHarness database disk I/O error during startup. Free disk space or repair the filesystem/database.\033[0m",
                 file=sys.stderr,
             )
             return 1
@@ -178,7 +176,7 @@ class HarnessScheduler:
         if once:
             self.run_deterministic_once(team)
 
-            def clear_pid(conn: sqlite3.Connection) -> None:
+            def clear_pid(conn: Any) -> None:
                 db.set_meta(conn, "scheduler_pid", "")
 
             self.with_retrying_db("one-shot shutdown", clear_pid)
@@ -192,7 +190,7 @@ class HarnessScheduler:
         except KeyboardInterrupt:
             print("Harness supervisor stopped by user or ./harness stop; agent tmux windows remain available.", flush=True)
 
-            def mark_stopped(conn: sqlite3.Connection) -> None:
+            def mark_stopped(conn: Any) -> None:
                 db.log_event(conn, "scheduler", "Harness supervisor stopped by user or ./harness stop")
                 db.set_meta(conn, "scheduler_pid", "")
 
@@ -203,7 +201,7 @@ class HarnessScheduler:
         return 0
 
     def with_retrying_db(self, label: str, action):
-        """Run scheduler database work through SQLite/Turso's busy handler."""
+        """Run scheduler database work through Turso's busy handler."""
 
         last_error: Exception | None = None
         for attempt in range(8):
@@ -225,7 +223,7 @@ class HarnessScheduler:
                     raise
                 last_error = exc
                 if attempt == 0:
-                    print(f"\033[33mSQLite/Turso write conflict during {label} ({exc}); retrying immediately.\033[0m", file=sys.stderr)
+                    print(f"\033[33mTurso write conflict during {label} ({exc}); retrying immediately.\033[0m", file=sys.stderr)
         if last_error is not None:
             raise last_error
         raise RuntimeError(f"{label} did not run")
@@ -302,7 +300,7 @@ class HarnessScheduler:
         message = f"Ignored unexpected SIGTERM x{count}; use ./harness stop for intentional shutdown"
         print(f"\033[33m{message}.\033[0m", file=sys.stderr, flush=True)
 
-        def record(conn: sqlite3.Connection) -> None:
+        def record(conn: Any) -> None:
             db.log_event(conn, "scheduler_signal", message, payload={"signal": "SIGTERM", "count": count})
 
         try:
@@ -338,7 +336,7 @@ class HarnessScheduler:
     def scheduler_tick_action(self, team: str) -> str:
         """Run one scheduler tick using its own database connection."""
 
-        def tick(conn: sqlite3.Connection) -> None:
+        def tick(conn: Any) -> None:
             self.tick_once(conn, self.effective_team(conn, team))
 
         self.with_retrying_db("scheduler tick", tick)
@@ -347,7 +345,7 @@ class HarnessScheduler:
     def status_refresh_action(self) -> str:
         """Refresh generated status artifacts using its own database connection."""
 
-        def update(conn: sqlite3.Connection) -> tuple[Path, Path]:
+        def update(conn: Any) -> tuple[Path, Path]:
             return refresh_reports(conn, self.root)
 
         md, html = self.with_retrying_db("status refresh", update)
@@ -356,7 +354,7 @@ class HarnessScheduler:
     def integration_action(self) -> str:
         """Run one deterministic integration pass using its own database connection."""
 
-        def integrate(conn: sqlite3.Connection) -> dict[str, int]:
+        def integrate(conn: Any) -> dict[str, int]:
             db.review_ready_cards(conn)
             return integrate_once(conn, self.root)
 
@@ -366,13 +364,13 @@ class HarnessScheduler:
     def test_loop_action(self) -> str:
         """Run one deterministic full-suite test pass using its own database connection."""
 
-        def tests(conn: sqlite3.Connection) -> int:
+        def tests(conn: Any) -> int:
             return run_tests_once(conn, self.root)
 
         run_id = self.with_retrying_db("test loop", tests)
         return f"recorded test run {run_id}"
 
-    def validate_initialized(self, conn: sqlite3.Connection) -> bool:
+    def validate_initialized(self, conn: Any) -> bool:
         """Require explicit initialization before resident sessions are started."""
 
         if db.get_meta(conn, "initialized_at"):
@@ -383,7 +381,7 @@ class HarnessScheduler:
         print(f"\033[31m{message}\033[0m", file=sys.stderr)
         return False
 
-    def write_role_prompt_files(self, conn: sqlite3.Connection) -> None:
+    def write_role_prompt_files(self, conn: Any) -> None:
         """Materialize reusable role prompts for inspection and repair."""
 
         roles_dir = self.paths.prompts / "roles"
@@ -396,7 +394,7 @@ class HarnessScheduler:
             if not path.exists():
                 path.write_text(prompt)
 
-    def check_local_tools(self, conn: sqlite3.Connection) -> None:
+    def check_local_tools(self, conn: Any) -> None:
         """Record availability of local tools init depends on without starting agents."""
 
         tmux_available = self.tmux.available() if hasattr(self.tmux, "available") else True
@@ -415,7 +413,7 @@ class HarnessScheduler:
             return
         db.set_meta(conn, "codex_status", "available" if codex.returncode == 0 else "unknown")
 
-    def check_harness_mcp(self, conn: sqlite3.Connection) -> bool:
+    def check_harness_mcp(self, conn: Any) -> bool:
         """Verify the harness stdio MCP itself before Codex receives it."""
 
         harness = self.harness_executable()
@@ -444,7 +442,7 @@ class HarnessScheduler:
             db.log_event(conn, "mcp_failed", f"Harness MCP server did not expose required tools: {detail}")
         return ok
 
-    def initialize_index(self, conn: sqlite3.Connection) -> None:
+    def initialize_index(self, conn: Any) -> None:
         """Prime the code index when possible without blocking future worktrees."""
 
         try:
@@ -593,7 +591,7 @@ class HarnessScheduler:
             "messages": int(messages),
         }
 
-    def harness_sessions(self, conn: sqlite3.Connection, windows: set[str]) -> dict[str, set[str]]:
+    def harness_sessions(self, conn: Any, windows: set[str]) -> dict[str, set[str]]:
         """Find tmux sessions containing harness windows, even after metadata was cleared."""
 
         candidates = {db.get_meta(conn, "tmux_session", "")}
@@ -620,15 +618,15 @@ class HarnessScheduler:
                 sessions[session] = matched
         return sessions
 
-    def harness_windows(self, conn: sqlite3.Connection) -> set[str]:
+    def harness_windows(self, conn: Any) -> set[str]:
         """Return tmux windows owned by this harness run."""
 
         windows = {"manhole", "status", "updater", "tests", "integration"}
-        for row in conn.execute("SELECT tmux_window FROM agents WHERE tmux_window != ''"):
+        for row in conn.execute("SELECT tmux_window FROM agents WHERE tmux_window != ''").fetchall():
             windows.add(str(row["tmux_window"]))
         return windows
 
-    def scheduler_pids(self, conn: sqlite3.Connection) -> list[int]:
+    def scheduler_pids(self, conn: Any) -> list[int]:
         """Find running harness scheduler/watchdog processes for this repository."""
 
         pids: set[int] = set()
@@ -660,7 +658,7 @@ class HarnessScheduler:
                 continue
         return signaled
 
-    def tick_once(self, conn: sqlite3.Connection, team: str = "building") -> None:
+    def tick_once(self, conn: Any, team: str = "building") -> None:
         """Perform one scheduler pass: resources, requested spawns, liveness, janitor."""
 
         sample = sample_resources(self.root)
@@ -678,14 +676,14 @@ class HarnessScheduler:
         self.check_progress_stall(conn)
         self.maybe_run_janitor(conn)
 
-    def effective_team(self, conn: sqlite3.Connection, requested: str) -> str:
+    def effective_team(self, conn: Any, requested: str) -> str:
         """Choose a resident team without blocking on a global planning phase."""
 
         if requested != "auto":
             return requested
         return "building"
 
-    def ensure_git_repo(self, conn: sqlite3.Connection) -> None:
+    def ensure_git_repo(self, conn: Any) -> None:
         """Initialize git when needed because work lanes rely on branches/worktrees."""
 
         if (self.root / ".git").exists():
@@ -693,7 +691,7 @@ class HarnessScheduler:
         subprocess.run(["git", "init"], cwd=self.root, check=False, text=True, capture_output=True)
         db.log_event(conn, "git", "Initialized git repository because none existed")
 
-    def check_gh(self, conn: sqlite3.Connection) -> None:
+    def check_gh(self, conn: Any) -> None:
         """Record GitHub CLI availability without blocking local harness startup."""
 
         try:
@@ -707,7 +705,7 @@ class HarnessScheduler:
         db.log_event(conn, "warning", "GitHub CLI is missing or unauthorized; continuing without automatic pushes/pages")
         print("\033[31mGitHub CLI is missing or unauthorized; continuing locally.\033[0m", file=sys.stderr)
 
-    def check_project_context(self, conn: sqlite3.Connection) -> None:
+    def check_project_context(self, conn: Any) -> None:
         """Create the project context file agents expect before they start."""
 
         development_md = self.root / "DEVELOPMENT.md"
@@ -718,7 +716,7 @@ class HarnessScheduler:
         db.log_event(conn, "project_context", message)
         print(f"\033[33m{message}\033[0m", file=sys.stderr)
 
-    def check_codex_mcp(self, conn: sqlite3.Connection) -> bool:
+    def check_codex_mcp(self, conn: Any) -> bool:
         """Fail startup if Codex will not expose the harness MCP memory tools."""
 
         harness = self.harness_executable()
@@ -746,7 +744,7 @@ class HarnessScheduler:
         db.log_event(conn, "mcp", "Harness MCP tools exposed to Codex workers")
         return True
 
-    def _mcp_preflight_failed(self, conn: sqlite3.Connection, message: str) -> bool:
+    def _mcp_preflight_failed(self, conn: Any, message: str) -> bool:
         db.set_meta(conn, "red_banner", "Harness MCP unavailable; refusing to start agents.")
         db.log_event(conn, "mcp_failed", message)
         print(f"\033[31m{message}\033[0m", file=sys.stderr)
@@ -765,7 +763,7 @@ class HarnessScheduler:
                 return candidate
         return self.root / "harness"
 
-    def ensure_goal(self, conn: sqlite3.Connection, provided: str | None) -> bool:
+    def ensure_goal(self, conn: Any, provided: str | None) -> bool:
         """Capture a valid goal seed without preserving terminal-noise corruption."""
 
         existing = db.get_goal(conn)
@@ -813,7 +811,7 @@ class HarnessScheduler:
             "Initial backlog seed: Coordinator or Goal Planner must refine this into measurable worklanes without blocking useful development.\n"
         )
 
-    def start_support_windows(self, conn: sqlite3.Connection) -> None:
+    def start_support_windows(self, conn: Any) -> None:
         """Start only interactive support windows; deterministic loops run in-process."""
 
         try:
@@ -846,7 +844,7 @@ class HarnessScheduler:
         self.tmux.ensure_window(session, "status", "watch -c -n 5 ./harness status")
         db.log_event(conn, "tmux", "Interactive support windows ready", payload={"session": session, "attach": attach})
 
-    def ensure_team(self, conn: sqlite3.Connection, team: str) -> None:
+    def ensure_team(self, conn: Any, team: str) -> None:
         """Keep the small resident team alive while respecting integration backpressure."""
 
         specs = specs_for_team(team)
@@ -862,7 +860,7 @@ class HarnessScheduler:
             for _ in range(missing):
                 self.spawn_agent(conn, spec.name, title=f"Maintain {spec.name} capacity")
 
-    def queued_developer_worklanes(self, conn: sqlite3.Connection) -> int:
+    def queued_developer_worklanes(self, conn: Any) -> int:
         """Count planned implementation cards without flooding workers with reports."""
 
         rows = self.planned_developer_candidates(conn)
@@ -874,7 +872,7 @@ class HarnessScheduler:
             return 1
         return 0
 
-    def planned_developer_candidates(self, conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    def planned_developer_candidates(self, conn: Any) -> list[Any]:
         """Return planned Developer-capacity cards in deterministic claim order."""
 
         roles = tuple(sorted(db.CODE_PRODUCING_ROLES))
@@ -900,19 +898,19 @@ class HarnessScheduler:
             return sorted(gate_rows, key=lambda row: (int(row["priority"]), int(row["id"]))) + recovery_candidates
         return recovery_candidates + non_recovery_rows
 
-    def is_gate_repair_card(self, row: sqlite3.Row) -> bool:
+    def is_gate_repair_card(self, row: Any) -> bool:
         """Return whether a card directly repairs the metric-producing test gate."""
 
         source_key = str(row["source_key"] or "")
         title = str(row["title"] or "")
         return source_key.startswith("test-failure:") or title == "Fix global test suite failures"
 
-    def is_integration_recovery_card(self, row: sqlite3.Row) -> bool:
+    def is_integration_recovery_card(self, row: Any) -> bool:
         """Return whether a card is an integration-failure resolver."""
 
         return str(row["source_key"] or "").startswith("integration-failure:") or str(row["title"] or "").startswith("Resolve integration failure for card #")
 
-    def is_report_only_developer_card(self, row: sqlite3.Row) -> bool:
+    def is_report_only_developer_card(self, row: Any) -> bool:
         """Identify old Developer cards that only ask for replay/report evidence."""
 
         if str(row["role_type"] or "") != "Developer":
@@ -920,7 +918,7 @@ class HarnessScheduler:
         text = " ".join(str(row[key] or "") for key in ("title", "description", "goal", "acceptance_criteria", "notes", "source_key")).lower()
         return any(marker in text for marker in REPORT_ONLY_CARD_MARKERS)
 
-    def active_report_only_developer_cards(self, conn: sqlite3.Connection) -> int:
+    def active_report_only_developer_cards(self, conn: Any) -> int:
         """Count live report-only Developer leases so replay work has a side quota."""
 
         rows = conn.execute(
@@ -937,7 +935,7 @@ class HarnessScheduler:
         ).fetchall()
         return len([row for row in rows if self.is_report_only_developer_card(row)])
 
-    def integration_recovery_slots(self, conn: sqlite3.Connection) -> int:
+    def integration_recovery_slots(self, conn: Any) -> int:
         """Return how many more integration-recovery cards may be active."""
 
         active = int(
@@ -957,7 +955,7 @@ class HarnessScheduler:
         )
         return max(0, INTEGRATION_RECOVERY_ACTIVE_LIMIT - active)
 
-    def claim_developer_card(self, conn: sqlite3.Connection, agent_name: str, worktree: str, branch: str) -> sqlite3.Row | None:
+    def claim_developer_card(self, conn: Any, agent_name: str, worktree: str, branch: str) -> Any | None:
         """Assign the next Developer card while preserving product-work capacity."""
 
         rows = self.planned_developer_candidates(conn)
@@ -971,7 +969,7 @@ class HarnessScheduler:
             return None
         return db.assign_card(conn, int(report_only[0]["id"]), agent_name, worktree, branch)
 
-    def stabilization_planned_worklanes(self, conn: sqlite3.Connection) -> int:
+    def stabilization_planned_worklanes(self, conn: Any) -> int:
         """Count planned repair cards that should still get Developers under backpressure."""
 
         return int(
@@ -991,7 +989,7 @@ class HarnessScheduler:
             ).fetchone()["count"]
         )
 
-    def repair_control_plane_cards(self, conn: sqlite3.Connection) -> None:
+    def repair_control_plane_cards(self, conn: Any) -> None:
         """Repair card state left behind by older harness control-plane bugs."""
 
         self.retire_capacity_cards(conn)
@@ -1002,7 +1000,7 @@ class HarnessScheduler:
         self.retire_unrecoverable_integration_failures(conn)
         self.dedupe_integration_resolution_cards(conn)
 
-    def retire_unrecoverable_integration_failures(self, conn: sqlite3.Connection) -> int:
+    def retire_unrecoverable_integration_failures(self, conn: Any) -> int:
         """Close failed integration cards whose branch state is already settled."""
 
         rows = conn.execute(
@@ -1036,7 +1034,7 @@ class HarnessScheduler:
             db.log_event(conn, "integration_queue_repair", f"Settled {repaired} stale integration-failed originals")
         return repaired
 
-    def retire_capacity_cards(self, conn: sqlite3.Connection) -> int:
+    def retire_capacity_cards(self, conn: Any) -> int:
         """Retire fake Developer capacity cards created by older scheduler versions."""
 
         now = db.utc_now()
@@ -1059,7 +1057,7 @@ class HarnessScheduler:
             db.log_event(conn, "card_repair", f"Retired {retired} obsolete Developer capacity cards")
         return int(retired)
 
-    def retire_developer_handoff_cards(self, conn: sqlite3.Connection) -> int:
+    def retire_developer_handoff_cards(self, conn: Any) -> int:
         """Retire scheduler-handoff cards that old Developer spawn requests leaked."""
 
         rows = conn.execute(
@@ -1092,7 +1090,7 @@ class HarnessScheduler:
             db.log_event(conn, "card_repair", f"Retired {retired} obsolete Developer handoff cards")
         return retired
 
-    def retire_non_actionable_development_cards(self, conn: sqlite3.Connection) -> int:
+    def retire_non_actionable_development_cards(self, conn: Any) -> int:
         """Retire cards that older releases left assigned after no-op reports."""
 
         rows = conn.execute(
@@ -1125,7 +1123,7 @@ class HarnessScheduler:
             db.log_event(conn, "card_repair", f"Retired {retired} non-actionable development cards")
         return retired
 
-    def requeue_cards_from_terminal_agents(self, conn: sqlite3.Connection) -> int:
+    def requeue_cards_from_terminal_agents(self, conn: Any) -> int:
         """Return development cards owned by terminal workers to planned."""
 
         placeholders = ",".join("?" for _ in db.AGENT_TERMINAL_STATUSES)
@@ -1145,7 +1143,7 @@ class HarnessScheduler:
             db.log_event(conn, "card_repair", f"Requeued {len(rows)} cards owned by terminal workers")
         return len(rows)
 
-    def dedupe_global_test_failure_cards(self, conn: sqlite3.Connection) -> int:
+    def dedupe_global_test_failure_cards(self, conn: Any) -> int:
         """Keep one global full-suite stabilization card and retire older duplicates."""
 
         rows = conn.execute(
@@ -1195,7 +1193,7 @@ class HarnessScheduler:
         db.log_event(conn, "card_repair", f"Retired {len(stale_ids)} duplicate global test-failure cards", payload={"kept_card_id": keep, "retired_card_ids": stale_ids[:50]})
         return len(stale_ids)
 
-    def dedupe_integration_resolution_cards(self, conn: sqlite3.Connection) -> int:
+    def dedupe_integration_resolution_cards(self, conn: Any) -> int:
         """Keep one active resolver per integration failure and retire competing cards."""
 
         rows = conn.execute(
@@ -1215,7 +1213,7 @@ class HarnessScheduler:
             ORDER BY w.id
             """
         ).fetchall()
-        groups: dict[str, list[sqlite3.Row]] = {}
+        groups: dict[str, list[Any]] = {}
         for row in rows:
             key = _integration_resolution_key(row)
             if key:
@@ -1247,13 +1245,13 @@ class HarnessScheduler:
             db.log_event(conn, "card_repair", f"Retired {retired} overlapping integration-resolution cards")
         return retired
 
-    def integration_resolution_card_to_keep(self, cards: list[sqlite3.Row]) -> int | None:
+    def integration_resolution_card_to_keep(self, cards: list[Any]) -> int | None:
         """Choose the one card that should continue for an integration failure."""
 
         if not cards:
             return None
 
-        def score(row: sqlite3.Row) -> tuple[int, int, int, int, int]:
+        def score(row: Any) -> tuple[int, int, int, int, int]:
             active = 1 if row["agent_status"] and db.is_active_agent_status(str(row["agent_status"])) else 0
             active_resolver = 1 if active and row["agent_role"] == "Conflict Resolver" else 0
             resolver_card = 1 if row["role_type"] == "Conflict Resolver" else 0
@@ -1262,7 +1260,7 @@ class HarnessScheduler:
 
         return int(max(cards, key=score)["id"])
 
-    def retire_card_and_release_agent(self, conn: sqlite3.Connection, row: sqlite3.Row, note: str) -> None:
+    def retire_card_and_release_agent(self, conn: Any, row: Any, note: str) -> None:
         """Retire a duplicate card and leave Developers available for new work."""
 
         agent_name = str(row["agent_name"] or "")
@@ -1283,7 +1281,7 @@ class HarnessScheduler:
                 (now, now, f"Completed duplicate card#{row['id']}: superseded", agent_name),
             )
 
-    def retire_resolution_cards_for_target(self, conn: sqlite3.Connection, target_id: int, note: str) -> int:
+    def retire_resolution_cards_for_target(self, conn: Any, target_id: int, note: str) -> int:
         """Retire all non-done integration-resolution cards for one original card."""
 
         rows = conn.execute(
@@ -1307,7 +1305,7 @@ class HarnessScheduler:
             self.retire_card_and_release_agent(conn, row, note)
         return len(rows)
 
-    def requeue_developers_without_cards(self, conn: sqlite3.Connection) -> None:
+    def requeue_developers_without_cards(self, conn: Any) -> None:
         """Reassign idle Developers, and stop panes with ambiguous card ownership."""
 
         developers = conn.execute(
@@ -1358,7 +1356,7 @@ class HarnessScheduler:
                     pass
             db.log_event(conn, "uncarded_agent_stopped", f"Stopped {agent['name']} because it had {len(rows)} development cards", agent_name=agent["name"])
 
-    def developer_spawn_blocker(self, conn: sqlite3.Connection, team: str) -> str:
+    def developer_spawn_blocker(self, conn: Any, team: str) -> str:
         """Return why another Developer would be unstable, or an empty string if allowed."""
 
         queued = self.queued_developer_worklanes(conn)
@@ -1370,7 +1368,7 @@ class HarnessScheduler:
             return f"Developer capacity is already full ({active}/{cap})"
         return ""
 
-    def integration_backpressure(self, conn: sqlite3.Connection) -> bool:
+    def integration_backpressure(self, conn: Any) -> bool:
         """Detect when integration queues are too full to justify more feature work."""
 
         placeholders = ",".join("?" for _ in INTEGRATION_READY_STATUSES)
@@ -1394,11 +1392,11 @@ class HarnessScheduler:
         db.set_meta(conn, "integration_backpressure_active", "0")
         return False
 
-    def active_agent_count(self, conn: sqlite3.Connection, role: str) -> int:
+    def active_agent_count(self, conn: Any, role: str) -> int:
         """Count live agents for capacity, including non-terminal self-reported statuses."""
 
         active = 0
-        for agent in conn.execute("SELECT * FROM agents WHERE role = ?", (role,)):
+        for agent in conn.execute("SELECT * FROM agents WHERE role = ?", (role,)).fetchall():
             if not db.is_active_agent_status(agent["current_status"]):
                 continue
             if agent["ended_at"]:
@@ -1417,7 +1415,7 @@ class HarnessScheduler:
             active += 1
         return active
 
-    def handle_spawn_requests(self, conn: sqlite3.Connection, team: str = "building") -> None:
+    def handle_spawn_requests(self, conn: Any, team: str = "building") -> None:
         """Accept MCP spawn requests by starting agents through scheduler-owned code."""
 
         for request in db.next_spawn_requests(conn):
@@ -1440,7 +1438,7 @@ class HarnessScheduler:
                     db.mark_spawn_request(conn, request["id"], "rejected", "")
                     db.log_event(conn, "spawn_rejected", f"Rejected Developer spawn request: {reason}", payload={"request_id": request["id"], "title": request["title"]})
                     continue
-            existing: sqlite3.Row | None = None
+            existing: Any | None = None
             if role in SINGLETON_SPAWN_ROLES or role == "Coordinator":
                 existing = self.running_role_agent(conn, role)
             if existing:
@@ -1473,12 +1471,12 @@ class HarnessScheduler:
         text = " ".join(str(part or "").lower() for part in parts)
         return any(marker in text for marker in DEVELOPER_HANDOFF_MARKERS)
 
-    def running_role_agent(self, conn: sqlite3.Connection, role: str) -> sqlite3.Row | None:
+    def running_role_agent(self, conn: Any, role: str) -> Any | None:
         """Return one reachable active agent for a singleton role."""
 
         agents = [
             agent
-            for agent in conn.execute("SELECT * FROM agents WHERE role = ? ORDER BY id", (role,))
+            for agent in conn.execute("SELECT * FROM agents WHERE role = ? ORDER BY id", (role,)).fetchall()
             if db.is_active_agent_status(agent["current_status"]) and not agent["ended_at"]
         ]
         for agent in agents:
@@ -1492,7 +1490,7 @@ class HarnessScheduler:
             return agent
         return None
 
-    def agent_development_card_count(self, conn: sqlite3.Connection, agent: sqlite3.Row) -> int:
+    def agent_development_card_count(self, conn: Any, agent: Any) -> int:
         """Count development cards attached to an active agent."""
 
         return int(
@@ -1510,7 +1508,7 @@ class HarnessScheduler:
             ).fetchone()["count"]
         )
 
-    def requeue_agent_cards(self, conn: sqlite3.Connection, agent: sqlite3.Row, reason: str) -> int:
+    def requeue_agent_cards(self, conn: Any, agent: Any, reason: str) -> int:
         """Return cards owned by a dead worker to planned so Python can reassign them."""
 
         rows = conn.execute(
@@ -1531,7 +1529,7 @@ class HarnessScheduler:
             db.log_event(conn, "card_requeued", f"Requeued {len(rows)} cards from {agent['name']}", agent_name=agent["name"], payload={"reason": reason})
         return len(rows)
 
-    def mark_agent_missing(self, conn: sqlite3.Connection, agent: sqlite3.Row, reason: str) -> None:
+    def mark_agent_missing(self, conn: Any, agent: Any, reason: str) -> None:
         """Mark a supposedly active worker dead when Python cannot reach its tmux pane."""
 
         self.requeue_agent_cards(conn, agent, reason)
@@ -1539,7 +1537,7 @@ class HarnessScheduler:
         self.kill_agent_window(agent)
         db.log_event(conn, "agent_missing", f"{agent['name']} {reason}", agent_name=agent["name"])
 
-    def reconcile_missing_tmux_agents(self, conn: sqlite3.Connection) -> int:
+    def reconcile_missing_tmux_agents(self, conn: Any) -> int:
         """Crash active DB agents whose recorded tmux target no longer exists."""
 
         repaired = 0
@@ -1572,7 +1570,7 @@ class HarnessScheduler:
         repaired += self.reconcile_singleton_agent_duplicates(conn)
         return repaired
 
-    def reconcile_singleton_agent_duplicates(self, conn: sqlite3.Connection) -> int:
+    def reconcile_singleton_agent_duplicates(self, conn: Any) -> int:
         """Keep one Coordinator/Manager control-plane worker and stop duplicates."""
 
         rows = [
@@ -1584,7 +1582,7 @@ class HarnessScheduler:
                   AND ended_at IS NULL
                 ORDER BY id
                 """
-            )
+            ).fetchall()
             if db.is_active_agent_status(agent["current_status"]) and _tmux_target(agent) and self.target_exists(_tmux_target(agent))
         ]
         if len(rows) <= 1:
@@ -1608,7 +1606,7 @@ class HarnessScheduler:
         except Exception:
             return False
 
-    def kill_agent_window(self, agent: sqlite3.Row) -> None:
+    def kill_agent_window(self, agent: Any) -> None:
         """Best-effort close of one harness-owned agent window."""
 
         session = str(agent["tmux_session"] or "")
@@ -1620,7 +1618,7 @@ class HarnessScheduler:
         except Exception:
             return
 
-    def card_prompt(self, conn: sqlite3.Connection, card_id: int, title: str, prompt: str) -> str:
+    def card_prompt(self, conn: Any, card_id: int, title: str, prompt: str) -> str:
         """Build the bounded prompt for a concrete card-backed assignment."""
 
         if card_id:
@@ -1635,12 +1633,12 @@ class HarnessScheduler:
                 )
         return f"Assigned card-backed work: {title}\n\n{prompt}"
 
-    def prompt_running_role(self, conn: sqlite3.Connection, role: str, message: str) -> str:
+    def prompt_running_role(self, conn: Any, role: str, message: str) -> str:
         """Deliver work to one reachable active agent for singleton specialist roles."""
 
         agents = [
             agent
-            for agent in conn.execute("SELECT * FROM agents WHERE role = ? ORDER BY id", (role,))
+            for agent in conn.execute("SELECT * FROM agents WHERE role = ? ORDER BY id", (role,)).fetchall()
             if db.is_active_agent_status(agent["current_status"])
         ]
         for agent in agents:
@@ -1660,7 +1658,7 @@ class HarnessScheduler:
                 db.log_event(conn, "agent_missing", f"{agent['name']} tmux prompt failed", agent_name=agent["name"])
         return ""
 
-    def spawn_agent(self, conn: sqlite3.Connection, role: str, title: str, extra: str = "", card_id: int | None = None) -> str:
+    def spawn_agent(self, conn: Any, role: str, title: str, extra: str = "", card_id: int | None = None) -> str:
         """Create a Codex tmux window and agent row, using worktrees for developers."""
 
         if role == "Developer" and card_id is None and self.queued_developer_worklanes(conn) <= 0:
@@ -1766,7 +1764,7 @@ class HarnessScheduler:
         result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.root, text=True, capture_output=True, check=False)
         return result.stdout.strip() if result.returncode == 0 else ""
 
-    def check_agent_liveness(self, conn: sqlite3.Connection) -> None:
+    def check_agent_liveness(self, conn: Any) -> None:
         """Detect crashed, idle, or suspicious agents and route correction prompts."""
 
         agents = [
@@ -1804,7 +1802,7 @@ class HarnessScheduler:
         if idle_agents:
             self.prompt_auditor(conn, f"{len(idle_agents)} agents appear idle for more than {IDLE_SECONDS // 60} minutes: {_agent_list(idle_agents)}. Diagnose and force progress toward the metric.")
 
-    def check_progress_stall(self, conn: sqlite3.Connection) -> None:
+    def check_progress_stall(self, conn: Any) -> None:
         """Raise a visible alert if the progress metric has not increased in 30 minutes."""
 
         metric = db.latest_metric(conn)
@@ -1830,7 +1828,7 @@ class HarnessScheduler:
             db.log_event(conn, "progress_stalled", banner, payload={"percent_ready": percent})
             self.prompt_coordinator(conn, banner + " Reorganize work so progress resumes.")
 
-    def prompt_auditor(self, conn: sqlite3.Connection, message: str) -> None:
+    def prompt_auditor(self, conn: Any, message: str) -> None:
         """Ask a reachable auditor to intervene, or start one alert auditor."""
 
         card_id = db.find_or_create_card(
@@ -1844,7 +1842,7 @@ class HarnessScheduler:
         )
         auditors = [
             agent
-            for agent in conn.execute("SELECT * FROM agents WHERE role = 'Auditor' ORDER BY id")
+            for agent in conn.execute("SELECT * FROM agents WHERE role = 'Auditor' ORDER BY id").fetchall()
             if db.is_active_agent_status(agent["current_status"])
         ]
         for auditor in auditors:
@@ -1876,7 +1874,7 @@ class HarnessScheduler:
         db.set_meta(conn, "last_auditor_spawn_epoch", str(now))
         self.spawn_agent(conn, "Auditor", "Investigate scheduler alert", extra=message, card_id=card_id)
 
-    def handle_resource_pressure(self, conn: sqlite3.Connection, sample: dict[str, Any]) -> None:
+    def handle_resource_pressure(self, conn: Any, sample: dict[str, Any]) -> None:
         """Escalate sustained low/high resource use to Manager or Janitor."""
 
         cpu = float(sample.get("cpu_percent", 0))
@@ -1912,7 +1910,7 @@ class HarnessScheduler:
         else:
             db.set_meta(conn, "high_resource_since", "0")
 
-    def prompt_coordinator(self, conn: sqlite3.Connection, message: str) -> None:
+    def prompt_coordinator(self, conn: Any, message: str) -> None:
         """Ask the Coordinator to reorganize work when deterministic monitors fire."""
 
         card_id = db.find_or_create_card(
@@ -1927,7 +1925,7 @@ class HarnessScheduler:
         coordinator = next(
             (
                 agent
-                for agent in conn.execute("SELECT * FROM agents WHERE role IN ('Coordinator', 'Manager') ORDER BY CASE role WHEN 'Coordinator' THEN 0 ELSE 1 END, id")
+                for agent in conn.execute("SELECT * FROM agents WHERE role IN ('Coordinator', 'Manager') ORDER BY CASE role WHEN 'Coordinator' THEN 0 ELSE 1 END, id").fetchall()
                 if db.is_active_agent_status(agent["current_status"])
             ),
             None,
@@ -1947,7 +1945,7 @@ class HarnessScheduler:
                 db.log_event(conn, "agent_missing", f"{coordinator['name']} tmux prompt failed", agent_name=coordinator["name"])
         self.spawn_agent(conn, "Coordinator", "Respond to scheduler alert", extra=message, card_id=card_id)
 
-    def prompt_manager(self, conn: sqlite3.Connection, message: str) -> None:
+    def prompt_manager(self, conn: Any, message: str) -> None:
         """Compatibility wrapper for older tests and queued Manager requests."""
 
         self.prompt_coordinator(conn, message)
@@ -1966,7 +1964,7 @@ class HarnessScheduler:
                     return 0
         return 0
 
-    def maybe_run_janitor(self, conn: sqlite3.Connection) -> None:
+    def maybe_run_janitor(self, conn: Any) -> None:
         """Run deterministic cleanup at startup and at least once per hour."""
 
         last = float(db.get_meta(conn, "last_janitor_epoch", "0") or 0)
@@ -2004,7 +2002,7 @@ class HarnessScheduler:
 
 
 def _parse_epoch(value: str) -> float:
-    """Convert the UTC ISO strings in SQLite to epoch seconds for liveness checks."""
+    """Convert the UTC ISO strings in Turso to epoch seconds for liveness checks."""
 
     from datetime import datetime
 
@@ -2022,7 +2020,7 @@ def _agent_list(names: list[str], limit: int = 10) -> str:
     return ", ".join(shown) + suffix
 
 
-def _integration_resolution_key(row: sqlite3.Row) -> str:
+def _integration_resolution_key(row: Any) -> str:
     """Return the deterministic overlap key for an integration-resolution card."""
 
     description = str(row["description"] or "")
@@ -2041,7 +2039,7 @@ def _integration_resolution_key(row: sqlite3.Row) -> str:
     return ""
 
 
-def _integration_resolution_target_id(row: sqlite3.Row) -> int | None:
+def _integration_resolution_target_id(row: Any) -> int | None:
     """Extract the original card id an integration-resolution card is about."""
 
     source_key = str(row["source_key"] or "")
@@ -2056,7 +2054,7 @@ def _integration_resolution_target_id(row: sqlite3.Row) -> int | None:
     return None
 
 
-def _tmux_target(agent: sqlite3.Row) -> str:
+def _tmux_target(agent: Any) -> str:
     """Resolve an agent row to a concrete tmux target, if one was recorded."""
 
     if agent["tmux_pane"]:
@@ -2129,7 +2127,7 @@ def _harness_is_stopped(db_path: Path) -> bool:
         with db.connect(db_path) as conn:
             db.init_db(conn)
             return db.get_meta(conn, "harness_stopped") == "1"
-    except sqlite3.Error:
+    except Exception:
         return False
 
 

@@ -4,18 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-harness"
-version = "0.1.55"
+version = "0.1.56"
 description = "Deterministic scheduler around Codex CLI worker agents"
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = ["pyturso>=0.6.1"]
 license = {text = "MIT"}
 authors = [{name = "Adam Zieliński", email = "adam@adamziel.com"}]
 
 [project.scripts]
 harness = "llm_harness.cli:main"
-
-[project.optional-dependencies]
-turso = ["pyturso>=0.6.1"]
 
 [tool.setuptools.packages.find]
 where = ["."]

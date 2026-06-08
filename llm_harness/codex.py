@@ -35,7 +35,7 @@ def build_codex_command(
     prompt_path = Path(prompt_file).resolve()
     cwd_path = Path(cwd).resolve()
     root_path = Path(harness_root or cwd_path).resolve()
-    db_path = Path(db_path or root_path / ".harness" / "harness.sqlite3").resolve()
+    db_path = Path(db_path or root_path / ".harness" / "harness.turso").resolve()
     harness = Path(harness_command or root_path / "harness").resolve()
     config_args = " ".join(shlex.quote(arg) for arg in codex_mcp_config_args(root_path, db_path, harness))
     reasoning_config = f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"'

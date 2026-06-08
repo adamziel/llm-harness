@@ -1,7 +1,7 @@
 # LLM Harness
 
 `llm-harness` is a deterministic scheduler around Codex CLI worker agents. It
-uses Python, tmux, git worktrees, Turso/SQLite, and small MCP tools to keep agentic work
+uses Python, tmux, git worktrees, Turso, and small MCP tools to keep agentic work
 inspectable and restartable instead of trusting a single long-running chat.
 
 ## Run it without cloning
@@ -42,7 +42,7 @@ and prints their prefixed logs to the single `./harness run` stream. Those
 internal entrypoints remain hidden from help because users should not run them
 directly.
 
-`init` records the goal in `.harness/harness.sqlite3`, initializes Git if needed,
+`init` records the goal in `.harness/harness.turso`, initializes Git if needed,
 creates `DEVELOPMENT.md`, `PLAN.md`, status templates, role prompt files, and
 validates the harness MCP. `run` then starts a small resident control plane in a
 harness-owned tmux session: Coordinator, Integrator, queued Developer capacity,
@@ -59,18 +59,18 @@ stopping the others.
 
 ## Persistent state
 
-Turso is the preferred source of truth when the `pyturso` package is installed;
-the single-file harness falls back to Python's built-in SQLite driver when it is
-not. The database stores runs, goals, events, agents, tmux panes,
+Turso is the only supported harness database backend. The single-file harness
+requires the `pyturso` package at runtime and uses Turso MVCC for concurrent
+writes. The database stores runs, goals, events, agents, tmux panes,
 worktrees, worklanes, agent messages, structured agent reports, integration
 attempts, issues, resource samples, test runs, parsed test results, bug history,
 metric samples, code index rows, settings, and scheduler-routed spawn requests.
-Set `HARNESS_DB_DRIVER=turso` to require the Turso driver and fail clearly when
-`pyturso` is missing. Connections enable Turso MVCC for concurrent writes and
-fall back to WAL on regular SQLite.
+Install `pyturso` in the runtime environment; the harness fails clearly when
+`pyturso` is missing. There is no stdlib database fallback or driver-selection
+mode.
 
 The MCP server exposes that state through deterministic tools documented in
-`llm_harness/skills/sqlite_mcp/SKILL.md`.
+`llm_harness/skills/turso_mcp/SKILL.md`.
 
 ## Status reports
 

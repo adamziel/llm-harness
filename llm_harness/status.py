@@ -6,11 +6,11 @@ import html
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import time
 from pathlib import Path
 from textwrap import shorten
+from typing import Any
 
 from .db import is_active_agent_status, latest_metric, log_event, recent_events, set_meta, utc_now
 
@@ -117,8 +117,8 @@ def ensure_templates(root: str | Path) -> None:
         html_template.write_text(HTML_TEMPLATE)
 
 
-def refresh_reports(conn: sqlite3.Connection, root: str | Path) -> tuple[Path, Path]:
-    """Render STATUS.md and STATUS.html from SQLite so status is restart-safe."""
+def refresh_reports(conn: Any, root: str | Path) -> tuple[Path, Path]:
+    """Render STATUS.md and STATUS.html from Turso so status is restart-safe."""
 
     root_path = Path(root)
     ensure_templates(root_path)
@@ -143,7 +143,7 @@ def refresh_reports(conn: sqlite3.Connection, root: str | Path) -> tuple[Path, P
     return status_md, status_html
 
 
-def commit_and_push_status(conn: sqlite3.Connection, root: str | Path) -> bool:
+def commit_and_push_status(conn: Any, root: str | Path) -> bool:
     """Commit and push status artifacts without staging unrelated user work."""
 
     root_path = Path(root)
@@ -212,7 +212,7 @@ def _mainline_branch(root: Path) -> str:
     return ""
 
 
-def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
+def collect_status(conn: Any) -> dict[str, object]:
     """Gather the bounded data set shared by TUI, markdown, and HTML reports."""
 
     goal = conn.execute("SELECT * FROM goals WHERE id = 1").fetchone()
@@ -377,7 +377,7 @@ def collect_status(conn: sqlite3.Connection) -> dict[str, object]:
     }
 
 
-def dashboard(conn: sqlite3.Connection) -> str:
+def dashboard(conn: Any) -> str:
     """Return the Unicode/ANSI dashboard printed by ./harness status and poke."""
 
     data = collect_status(conn)
@@ -596,7 +596,7 @@ def _progress_count_text(metric: object) -> str:
 
 
 def _display_number(value: object) -> str:
-    """Format SQLite numeric values without distracting .0 suffixes."""
+    """Format database numeric values without distracting .0 suffixes."""
 
     try:
         number = float(value)  # type: ignore[arg-type]
@@ -648,7 +648,7 @@ def _html_runtime_alerts(alerts: object) -> str:
     return f"<div class=\"card bad\"><h2>Runtime alerts</h2><ul>{items}</ul></div>"
 
 
-def _runtime_alerts(metadata: dict[str, str], agents: list[sqlite3.Row], active_work: list[sqlite3.Row], pending_lanes: list[sqlite3.Row]) -> list[str]:
+def _runtime_alerts(metadata: dict[str, str], agents: list[Any], active_work: list[Any], pending_lanes: list[Any]) -> list[str]:
     """Return visible status alerts for dead harness control-plane processes."""
 
     alerts: list[str] = []

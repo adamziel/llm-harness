@@ -1,8 +1,8 @@
-# Harness SQLite MCP
+# Harness Turso MCP
 
 Use this skill in every Codex agent launched by the harness.
 
-The harness exposes a local MCP server backed by `.harness/harness.sqlite3`.
+The harness exposes a local MCP server backed by `.harness/harness.turso3`.
 Use it as the shared memory and coordination surface instead of relying on chat
 history alone.
 
@@ -24,7 +24,7 @@ Tools:
   This deliberately routes through the central scheduler so the harness knows the
   whole process tree. Do not start Codex directly.
 - `code_search(query, worktree?, limit?, refresh?)` — search code with ripgrep or
-  the SQLite fallback index before doing broad manual greps.
+  the Turso fallback index before doing broad manual greps.
 
 Keep writes concise and structured. Prefer several small events over one giant
 note that will waste future context.

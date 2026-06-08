@@ -1,9 +1,8 @@
-"""Repository search MCP backend with ripgrep first and SQLite fallback."""
+"""Repository search MCP backend with ripgrep first and Turso index fallback."""
 
 from __future__ import annotations
 
 import os
-import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,7 @@ TEXT_EXTENSIONS = {
 }
 
 
-def refresh_index(conn: sqlite3.Connection, root: str | Path, worktree: str = "main") -> int:
+def refresh_index(conn: Any, root: str | Path, worktree: str = "main") -> int:
     """Index small text files so agents have a deterministic search fallback."""
 
     root_path = Path(root).resolve()
@@ -44,8 +43,8 @@ def refresh_index(conn: sqlite3.Connection, root: str | Path, worktree: str = "m
     return count
 
 
-def code_search(conn: sqlite3.Connection, root: str | Path, query: str, worktree: str = "main", limit: int = 20) -> list[dict[str, Any]]:
-    """Search code using ripgrep when available, otherwise the SQLite index."""
+def code_search(conn: Any, root: str | Path, query: str, worktree: str = "main", limit: int = 20) -> list[dict[str, Any]]:
+    """Search code using ripgrep when available, otherwise the Turso index."""
 
     rg = _ripgrep(root, query, limit)
     if rg:
@@ -61,7 +60,7 @@ def code_search(conn: sqlite3.Connection, root: str | Path, query: str, worktree
     results: list[dict[str, Any]] = []
     for row in rows:
         line_no, line = _first_matching_line(row["content"], query)
-        results.append({"path": row["path"], "line": line_no, "text": line, "source": "sqlite-index"})
+        results.append({"path": row["path"], "line": line_no, "text": line, "source": "turso-index"})
     return results
 
 

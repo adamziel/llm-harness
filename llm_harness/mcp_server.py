@@ -16,7 +16,7 @@ from .indexer import code_search, refresh_index
 TOOLS = [
     {
         "name": "memory_record_event",
-        "description": "Append an event to the harness SQLite memory.",
+        "description": "Append an event to the harness Turso memory.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -30,7 +30,7 @@ TOOLS = [
     },
     {
         "name": "memory_query",
-        "description": "Run a read-only SELECT/WITH/PRAGMA query against harness SQLite memory. Use PRAGMA table_xinfo(table) to inspect columns.",
+        "description": "Run a read-only SELECT/WITH/PRAGMA query against harness Turso memory. Use PRAGMA table_xinfo(table) to inspect columns.",
         "inputSchema": {
             "type": "object",
             "properties": {"sql": {"type": "string"}, "params": {"type": "array"}},
@@ -91,7 +91,7 @@ TOOLS = [
     },
     {
         "name": "code_search",
-        "description": "Search the repository or worktree using ripgrep or the SQLite code index fallback.",
+        "description": "Search the repository or worktree using ripgrep or the Turso code index fallback.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -231,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description="Run the llm-harness MCP server")
     parser.add_argument("--root", default=os.environ.get("HARNESS_ROOT", os.getcwd()))
-    parser.add_argument("--db", default=os.environ.get("HARNESS_DB", str(Path(os.getcwd()) / ".harness" / "harness.sqlite3")))
+    parser.add_argument("--db", default=os.environ.get("HARNESS_DB", str(Path(os.getcwd()) / ".harness" / "harness.turso")))
     args = parser.parse_args(argv)
     serve(args.root, args.db)
     return 0

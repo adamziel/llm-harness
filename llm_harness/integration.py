@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import re
-import sqlite3
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from . import db
 
@@ -16,7 +16,7 @@ INTEGRATION_LIMIT = 5
 GENERATED_REPORT_PATHS = {"STATUS.md", "STATUS.html", "progress.md", "progress.html"}
 
 
-def integrate_once(conn: sqlite3.Connection, root: str | Path, limit: int = INTEGRATION_LIMIT) -> dict[str, int]:
+def integrate_once(conn: Any, root: str | Path, limit: int = INTEGRATION_LIMIT) -> dict[str, int]:
     """Merge and push ready lanes from a clean harness-owned integration worktree."""
 
     root_path = Path(root).resolve()
@@ -52,7 +52,7 @@ def integrate_once(conn: sqlite3.Connection, root: str | Path, limit: int = INTE
     return result
 
 
-def _ready_lanes(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+def _ready_lanes(conn: Any, limit: int) -> list[Any]:
     placeholders = ",".join("?" for _ in INTEGRATION_STATUSES)
     gate_clause = ""
     if db.get_meta(conn, "test_gate_mode") == "hard_blocker":
@@ -73,7 +73,7 @@ def _ready_lanes(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
     )
 
 
-def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainline: str, lane: sqlite3.Row) -> str:
+def _integrate_lane(conn: Any, root: Path, worktree: Path, mainline: str, lane: Any) -> str:
     lane_id = int(lane["id"])
     branch = str(lane["branch_name"])
     candidate = _candidate_ref(root, branch)
@@ -161,7 +161,7 @@ def _integrate_lane(conn: sqlite3.Connection, root: Path, worktree: Path, mainli
     return "integrated"
 
 
-def _record_attempt(conn: sqlite3.Connection, lane_id: int, branch: str) -> int:
+def _record_attempt(conn: Any, lane_id: int, branch: str) -> int:
     cur = conn.execute(
         """
         INSERT INTO integration_attempts(worklane_id, attempt_branch, status, started_at)
@@ -172,7 +172,7 @@ def _record_attempt(conn: sqlite3.Connection, lane_id: int, branch: str) -> int:
     return int(cur.lastrowid)
 
 
-def _queue_conflict_card(conn: sqlite3.Connection, lane: sqlite3.Row, failure_type: str, reason: str) -> None:
+def _queue_conflict_card(conn: Any, lane: Any, failure_type: str, reason: str) -> None:
     """Create one planned conflict-resolution card for a failed integration lane."""
 
     lane_id = int(lane["id"])
@@ -232,7 +232,7 @@ def branch_integration_state(root: str | Path, branch: str, mainline: str | None
 
 
 def _finish_attempt(
-    conn: sqlite3.Connection,
+    conn: Any,
     attempt_id: int,
     status: str,
     merge_result: str,

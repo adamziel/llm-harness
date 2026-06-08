@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import shutil
-import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 from . import db
 
 
-def run_janitor(conn: sqlite3.Connection, root: str | Path, max_prompt_age_hours: int = 24) -> dict[str, int]:
+def run_janitor(conn: Any, root: str | Path, max_prompt_age_hours: int = 24) -> dict[str, int]:
     """Clean stale temporary files while preserving branches and worktrees."""
 
     paths = db.paths_for(root)
