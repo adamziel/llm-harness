@@ -355,6 +355,7 @@ def collect_status(conn: Any) -> dict[str, object]:
         "failure_count": metadata.get("test_gate_failure_count", ""),
         "run_id": metadata.get("test_gate_run_id", ""),
     }
+    gate_station = _gate_station_status(conn, metadata)
     runtime_alerts = _runtime_alerts(metadata, agents, active_work, pending_lanes)
     return {
         "goal": dict(goal) if goal else None,
@@ -373,6 +374,7 @@ def collect_status(conn: Any) -> dict[str, object]:
         "failed_integration": dict(failed_integration) if failed_integration else {"count": 0},
         "integration_health": dict(integration_health) if integration_health else {},
         "test_gate": test_gate,
+        "gate_station": gate_station,
         "metadata": metadata,
         "runtime_alerts": runtime_alerts,
     }
@@ -420,6 +422,26 @@ def dashboard(conn: Any) -> str:
         lines.append(_box_line(width, f"Gate: SOFT KNOWN-RED — {test_gate.get('failure_count')} known failures, progress allowed", ANSI["yellow"]))
     elif isinstance(test_gate, dict) and test_gate.get("mode") == "quarantined_known_red":
         lines.append(_box_line(width, f"Gate: KNOWN-RED QUARANTINE — {test_gate.get('failure_count')} known failures, progress allowed", ANSI["yellow"]))
+    gate_station = data.get("gate_station")
+    if isinstance(gate_station, dict) and gate_station.get("mode") == "1":
+        first_target = str(gate_station.get("first_failing_target") or "unknown")
+        lines.append(_box_line(width, f"First failing target: {first_target}", ANSI["yellow"]))
+        lines.append(
+            _box_line(
+                width,
+                f"No-fail-fast failing targets: {gate_station.get('inventory_failure_count', 0)} | "
+                f"Focused tests cleared this session: {gate_station.get('focused_tests_cleared_session', 0)}",
+                ANSI["yellow"],
+            )
+        )
+        lines.append(_box_line(width, f"Full gate: passed={gate_station.get('full_gate_passed', 0)}, failed={gate_station.get('full_gate_failed', 0)}"))
+        owners = gate_station.get("cluster_owners")
+        if isinstance(owners, list) and owners:
+            owner_text = ", ".join(
+                f"{owner.get('owner') or owner.get('source_key')}→{owner.get('agent_name') or 'unassigned'}"
+                for owner in owners[:3]
+            )
+            lines.append(_box_line(width, f"Gate clusters: {owner_text}", ANSI["yellow"]))
 
     resources = data["resources"]
     if resources:
@@ -544,7 +566,7 @@ def _markdown_context(data: dict[str, object]) -> dict[str, str]:
         "metric": _metric_text(metric),
         "agents": _markdown_table(data.get("agents", []), ["name", "role", "current_status", "tmux_window", "worktree"]),
         "work_lanes": _markdown_table(data.get("work_lanes", []), ["id", "title", "role_type", "card_type", "stage", "status", "integration_queue", "expected_metric_impact"]),
-        "tests": _test_text(data.get("test_run")),
+        "tests": _test_text(data.get("test_run")) + _gate_station_text(data.get("gate_station")),
         "resources": _resource_text(data.get("resources", [])),
         "events": "\n".join(f"- {e['ts']} **{e['type']}**: {e['message']}" for e in data.get("events", [])) or "No events yet.",
         "next_steps": _next_steps(data),
@@ -565,7 +587,7 @@ def _html_context(data: dict[str, object]) -> dict[str, str]:
         "metric_html": html.escape(_metric_text(metric)),
         "metric_chart_html": _sparkline(data.get("metric_history", []), "percent_ready"),
         "resources_html": _html_resource(data.get("resources", [])),
-        "tests_html": html.escape(_test_text(data.get("test_run"))).replace("\n", "<br>"),
+        "tests_html": html.escape(_test_text(data.get("test_run")) + _gate_station_text(data.get("gate_station"))).replace("\n", "<br>"),
         "agents_html": _html_table(data.get("agents", []), ["name", "role", "current_status", "tmux_window", "worktree"]),
         "work_lanes_html": _html_table(data.get("work_lanes", []), ["id", "title", "role_type", "card_type", "stage", "status", "integration_queue", "expected_metric_impact"]),
         "events_html": "<ul>" + "".join(f"<li>{html.escape(e['ts'])} <strong>{html.escape(e['type'])}</strong>: {html.escape(e['message'])}</li>" for e in data.get("events", [])) + "</ul>",
@@ -614,6 +636,75 @@ def _test_text(test_run: object) -> str:
         bits = ", ".join(f"{k}={v}" for k, v in sorted(summary.items()))
         return f"{test_run.get('status')} — {test_run.get('command')}" + (f" ({bits})" if bits else "")
     return "No test runs recorded yet."
+
+
+def _gate_station_status(conn: Any, metadata: dict[str, str]) -> dict[str, object]:
+    """Collect red-gate stabilization counters without mixing them with PHPT progress."""
+
+    full_gate = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN status = 'passed' THEN 1 ELSE 0 END) AS passed,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+        FROM test_runs
+        WHERE command LIKE '%tools/run-tests.sh%'
+        """
+    ).fetchone()
+    owners = conn.execute(
+        """
+        SELECT
+            w.id AS card_id,
+            w.source_key,
+            w.title,
+            a.name AS agent_name
+        FROM worklanes w
+        LEFT JOIN agents a
+            ON a.id = w.owner_agent_id
+            AND a.current_status NOT IN ('crash', 'success', 'stopped')
+            AND a.ended_at IS NULL
+        WHERE w.stage != 'done'
+          AND w.source_key LIKE 'gate-cluster:%'
+        ORDER BY w.id ASC
+        LIMIT 8
+        """
+    ).fetchall()
+    return {
+        "mode": metadata.get("gate_station_mode", "0"),
+        "inventory_failure_count": int(float(metadata.get("gate_station_inventory_failure_count", "0") or 0)),
+        "first_failing_target": metadata.get("gate_station_first_failing_target", ""),
+        "focused_tests_cleared_session": int(float(metadata.get("focused_tests_cleared_session", "0") or 0)),
+        "full_gate_passed": int(full_gate["passed"] or 0) if full_gate else 0,
+        "full_gate_failed": int(full_gate["failed"] or 0) if full_gate else 0,
+        "cluster_owners": [
+            {
+                "card_id": row["card_id"],
+                "source_key": row["source_key"],
+                "owner": str(row["source_key"] or "").removeprefix("gate-cluster:"),
+                "title": row["title"],
+                "agent_name": row["agent_name"] or "",
+            }
+            for row in owners
+        ],
+    }
+
+
+def _gate_station_text(gate_station: object) -> str:
+    """Render gate-station counters for STATUS.md/HTML test sections."""
+
+    if not isinstance(gate_station, dict) or gate_station.get("mode") != "1":
+        return ""
+    lines = [
+        "",
+        f"Gate station: first failing target={gate_station.get('first_failing_target') or 'unknown'}",
+        f"No-fail-fast failing targets: {gate_station.get('inventory_failure_count', 0)}",
+        f"Focused tests cleared this session: {gate_station.get('focused_tests_cleared_session', 0)}",
+        f"Full gate: passed={gate_station.get('full_gate_passed', 0)}, failed={gate_station.get('full_gate_failed', 0)}",
+    ]
+    owners = gate_station.get("cluster_owners")
+    if isinstance(owners, list) and owners:
+        rendered = ", ".join(f"{row.get('owner')}→{row.get('agent_name') or 'unassigned'}" for row in owners[:8])
+        lines.append(f"Failure cluster owners: {rendered}")
+    return "\n" + "\n".join(lines)
 
 
 def _resource_text(resources: object) -> str:

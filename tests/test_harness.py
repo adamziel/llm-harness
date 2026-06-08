@@ -1488,6 +1488,167 @@ class HarnessTests(unittest.TestCase):
 
             self.assertEqual(len(failure_events), 1)
 
+    def test_gate_station_starts_one_inventory_and_gate_owner_before_feature_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.record_metric(conn, "accepted_public_phpt_passes", 10, 100)
+                run_id = db.record_test_run(conn, command="tools/run-tests.sh", status="failed", full_log="gate failed", results=[])
+                db.set_meta(conn, "test_gate_mode", "hard_blocker")
+                db.set_meta(conn, "test_gate_run_id", str(run_id))
+                feature_id = db.create_card(conn, "Add unrelated PHPT slice", role_type="Developer", source_key="feature:next")
+                scheduler.manage_gate_station(conn)
+                candidates = scheduler.planned_developer_candidates(conn)
+                cards = conn.execute("SELECT * FROM worklanes WHERE stage != 'done' ORDER BY id").fetchall()
+                reproducers = conn.execute("SELECT * FROM agents WHERE role = 'Reproducer' AND ended_at IS NULL").fetchall()
+                gate_station_mode = db.get_meta(conn, "gate_station_mode")
+
+            source_keys = [row["source_key"] for row in cards]
+            candidate_ids = [row["id"] for row in candidates]
+            self.assertEqual(gate_station_mode, "1")
+            self.assertIn("gate-station:inventory", source_keys)
+            self.assertIn("test-failure:global-suite", source_keys)
+            self.assertEqual(len(reproducers), 1)
+            self.assertNotIn(feature_id, candidate_ids)
+            self.assertTrue(all(row["source_key"].startswith(("test-failure:", "gate-", "integration-failure:")) for row in candidates))
+
+    def test_gate_station_splits_no_fail_fast_inventory_into_file_owned_lanes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "gate_station_mode", "1")
+                db.set_meta(conn, "test_gate_mode", "hard_blocker")
+                db.set_meta(conn, "gate_station_last_inventory_failures", "5")
+                run_id = db.record_test_run(
+                    conn,
+                    command="cargo test -q --no-fail-fast",
+                    status="failed",
+                    full_log="",
+                    results=[
+                        {"nodeid": "runtime::cleanup::method_args", "file": "runtime/src/lib.rs", "status": "failed"},
+                        {"nodeid": "runtime::cleanup::static_args", "file": "runtime/src/lib.rs", "status": "failed"},
+                        {"nodeid": "codegen::strings::concat", "file": "compiler/src/codegen.rs", "status": "failed"},
+                    ],
+                )
+                scheduler.manage_gate_station(conn)
+                lanes = conn.execute("SELECT * FROM worklanes WHERE source_key LIKE 'gate-cluster:%' ORDER BY source_key").fetchall()
+                rendered = dashboard(conn)
+                inventory_run_id = db.get_meta(conn, "gate_station_inventory_run_id")
+                inventory_failure_count = db.get_meta(conn, "gate_station_inventory_failure_count")
+                first_failing_target = db.get_meta(conn, "gate_station_first_failing_target")
+                focused_tests_cleared = db.get_meta(conn, "focused_tests_cleared_session")
+
+            self.assertEqual(inventory_run_id, str(run_id))
+            self.assertEqual(inventory_failure_count, "3")
+            self.assertEqual(first_failing_target, "runtime::cleanup::method_args")
+            self.assertEqual(focused_tests_cleared, "2")
+            self.assertEqual(len(lanes), 2)
+            self.assertEqual([row["source_key"] for row in lanes], ["gate-cluster:compiler/src/codegen.rs", "gate-cluster:runtime/src/lib.rs"])
+            self.assertIn("runtime::cleanup::method_args", lanes[1]["notes"])
+            self.assertIn("First failing target: runtime::cleanup::method_args", rendered)
+            self.assertIn("Focused tests cleared this session: 2", rendered)
+            self.assertIn("No-fail-fast failing targets: 3", rendered)
+
+    def test_gate_station_developer_candidates_are_disjoint_by_owned_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "gate_station_mode", "1")
+                db.set_meta(conn, "gate_station_inventory_ready", "1")
+                first = db.create_card(conn, "Fix runtime cleanup A", role_type="Developer", source_key="gate-cluster:runtime/src/lib.rs", priority=0, notes="Owned target/file: runtime/src/lib.rs")
+                second = db.create_card(conn, "Fix runtime cleanup B", role_type="Developer", source_key="gate-cluster:runtime/src/lib.rs:duplicate", priority=1, notes="Owned target/file: runtime/src/lib.rs")
+                third = db.create_card(conn, "Fix codegen concat", role_type="Developer", source_key="gate-cluster:compiler/src/codegen.rs", priority=2, notes="Owned target/file: compiler/src/codegen.rs")
+                candidates = scheduler.planned_developer_candidates(conn)
+
+            candidate_ids = [row["id"] for row in candidates]
+            self.assertIn(first, candidate_ids)
+            self.assertIn(third, candidate_ids)
+            self.assertNotIn(second, candidate_ids)
+
+    def test_gate_station_developer_candidates_skip_already_owned_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            scheduler = HarnessScheduler(tmp, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                db.set_meta(conn, "gate_station_mode", "1")
+                db.set_meta(conn, "gate_station_inventory_ready", "1")
+                active = db.create_card(conn, "Fix runtime cleanup A", role_type="Developer", source_key="gate-cluster:runtime/src/lib.rs", notes="Owned target/file: runtime/src/lib.rs")
+                duplicate = db.create_card(conn, "Fix runtime cleanup B", role_type="Developer", source_key="gate-cluster:runtime/src/lib.rs:followup", notes="Owned target/file: runtime/src/lib.rs")
+                disjoint = db.create_card(conn, "Fix codegen concat", role_type="Developer", source_key="gate-cluster:compiler/src/codegen.rs", notes="Owned target/file: compiler/src/codegen.rs")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running")
+                db.assign_card(conn, active, "developer-1")
+                candidates = scheduler.planned_developer_candidates(conn)
+
+            candidate_ids = [row["id"] for row in candidates]
+            self.assertIn(disjoint, candidate_ids)
+            self.assertNotIn(duplicate, candidate_ids)
+
+    def test_dirty_crashed_gate_worker_creates_recovery_lane_without_reassigning_dirty_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=root, check=True)
+            (root / "runtime.rs").write_text("base\n")
+            subprocess.run(["git", "add", "runtime.rs"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "Initial"], cwd=root, check=True, capture_output=True)
+            paths = db.bootstrap(root)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                worktree, branch = scheduler.agent_cwd("Developer", "developer-1")
+                (worktree / "runtime.rs").write_text("base\npartial fix\n")
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", cwd=str(worktree), worktree=str(worktree), branch=branch)
+                agent = conn.execute("SELECT * FROM agents WHERE name = 'developer-1'").fetchone()
+                card_id = db.create_card(conn, "Fix runtime cleanup", role_type="Developer", source_key="gate-cluster:runtime/src/lib.rs")
+                db.assign_card(conn, card_id, "developer-1", str(worktree), branch)
+                scheduler.mark_agent_missing(conn, agent, "tmux pane no longer exists")
+                original = conn.execute("SELECT * FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+                recovery = conn.execute("SELECT * FROM worklanes WHERE source_key LIKE 'gate-crash-recovery:%'").fetchone()
+
+            self.assertEqual(original["stage"], "done")
+            self.assertEqual(original["status"], "stale")
+            self.assertIsNotNone(recovery)
+            self.assertIn(str(worktree), recovery["notes"])
+            self.assertTrue((worktree / "runtime.rs").exists())
+
+    def test_committed_crashed_gate_worker_creates_recovery_lane_without_reassigning_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "master"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "harness@example.test"], cwd=root, check=True)
+            (root / "runtime.rs").write_text("base\n")
+            subprocess.run(["git", "add", "runtime.rs"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "Initial"], cwd=root, check=True, capture_output=True)
+            paths = db.bootstrap(root)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                worktree, branch = scheduler.agent_cwd("Developer", "developer-1")
+                (worktree / "runtime.rs").write_text("base\ncommitted fix\n")
+                subprocess.run(["git", "add", "runtime.rs"], cwd=worktree, check=True)
+                subprocess.run(["git", "commit", "-m", "Focused gate fix"], cwd=worktree, check=True, capture_output=True)
+                db.upsert_agent(conn, name="developer-1", role="Developer", current_status="running", cwd=str(worktree), worktree=str(worktree), branch=branch)
+                agent = conn.execute("SELECT * FROM agents WHERE name = 'developer-1'").fetchone()
+                card_id = db.create_card(conn, "Fix runtime cleanup", role_type="Developer", source_key="gate-cluster:runtime/src/lib.rs")
+                db.assign_card(conn, card_id, "developer-1", str(worktree), branch)
+                scheduler.mark_agent_missing(conn, agent, "tmux pane no longer exists")
+                original = conn.execute("SELECT * FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+                recovery = conn.execute("SELECT * FROM worklanes WHERE source_key LIKE 'gate-crash-recovery:%'").fetchone()
+
+            self.assertEqual(original["stage"], "done")
+            self.assertEqual(original["status"], "stale")
+            self.assertIsNotNone(recovery)
+            self.assertIn(str(worktree), recovery["notes"])
+
     def test_failed_global_gate_with_metric_is_soft_known_red_and_keeps_product_work(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

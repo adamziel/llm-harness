@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import signal
@@ -50,6 +51,9 @@ INTEGRATION_READY_STATUSES = ("ready_for_integration",)
 INTEGRATION_RECOVERY_ACTIVE_LIMIT = 4
 REPORT_ONLY_DEVELOPER_ACTIVE_LIMIT = 1
 REPORT_ONLY_CARD_MARKERS = ("read-only", "read only", "no source edits", "no_source_edits", ".harness/reports", "focused replay")
+GATE_INVENTORY_SOURCE_KEY = "gate-station:inventory"
+GATE_OWNER_SOURCE_KEY = "test-failure:global-suite"
+DEFAULT_GATE_INVENTORY_COMMAND = "cargo test -q --no-fail-fast"
 INTEGRATION_RESOLUTION_CARD_RE = re.compile(r"card #(\d+)")
 INTEGRATION_BRANCH_RE = re.compile(r"(?m)^Branch:\s*(\S+)")
 SUPPORT_ROLES = {"Manhole", "Status reporter", "Janitor"}
@@ -89,6 +93,15 @@ Edit it with project-specific commands and conventions for future agents.
 - Avoid unsupported claims of completion; cite tests, files, commits, or other evidence.
 - Leave unrelated files untouched.
 """
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    """Parse metadata integers defensively."""
+
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def _looks_resource_blocker(notes: object) -> bool:
@@ -675,6 +688,7 @@ class HarnessScheduler:
         db.record_resource_sample(conn, sample)
         self.reconcile_missing_tmux_agents(conn)
         self.handle_resource_pressure(conn, sample)
+        self.manage_gate_station(conn)
         self.handle_spawn_requests(conn, team)
         reviewed = db.review_ready_cards(conn)
         if reviewed:
@@ -854,6 +868,319 @@ class HarnessScheduler:
         self.tmux.ensure_window(session, "status", "watch -c -n 5 ./harness status")
         db.log_event(conn, "tmux", "Interactive support windows ready", payload={"session": session, "attach": attach})
 
+    def manage_gate_station(self, conn: Any) -> None:
+        """Own red global-gate stabilization as a deterministic scheduler mode."""
+
+        if not self.gate_station_should_run(conn):
+            if db.get_meta(conn, "gate_station_mode") == "1":
+                db.set_meta(conn, "gate_station_mode", "0")
+                db.log_event(conn, "gate_station", "Exited gate station mode because the global gate is no longer red")
+            return
+        db.set_meta(conn, "gate_station_mode", "1")
+        self.ensure_gate_owner_card(conn)
+        self.ingest_gate_inventory(conn)
+        if db.get_meta(conn, "gate_station_inventory_ready") != "1":
+            self.ensure_gate_inventory_worker(conn)
+        self.redirect_looping_gate_workers(conn)
+
+    def gate_station_should_run(self, conn: Any) -> bool:
+        """Enter gate station when the accepted metric stalls behind a red full gate."""
+
+        latest_gate = self.latest_global_gate_run(conn)
+        if latest_gate and latest_gate["status"] == "failed":
+            return True
+        metric = db.selected_metric(conn)
+        if (
+            metric is not None
+            and str(metric["metric_name"]) == "accepted_public_phpt_passes"
+            and str(db.get_meta(conn, "red_banner", "")).startswith("PROGRESS STALLED")
+        ):
+            return True
+        return db.get_meta(conn, "test_gate_mode") in {"hard_blocker", "quarantined_known_red", "soft_known_red"}
+
+    def latest_global_gate_run(self, conn: Any) -> Any | None:
+        """Return the latest exact full-gate run, if the test loop has recorded one."""
+
+        return conn.execute(
+            """
+            SELECT * FROM test_runs
+            WHERE command LIKE '%tools/run-tests.sh%'
+            ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+
+    def gate_inventory_command(self, conn: Any) -> str:
+        """Return the configured no-fail-fast inventory command."""
+
+        return db.get_meta(conn, "gate_inventory_command", DEFAULT_GATE_INVENTORY_COMMAND) or DEFAULT_GATE_INVENTORY_COMMAND
+
+    def ensure_gate_owner_card(self, conn: Any) -> int:
+        """Maintain one exact owner for tools/run-tests.sh."""
+
+        card_id = db.find_or_create_card(
+            conn,
+            source_key=GATE_OWNER_SOURCE_KEY,
+            title="Fix global test suite failures",
+            role_type="Developer",
+            description="Own the exact global gate until tools/run-tests.sh is green or explicitly quarantined.",
+            goal="Run the exact gate, isolate the first failing target, patch one root cause, verify focused, then rerun the gate.",
+            acceptance_criteria=self.gate_owner_acceptance(),
+            priority=-10,
+            integration_required=True,
+        )
+        return int(card_id)
+
+    def gate_owner_acceptance(self) -> str:
+        """Spell out the narrow gate-owner loop so workers do not drift."""
+
+        return (
+            "Exact gate-owner loop: run tools/run-tests.sh; capture the first failing target; "
+            "run the focused target; root-cause that target; patch one cause; rerun the focused target; "
+            "rerun tools/run-tests.sh. Do not do broad snapshot/support refreshes without focused proof."
+        )
+
+    def ensure_gate_inventory_worker(self, conn: Any) -> int:
+        """Create and start exactly one read-only no-fail-fast inventory worker."""
+
+        command = self.gate_inventory_command(conn)
+        card_id = db.find_or_create_card(
+            conn,
+            source_key=GATE_INVENTORY_SOURCE_KEY,
+            title="Inventory red global gate failures",
+            role_type="Reproducer",
+            card_type="diagnostic",
+            description=f"Read-only inventory. Run `{command}` and classify every failure cluster.",
+            goal=(
+                "Produce failing target count, failing test names, owning file/module, likely class, "
+                "and recommended non-overlapping lanes. Do not edit source files."
+            ),
+            acceptance_criteria=(
+                f"Run `{command}` from the repository root. Report failing target count, failing names, owning file/module, "
+                "likely class, and recommended non-overlapping lanes. No source edits."
+            ),
+            priority=-20,
+            integration_required=False,
+            review_required=False,
+        )
+        row = conn.execute("SELECT stage, owner_agent_id FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+        if row and row["stage"] == "planned" and self.active_inventory_workers(conn) == 0:
+            self.spawn_agent(conn, "Reproducer", "Inventory red global gate failures", extra=f"Run `{command}` read-only and report structured failure clusters.", card_id=int(card_id))
+        return int(card_id)
+
+    def active_inventory_workers(self, conn: Any) -> int:
+        """Count active Reproducer workers already assigned to the inventory card."""
+
+        return int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM worklanes w
+                JOIN agents a ON a.id = w.owner_agent_id
+                WHERE w.source_key = ?
+                  AND w.stage = 'development'
+                  AND a.current_status NOT IN ('crash', 'success', 'stopped')
+                  AND a.ended_at IS NULL
+                """,
+                (GATE_INVENTORY_SOURCE_KEY,),
+            ).fetchone()["count"]
+        )
+
+    def ingest_gate_inventory(self, conn: Any) -> None:
+        """Turn a recorded no-fail-fast run into disjoint file-owned fix lanes."""
+
+        command = self.gate_inventory_command(conn)
+        run = conn.execute(
+            """
+            SELECT * FROM test_runs
+            WHERE command = ? OR command LIKE ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (command, f"%{command}%"),
+        ).fetchone()
+        if not run or str(run["status"]) != "failed":
+            return
+        run_id = int(run["id"])
+        if db.get_meta(conn, "gate_station_inventory_run_id") == str(run_id):
+            return
+        failures = conn.execute(
+            """
+            SELECT DISTINCT nodeid, file
+            FROM test_results
+            WHERE run_id = ? AND status IN ('failed', 'error') AND nodeid != ''
+            ORDER BY id
+            """,
+            (run_id,),
+        ).fetchall()
+        if not failures:
+            return
+        groups: dict[str, list[Any]] = {}
+        for failure in failures:
+            groups.setdefault(self.gate_failure_owner(failure), []).append(failure)
+        for owner, rows in groups.items():
+            source_key = f"gate-cluster:{owner}"
+            if self.unresolved_card_exists(conn, source_key):
+                continue
+            names = [str(row["nodeid"]) for row in rows]
+            classes = sorted({self.classify_gate_failure(owner, name) for name in names})
+            db.create_card(
+                conn,
+                f"Fix gate cluster: {owner}",
+                role_type="Developer",
+                source_key=source_key,
+                priority=-5,
+                description=f"Own only {owner}; failures: {', '.join(names[:12])}",
+                goal=f"Fix the red global-gate cluster for {owner} without touching overlapping files or fixture families.",
+                acceptance_criteria=(
+                    "Run a focused target for this cluster, patch one root cause, rerun focused verification, "
+                    "then report whether tools/run-tests.sh advanced. Do not claim PHPT metric movement unless accepted_public_phpt_passes changes."
+                ),
+                notes=(
+                    f"Owned target/file: {owner}\n"
+                    f"Likely class: {', '.join(classes)}\n"
+                    f"Failing tests: {', '.join(names)}\n"
+                    "Non-overlap rule: do not edit another gate-cluster owner without a recorded handoff."
+                ),
+            )
+        count = len(failures)
+        previous = _safe_int(db.get_meta(conn, "gate_station_last_inventory_failures"), 0)
+        cleared = _safe_int(db.get_meta(conn, "focused_tests_cleared_session"), 0)
+        if previous and count < previous:
+            cleared += previous - count
+            db.set_meta(conn, "focused_tests_cleared_session", str(cleared))
+            db.set_meta(conn, "last_progress_increase_epoch", str(time.time()))
+        db.set_meta(conn, "gate_station_last_inventory_failures", str(count))
+        db.set_meta(conn, "gate_station_inventory_failure_count", str(count))
+        db.set_meta(conn, "gate_station_inventory_run_id", str(run_id))
+        db.set_meta(conn, "gate_station_inventory_ready", "1")
+        db.set_meta(conn, "gate_station_first_failing_target", str(failures[0]["nodeid"]))
+        db.set_meta(conn, "gate_station_cluster_owners_json", json.dumps(sorted(groups), sort_keys=True))
+        db.log_event(conn, "gate_inventory", f"Recorded {count} no-fail-fast failures across {len(groups)} owners", payload={"run_id": run_id, "owners": sorted(groups)})
+
+    def unresolved_card_exists(self, conn: Any, source_key: str) -> bool:
+        """Return whether a source-key card is still actionable."""
+
+        return conn.execute(
+            """
+            SELECT 1 FROM worklanes
+            WHERE source_key = ?
+              AND stage != 'done'
+              AND status NOT IN ('abandoned', 'cancelled', 'stale')
+            LIMIT 1
+            """,
+            (source_key,),
+        ).fetchone() is not None
+
+    def gate_failure_owner(self, row: Any) -> str:
+        """Map a failing target to the file/module owner that should get one worker."""
+
+        file_name = str(row["file"] or "")
+        if file_name and file_name != "cargo":
+            return file_name
+        nodeid = str(row["nodeid"] or "unknown")
+        if "::" in nodeid:
+            return nodeid.rsplit("::", 1)[0]
+        return nodeid
+
+    def classify_gate_failure(self, owner: str, nodeid: str) -> str:
+        """Classify the likely failure family for scheduler-created lanes."""
+
+        text = f"{owner} {nodeid}".lower()
+        if "snapshot" in text or "fixture" in text:
+            return "fixture snapshot"
+        if "expect" in text:
+            return "stale expectation"
+        if "runtime" in text:
+            return "runtime behavior"
+        if "codegen" in text:
+            return "codegen behavior"
+        if any(word in text for word in ("thread", "concurr", "race", "shared")):
+            return "shared-state/concurrency"
+        return "unknown"
+
+    def is_gate_station_card(self, row: Any) -> bool:
+        """Return whether a card belongs to the red-gate stabilization board."""
+
+        source_key = str(row["source_key"] or "")
+        title = str(row["title"] or "")
+        return source_key.startswith(("gate-", "test-failure:")) or title == "Fix global test suite failures"
+
+    def disjoint_gate_station_candidates(self, rows: list[Any], occupied: set[str] | None = None) -> list[Any]:
+        """Keep at most one planned worker per owned file/target."""
+
+        selected: list[Any] = []
+        owners: set[str] = set(occupied or set())
+        for row in rows:
+            owner = self.card_owner_key(row)
+            if owner and owner in owners:
+                continue
+            if owner:
+                owners.add(owner)
+            selected.append(row)
+        return selected
+
+    def card_owner_key(self, row: Any) -> str:
+        """Extract a deterministic file/target owner from gate-station card text."""
+
+        text = "\n".join(str(row[key] or "") for key in ("notes", "description", "goal", "acceptance_criteria"))
+        match = re.search(r"Owned target/file:\s*([^\n]+)", text)
+        if match:
+            return match.group(1).strip()
+        source_key = str(row["source_key"] or "")
+        if source_key.startswith("gate-cluster:"):
+            return source_key.removeprefix("gate-cluster:").split(":duplicate", 1)[0]
+        return ""
+
+    def active_gate_station_owner_keys(self, conn: Any) -> set[str]:
+        """Return file/target owners already held by active gate-station workers."""
+
+        rows = conn.execute(
+            """
+            SELECT w.*
+            FROM worklanes w
+            JOIN agents a ON a.id = w.owner_agent_id
+            WHERE w.stage = 'development'
+              AND w.status = 'assigned'
+              AND (w.source_key LIKE 'gate-cluster:%' OR w.source_key LIKE 'gate-crash-recovery:%')
+              AND a.current_status NOT IN ('crash', 'success', 'stopped')
+              AND a.ended_at IS NULL
+            """
+        ).fetchall()
+        return {owner for owner in (self.card_owner_key(row) for row in rows) if owner}
+
+    def redirect_looping_gate_workers(self, conn: Any) -> None:
+        """Poke gate workers that report investigation without fresh test evidence."""
+
+        rows = conn.execute(
+            """
+            SELECT w.id, a.name, a.tmux_pane, r.report_json
+            FROM worklanes w
+            JOIN agents a ON a.id = w.owner_agent_id
+            JOIN agent_reports r ON r.id = (
+                SELECT r2.id FROM agent_reports r2
+                WHERE r2.card_id = w.id OR r2.worklane_id = w.id
+                ORDER BY r2.id DESC LIMIT 1
+            )
+            WHERE w.stage = 'development'
+              AND (w.source_key LIKE 'gate-%' OR w.source_key LIKE 'test-failure:%')
+              AND a.current_status NOT IN ('crash', 'success', 'stopped')
+            """
+        ).fetchall()
+        for row in rows:
+            report_text = str(row["report_json"] or "").lower()
+            if "investigat" not in report_text or "tests_run" in report_text:
+                continue
+            target = str(row["tmux_pane"] or "")
+            if not target:
+                continue
+            try:
+                self.tmux.send_prompt(
+                    target,
+                    "Gate-station redirect: report exact failing tests, classify root cause, patch one cause, run focused verification, and avoid broad support claims.",
+                )
+                db.log_event(conn, "gate_station_redirect", f"Redirected {row['name']} to focused gate evidence", agent_name=str(row["name"]), payload={"card_id": int(row["id"])})
+            except Exception:
+                continue
+
     def ensure_team(self, conn: Any, team: str) -> None:
         """Keep the small resident team alive while respecting integration backpressure."""
 
@@ -903,6 +1230,12 @@ class HarnessScheduler:
         recovery_rows = [row for row in rows if self.is_integration_recovery_card(row)]
         non_recovery_rows = [row for row in rows if not self.is_integration_recovery_card(row)]
         recovery_candidates = recovery_rows[:recovery_slots]
+        if db.get_meta(conn, "gate_station_mode") == "1":
+            station_rows = [row for row in non_recovery_rows if self.is_gate_station_card(row)]
+            if db.get_meta(conn, "gate_station_inventory_ready") != "1":
+                station_rows = [row for row in station_rows if self.is_gate_repair_card(row) or str(row["source_key"] or "").startswith("gate-crash-recovery:")]
+            occupied = self.active_gate_station_owner_keys(conn)
+            return self.disjoint_gate_station_candidates(sorted(station_rows, key=lambda row: (int(row["priority"]), int(row["id"]))), occupied) + recovery_candidates
         if db.get_meta(conn, "test_gate_mode") == "hard_blocker":
             gate_rows = [row for row in non_recovery_rows if self.is_gate_repair_card(row)]
             return sorted(gate_rows, key=lambda row: (int(row["priority"]), int(row["id"]))) + recovery_candidates
@@ -990,6 +1323,7 @@ class HarnessScheduler:
                   AND role_type IN ('Developer', 'Designer', 'Conflict Resolver', 'Reproducer')
                   AND (
                     source_key LIKE 'test-failure:%'
+                    OR source_key LIKE 'gate-%'
                     OR source_key LIKE 'integration-failure:%'
                     OR title LIKE 'Fix failing tests from run %'
                     OR title = 'Fix global test suite failures'
@@ -1522,11 +1856,11 @@ class HarnessScheduler:
         )
 
     def requeue_agent_cards(self, conn: Any, agent: Any, reason: str) -> int:
-        """Return cards owned by a dead worker to planned so Python can reassign them."""
+        """Return cards from a dead worker, preserving dirty gate work for recovery."""
 
         rows = conn.execute(
             """
-            SELECT id FROM worklanes
+            SELECT * FROM worklanes
             WHERE stage = 'development'
               AND (
                 owner_agent_id = ?
@@ -1536,11 +1870,66 @@ class HarnessScheduler:
             """,
             (agent["id"], agent["branch"], agent["branch"], agent["worktree"], agent["worktree"]),
         ).fetchall()
+        requeued = 0
+        recovered = 0
+        has_local_work = self.agent_worktree_dirty(agent)
         for row in rows:
+            if has_local_work and self.is_gate_station_card(row):
+                recovery_id = self.create_crash_recovery_card(conn, agent, row, reason)
+                db.retire_card(
+                    conn,
+                    int(row["id"]),
+                    f"Preserved dirty crashed worktree for recovery card#{recovery_id}: {agent['worktree']}",
+                    reason="dirty_crash_recovery",
+                    agent_name=str(agent["name"]),
+                )
+                recovered += 1
+                continue
             db.requeue_card(conn, int(row["id"]), f"Requeued after {agent['name']} ended without an accepted report: {reason}")
-        if rows:
-            db.log_event(conn, "card_requeued", f"Requeued {len(rows)} cards from {agent['name']}", agent_name=agent["name"], payload={"reason": reason})
+            requeued += 1
+        if requeued:
+            db.log_event(conn, "card_requeued", f"Requeued {requeued} cards from {agent['name']}", agent_name=agent["name"], payload={"reason": reason})
+        if recovered:
+            db.log_event(conn, "gate_crash_recovery", f"Preserved {recovered} dirty gate cards from {agent['name']}", agent_name=agent["name"], payload={"reason": reason, "worktree": str(agent["worktree"] or "")})
         return len(rows)
+
+    def agent_worktree_dirty(self, agent: Any) -> bool:
+        """Return whether a crashed worker left local work worth preserving."""
+
+        worktree = Path(str(agent["worktree"] or agent["cwd"] or ""))
+        if not worktree.exists():
+            return False
+        result = subprocess.run(["git", "status", "--porcelain"], cwd=worktree, text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            return False
+        if result.stdout.strip():
+            return True
+        base = self.current_head()
+        if not base:
+            return False
+        commits = subprocess.run(["git", "rev-list", "--count", "HEAD", f"^{base}"], cwd=worktree, text=True, capture_output=True, check=False)
+        if commits.returncode != 0:
+            return False
+        try:
+            return int(commits.stdout.strip() or "0") > 0
+        except ValueError:
+            return False
+
+    def create_crash_recovery_card(self, conn: Any, agent: Any, row: Any, reason: str) -> int:
+        """Create a fresh-worktree extraction lane for useful dirty crash diffs."""
+
+        source_key = f"gate-crash-recovery:{row['id']}:{agent['name']}"
+        return int(db.find_or_create_card(
+            conn,
+            source_key=source_key,
+            title=f"Recover minimal gate patch from {agent['name']}",
+            role_type="Developer",
+            priority=-9,
+            description=f"Extract only the proven minimal patch from preserved dirty worktree {agent['worktree']}.",
+            goal="Do not continue on the dirty branch. Inspect it, copy the minimal focused fix into a fresh worktree, and prove it with focused tests.",
+            acceptance_criteria="Name the preserved worktree, copied files, focused test proof, and why no unrelated dirty changes were carried over.",
+            notes=f"Original card: {row['id']}\nPreserved worktree: {agent['worktree']}\nBranch: {agent['branch']}\nCrash reason: {reason}",
+        ))
 
     def mark_agent_missing(self, conn: Any, agent: Any, reason: str) -> None:
         """Mark a supposedly active worker dead when Python cannot reach its tmux pane."""
