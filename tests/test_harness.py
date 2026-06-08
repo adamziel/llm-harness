@@ -1220,6 +1220,12 @@ class HarnessTests(unittest.TestCase):
             completed = subprocess.run([sys.executable, "-S", str(root / "dist" / "harness"), "-v"], text=True, capture_output=True, check=True, env=env)
         self.assertEqual(completed.stdout.strip(), f"harness {__version__}")
 
+    def test_status_pages_workflow_installs_harness_dependencies(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "status-pages.yml").read_text()
+        self.assertIn("actions/setup-python@v5", workflow)
+        self.assertIn("python -m pip install .", workflow)
+
     def test_building_team_uses_six_developer_cap(self):
         self.assertEqual(developer_count_for_building(8), 6)
         self.assertEqual(developer_count_for_building(6), 6)
