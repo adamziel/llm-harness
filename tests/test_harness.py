@@ -1261,6 +1261,53 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(len(cards), 1)
             self.assertEqual(cards[0]["source_key"], "test-failure:global-suite")
 
+    def test_global_test_loop_card_records_exact_acceptance_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                from llm_harness.testing_loop import queue_test_fix_lane
+
+                run_id = db.record_test_run(
+                    conn,
+                    command="tools/run-tests.sh",
+                    status="failed",
+                    full_log="test cleanup::magic ... FAILED",
+                    results=[{"nodeid": "cleanup::magic", "status": "failed"}],
+                )
+                queue_test_fix_lane(conn, run_id, [{"nodeid": "cleanup::magic", "status": "failed"}], "bad")
+                card = conn.execute("SELECT notes, acceptance_criteria FROM worklanes WHERE source_key = 'test-failure:global-suite'").fetchone()
+
+            self.assertIn("Acceptance command: tools/run-tests.sh", card["notes"])
+            self.assertIn("tools/run-tests.sh", card["acceptance_criteria"])
+            self.assertIn("root_cause", card["acceptance_criteria"])
+
+    def test_global_test_loop_updates_existing_gate_card_acceptance_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                from llm_harness.testing_loop import queue_test_fix_lane
+
+                card_id = db.create_card(
+                    conn,
+                    "Fix global test suite failures",
+                    role_type="Developer",
+                    source_key="test-failure:global-suite",
+                    acceptance_criteria="old acceptance",
+                )
+                run_id = db.record_test_run(
+                    conn,
+                    command="tools/run-tests.sh",
+                    status="failed",
+                    full_log="test cleanup::magic ... FAILED",
+                    results=[{"nodeid": "cleanup::magic", "status": "failed"}],
+                )
+                queue_test_fix_lane(conn, run_id, [{"nodeid": "cleanup::magic", "status": "failed"}], "bad")
+                card = conn.execute("SELECT acceptance_criteria FROM worklanes WHERE id = ?", (card_id,)).fetchone()
+
+            self.assertIn("tools/run-tests.sh", card["acceptance_criteria"])
+
     def test_discover_test_command_prefers_repo_run_tests_script(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1544,6 +1591,31 @@ class HarnessTests(unittest.TestCase):
 
             self.assertEqual(gate_mode, "hard_blocker")
             self.assertIn("New failures appeared", reason)
+
+    def test_quarantined_gate_expands_for_related_cargo_failure_cluster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = db.bootstrap(tmp)
+            with db.connect(paths.db) as conn:
+                db.init_db(conn)
+                from llm_harness.testing_loop import update_test_gate_state
+
+                first_results = [
+                    {"nodeid": "native_invocation_cleanup::method_args", "status": "failed"},
+                    {"nodeid": "native_invocation_cleanup::static_args", "status": "failed"},
+                ]
+                first_run = db.record_test_run(conn, command="tools/run-tests.sh", status="failed", full_log="", results=first_results)
+                update_test_gate_state(conn, first_run, "tools/run-tests.sh", "failed", first_results, False)
+                second_results = [
+                    *first_results,
+                    {"nodeid": "native_invocation_cleanup::magic_args", "status": "failed"},
+                ]
+                second_run = db.record_test_run(conn, command="tools/run-tests.sh", status="failed", full_log="", results=second_results)
+                update_test_gate_state(conn, second_run, "tools/run-tests.sh", "failed", second_results, False)
+                gate_mode = db.get_meta(conn, "test_gate_mode")
+                known_failures = json.loads(db.get_meta(conn, "test_gate_failures_json"))
+
+            self.assertEqual(gate_mode, "quarantined_known_red")
+            self.assertIn("native_invocation_cleanup::magic_args", known_failures)
 
     def test_failed_global_gate_requeues_stale_failed_gate_card(self):
         with tempfile.TemporaryDirectory() as tmp:

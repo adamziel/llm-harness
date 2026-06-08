@@ -148,6 +148,9 @@ def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dic
     failure_key = "global-suite" if global_command else ",".join(sorted(failures)) if failures else "command-level-failure"
     title = "Fix global test suite failures" if global_command else f"Fix failing tests from run {run_id}"
     notes = "Failed tests: " + (", ".join(failures) if failures else "see full test log") + f"\nFirst failing commit: {commit}"
+    acceptance = _test_fix_acceptance(command, global_command)
+    if global_command:
+        notes += f"\nAcceptance command: {command}\nFocused/local subset evidence is useful, but the assigned owner must report root_cause and resolution against that exact command."
     source_key = "test-failure:global-suite" if global_command else f"test-failure:{command}:{failure_key}"
     existing = conn.execute(
         """
@@ -159,16 +162,17 @@ def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dic
     ).fetchone()
     if existing:
         if global_command and existing["status"] == "integration_failed":
+            conn.execute("UPDATE worklanes SET acceptance_criteria = ? WHERE id = ?", (acceptance, existing["id"]))
             db.requeue_card(conn, int(existing["id"]), notes + f"\nLatest failing run: {run_id}")
             db.log_event(conn, "worklane_requeued", f"Requeued failing global gate card#{existing['id']} from run {run_id}", payload={"card_id": existing["id"], "run_id": run_id})
             return
         conn.execute(
             """
             UPDATE worklanes
-            SET notes = ?, priority = MIN(priority, 0), last_activity_at = ?
+            SET notes = ?, acceptance_criteria = ?, priority = MIN(priority, 0), last_activity_at = ?
             WHERE id = ?
             """,
-            (notes + f"\nLatest failing run: {run_id}", db.utc_now(), existing["id"]),
+            (notes + f"\nLatest failing run: {run_id}", acceptance, db.utc_now(), existing["id"]),
         )
         if not _recent_payload_event(conn, "worklane_deduplicated", "card_id", existing["id"], STATUS_EVENT_THROTTLE_SECONDS):
             db.log_event(conn, "worklane_deduplicated", f"Updated existing failing-test card#{existing['id']} from run {run_id}", payload={"card_id": existing["id"], "run_id": run_id})
@@ -182,8 +186,20 @@ def queue_test_fix_lane(conn: sqlite3.Connection, run_id: int, results: list[dic
         notes=notes,
         priority=0,
         goal="Restore the main-branch full test suite.",
-        acceptance_criteria="The failing tests pass in the deterministic test loop.",
+        acceptance_criteria=acceptance,
         source_key=source_key,
+    )
+
+
+def _test_fix_acceptance(command: str, global_command: bool) -> str:
+    """Return acceptance text that prevents local-only gate repairs."""
+
+    if not global_command:
+        return "The failing tests pass in the deterministic test loop."
+    return (
+        f"Run the exact global gate command from the repository root: {command}. "
+        "Either make it pass, or submit a structured agent_report naming root_cause, resolution, "
+        "remaining quarantined failures, and why no unrelated regressions were introduced. Focused tests alone are not sufficient."
     )
 
 
@@ -230,7 +246,7 @@ def update_test_gate_state(
         )
         return
     previous_failures = _known_gate_failures(conn)
-    if previous_failures and not set(failures).issubset(previous_failures):
+    if previous_failures and not set(failures).issubset(previous_failures) and not _same_failure_cluster(previous_failures, set(failures)):
         new_failures = sorted(set(failures) - previous_failures)
         _set_test_gate(
             conn,
@@ -271,6 +287,21 @@ def _known_gate_failures(conn: sqlite3.Connection) -> set[str]:
     if not isinstance(values, list):
         return set()
     return {str(value) for value in values}
+
+
+def _same_failure_cluster(previous_failures: set[str], current_failures: set[str]) -> bool:
+    """Allow small Rust/Cargo clusters to oscillate without blocking all work."""
+
+    previous_clusters = {_failure_cluster(failure) for failure in previous_failures}
+    return bool(previous_clusters) and all(_failure_cluster(failure) in previous_clusters for failure in current_failures)
+
+
+def _failure_cluster(nodeid: str) -> str:
+    """Return a narrow related-test cluster key for non-path Rust-style tests."""
+
+    if "::" not in nodeid or "/" in nodeid or "\\" in nodeid:
+        return nodeid
+    return nodeid.rsplit("::", 1)[0]
 
 
 def _set_test_gate(conn: sqlite3.Connection, mode: str, reason: str, failures: list[str], run_id: int) -> None:
