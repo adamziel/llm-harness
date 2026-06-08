@@ -1212,6 +1212,14 @@ class HarnessTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(__version__, match.group(1))
 
+    def test_single_file_harness_bundles_turso_for_no_site_python(self):
+        root = Path(__file__).resolve().parents[1]
+        subprocess.run([sys.executable, str(root / "scripts" / "build_single_file.py")], cwd=root, check=True, capture_output=True, text=True)
+        with tempfile.TemporaryDirectory() as cache:
+            env = {**os.environ, "LLM_HARNESS_EXTRACT_DIR": cache}
+            completed = subprocess.run([sys.executable, "-S", str(root / "dist" / "harness"), "-v"], text=True, capture_output=True, check=True, env=env)
+        self.assertEqual(completed.stdout.strip(), f"harness {__version__}")
+
     def test_building_team_uses_six_developer_cap(self):
         self.assertEqual(developer_count_for_building(8), 6)
         self.assertEqual(developer_count_for_building(6), 6)
