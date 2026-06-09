@@ -146,7 +146,21 @@ class HarnessScheduler:
             self.write_role_prompt_files(conn)
             self.check_local_tools(conn)
             conn.commit()
-            if not self.check_harness_mcp(conn):
+            return 0
+
+        init_code = self.with_retrying_db("init", initialize)
+        if init_code:
+            return init_code
+
+        # The MCP preflight starts a nested harness process that opens the same
+        # local Turso database. Keep that subprocess outside the initialization
+        # transaction; an open parent connection holds Turso's file lock even
+        # after commit and would make a valid MCP server look broken.
+        mcp_ok, mcp_message = self.probe_harness_mcp()
+
+        def finalize(conn: Any) -> int:
+            self.record_harness_mcp_check(conn, mcp_ok, mcp_message)
+            if not mcp_ok:
                 return 1
             self.initialize_index(conn)
             refresh_reports(conn, self.root)
@@ -156,7 +170,7 @@ class HarnessScheduler:
             db.log_event(conn, "init", "Harness initialized or repaired")
             return 0
 
-        return self.with_retrying_db("init", initialize)
+        return self.with_retrying_db("init finalize", finalize)
 
     def run(self, goal: str | None = None, team: str = "auto", once: bool = False) -> int:
         """Start or resume the harness, then keep monitoring worker state."""
@@ -439,10 +453,16 @@ class HarnessScheduler:
     def check_harness_mcp(self, conn: Any) -> bool:
         """Verify the harness stdio MCP itself before Codex receives it."""
 
+        ok, message = self.probe_harness_mcp()
+        self.record_harness_mcp_check(conn, ok, message)
+        return ok
+
+    def probe_harness_mcp(self) -> tuple[bool, str]:
+        """Run the harness MCP subprocess preflight without a caller DB handle."""
+
         harness = self.harness_executable()
         if not harness.exists():
-            db.log_event(conn, "mcp_failed", f"Harness executable not found for MCP: {harness}")
-            return False
+            return False, f"Harness executable not found for MCP: {harness}"
         try:
             server = subprocess.run(
                 [str(harness), "--root", str(self.root), "mcp"],
@@ -454,16 +474,27 @@ class HarnessScheduler:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            db.log_event(conn, "mcp_failed", f"Harness MCP server did not start: {exc}")
-            return False
+            return False, f"Harness MCP server did not start: {exc}"
         ok = server.returncode == 0 and "memory_query" in server.stdout and "agent_report" in server.stdout
+        if ok:
+            return True, "Harness MCP server passed init preflight"
+        detail = (server.stderr or server.stdout or "no MCP output").strip()
+        return False, f"Harness MCP server did not expose required tools: {detail}"
+
+    def record_harness_mcp_check(self, conn: Any, ok: bool, message: str) -> None:
+        """Persist and surface the result of the harness MCP self-check."""
+
         db.set_meta(conn, "harness_mcp_status", "available" if ok else "failed")
         if ok:
-            db.log_event(conn, "mcp", "Harness MCP server passed init preflight")
-        else:
-            detail = (server.stderr or server.stdout or "no MCP output").strip()
-            db.log_event(conn, "mcp_failed", f"Harness MCP server did not expose required tools: {detail}")
-        return ok
+            if db.get_meta(conn, "red_banner").startswith("Harness MCP unavailable"):
+                db.set_meta(conn, "red_banner", "")
+            db.log_event(conn, "mcp", message)
+            return
+        db.set_meta(conn, "red_banner", "Harness MCP unavailable; init cannot finish.")
+        db.log_event(conn, "mcp_failed", message)
+        summary = message.splitlines()[0] if message else "Harness MCP preflight failed."
+        print(f"\033[31m{summary}\033[0m", file=sys.stderr)
+        print("\033[31mRun ./harness logs for details.\033[0m", file=sys.stderr)
 
     def initialize_index(self, conn: Any) -> None:
         """Prime the code index when possible without blocking future worktrees."""

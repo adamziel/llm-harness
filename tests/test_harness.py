@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -896,7 +897,7 @@ class HarnessTests(unittest.TestCase):
             with (
                 mock.patch.object(scheduler, "check_gh"),
                 mock.patch.object(scheduler, "check_local_tools"),
-                mock.patch.object(scheduler, "check_harness_mcp", return_value=True),
+                mock.patch.object(scheduler, "probe_harness_mcp", return_value=(True, "Harness MCP server passed init preflight")),
                 mock.patch.object(scheduler, "initialize_index"),
             ):
                 self.assertEqual(scheduler.init_project(goal="Ship refined harness"), 0)
@@ -909,6 +910,27 @@ class HarnessTests(unittest.TestCase):
             with db.connect(root / ".harness" / "harness.turso") as conn:
                 self.assertTrue(db.get_meta(conn, "initialized_at"))
 
+    def test_init_mcp_preflight_does_not_lock_own_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_harness = Path(__file__).resolve().parents[1] / "harness"
+            local_harness = root / "harness"
+            local_harness.write_text(
+                "#!/bin/sh\n"
+                f"exec {shlex.quote(sys.executable)} {shlex.quote(str(repo_harness))} \"$@\"\n"
+            )
+            local_harness.chmod(0o755)
+            scheduler = HarnessScheduler(root, tmux=FakeTmux())
+            with (
+                mock.patch.object(scheduler, "check_gh"),
+                mock.patch.object(scheduler, "check_local_tools"),
+                mock.patch.object(scheduler, "initialize_index"),
+            ):
+                self.assertEqual(scheduler.init_project(goal="Ship refined harness"), 0)
+            with db.connect(root / ".harness" / "harness.turso") as conn:
+                self.assertEqual(db.get_meta(conn, "harness_mcp_status"), "available")
+                self.assertTrue(db.get_meta(conn, "initialized_at"))
+
     def test_init_rejects_terminal_escape_goal(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -916,7 +938,7 @@ class HarnessTests(unittest.TestCase):
             with (
                 mock.patch.object(scheduler, "check_gh"),
                 mock.patch.object(scheduler, "check_local_tools"),
-                mock.patch.object(scheduler, "check_harness_mcp", return_value=True),
+                mock.patch.object(scheduler, "probe_harness_mcp", return_value=(True, "Harness MCP server passed init preflight")),
                 mock.patch.object(scheduler, "initialize_index"),
             ):
                 self.assertEqual(scheduler.init_project(goal="\x1b[A --help"), 1)
@@ -935,7 +957,7 @@ class HarnessTests(unittest.TestCase):
             with (
                 mock.patch.object(scheduler, "check_gh"),
                 mock.patch.object(scheduler, "check_local_tools"),
-                mock.patch.object(scheduler, "check_harness_mcp", return_value=True),
+                mock.patch.object(scheduler, "probe_harness_mcp", return_value=(True, "Harness MCP server passed init preflight")),
                 mock.patch.object(scheduler, "initialize_index"),
             ):
                 self.assertEqual(scheduler.init_project(goal="Real compiler goal"), 0)
