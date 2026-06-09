@@ -208,7 +208,33 @@ class HarnessTests(unittest.TestCase):
         DatabaseError.__module__ = "turso.lib"
 
         self.assertTrue(db.is_retryable_error(DatabaseError("Transaction conflict")))
+        self.assertTrue(db.is_retryable_error(DatabaseError("Locking error: File is locked by another process")))
         self.assertFalse(db.is_retryable_error(DatabaseError("Parse error")))
+
+    def test_turso_open_retries_file_lock(self):
+        class FakeTursoConnection:
+            row_factory = None
+
+        class FakeTurso:
+            Row = object
+
+            def __init__(self):
+                self.attempts = 0
+                self.conn = FakeTursoConnection()
+
+            def connect(self, path, **kwargs):
+                self.attempts += 1
+                if self.attempts < 3:
+                    raise RuntimeError("Locking error: Failed locking file 'harness.turso-wal'. File is locked by another process")
+                return self.conn
+
+        fake_turso = FakeTurso()
+        with mock.patch.object(db, "turso", fake_turso), mock.patch("llm_harness.db.time.sleep"):
+            conn = db.open_connection(Path("harness.turso"))
+
+        self.assertIs(conn, fake_turso.conn)
+        self.assertEqual(fake_turso.attempts, 3)
+        self.assertIs(fake_turso.conn.row_factory, FakeTurso.Row)
 
     def test_db_disk_io_prints_clear_cli_error(self):
         stderr = io.StringIO()
@@ -217,6 +243,23 @@ class HarnessTests(unittest.TestCase):
 
         self.assertIn("Harness database disk I/O error", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_status_prints_cached_file_when_bootstrap_locked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "STATUS.md").write_text("cached harness status\n")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch("llm_harness.db.bootstrap", side_effect=RuntimeError("Locking error: File is locked by another process")),
+                mock.patch("sys.stdout", stdout),
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(main(["--root", str(root), "status"]), 0)
+
+        self.assertIn("cached harness status", stdout.getvalue())
+        self.assertIn("temporarily locked", stderr.getvalue())
+        self.assertNotIn("Traceback", stdout.getvalue() + stderr.getvalue())
 
     def test_begin_concurrent_starts_turso_mvcc_transaction(self):
         class FakeCursor:

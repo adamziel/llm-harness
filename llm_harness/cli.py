@@ -82,6 +82,14 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
+        if db.is_retryable_error(exc):
+            if args.command == "status":
+                return _print_cached_status(root, json_output=args.json)
+            print(
+                "\033[31mHarness database is temporarily locked by another harness process; retry shortly.\033[0m",
+                file=sys.stderr,
+            )
+            return 1
         raise
 
     if args.command == "init":
@@ -198,6 +206,24 @@ def _hidden_command(subparsers: argparse._SubParsersAction, name: str) -> argpar
     parser = subparsers.add_parser(name, help=argparse.SUPPRESS)
     subparsers._choices_actions = [action for action in subparsers._choices_actions if action.dest != name]
     return parser
+
+
+def _print_cached_status(root: Path, json_output: bool = False) -> int:
+    """Avoid tracebacks when a short-lived status command loses the Turso open race."""
+
+    if json_output:
+        print(json.dumps({"error": "harness_database_locked", "cached": False}, indent=2, sort_keys=True))
+        return 1
+    cached = root / "STATUS.md"
+    if not cached.exists():
+        print(
+            "\033[31mHarness database is temporarily locked by another harness process and no cached STATUS.md exists yet.\033[0m",
+            file=sys.stderr,
+        )
+        return 1
+    print("\033[33mHarness database is temporarily locked; showing cached STATUS.md.\033[0m", file=sys.stderr)
+    print(cached.read_text())
+    return 0
 
 
 def _agent_with_card(conn, agent) -> dict[str, object]:

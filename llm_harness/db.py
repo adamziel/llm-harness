@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 
 import turso
 from collections.abc import Iterable, Mapping
@@ -21,6 +22,8 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 TURSO_BUSY_TIMEOUT_MS = 60_000
+TURSO_OPEN_RETRY_SECONDS = 5.0
+TURSO_OPEN_RETRY_SLEEP_SECONDS = 0.1
 AGENT_TERMINAL_STATUSES = ("crash", "success", "stopped")
 AGENT_LIFECYCLE_STATUSES = ("running", *AGENT_TERMINAL_STATUSES)
 CARD_STAGES = ("planned", "development", "review", "integration", "done")
@@ -100,7 +103,7 @@ def is_retryable_error(exc: BaseException) -> bool:
     """Return whether Turso reported a write-concurrency conflict."""
 
     message = str(exc).lower()
-    return "locked" in message or "busy" in message or "conflict" in message
+    return "locked" in message or "locking error" in message or "busy" in message or "conflict" in message
 
 
 def is_disk_io_error(exc: BaseException) -> bool:
@@ -184,9 +187,16 @@ def connect(db_path: str | Path):
 def open_connection(path: Path):
     """Open Turso's local MVCC engine; there is no fallback backend."""
 
-    conn = turso.connect(str(path), experimental_features="views,triggers,generated_columns")
-    conn.row_factory = turso.Row
-    return conn
+    deadline = time.monotonic() + TURSO_OPEN_RETRY_SECONDS
+    while True:
+        try:
+            conn = turso.connect(str(path), experimental_features="views,triggers,generated_columns")
+            conn.row_factory = turso.Row
+            return conn
+        except Exception as exc:
+            if not is_retryable_error(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(TURSO_OPEN_RETRY_SLEEP_SECONDS)
 
 
 def connection_driver(conn: object) -> str:
